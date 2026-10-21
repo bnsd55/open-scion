@@ -13,6 +13,10 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use scion_server::{Backend, Error, ImportOptions, import_git};
+
+/// The import's byte cap for one commit or tree object, the same number
+/// the store keeps files under. Tests write one object past it.
+const MAX_OBJECT_BYTES: usize = 100 << 20;
 use tempfile::TempDir;
 
 /// A git repository in a temp dir, with fixed identities and no user or
@@ -159,7 +163,7 @@ fn plain_tree(git: &Git) -> String {
 fn refusal(git: &Git, what: &str) {
     match verdict(git) {
         Ok(commits) => panic!("{what}: the import accepted {commits} commits"),
-        Err(Error::Git(_)) | Err(Error::Corrupt(_)) => {}
+        Err(Error::Git(_) | Error::Corrupt(_)) => {}
         Err(other) => panic!("{what}: refused, but as {other:?}"),
     }
 }
@@ -303,6 +307,69 @@ fn reserved_names_import_like_any_other_name() {
             Ok(commits) => assert_eq!(commits, 1, "{name:?} imports as one commit"),
             Err(e) => panic!("{name:?}: the import refused a name git may hold: {e:?}"),
         }
+    }
+}
+
+/// An object past [`scion_server`]'s structure cap is refused on its
+/// header, before the import decodes it whole, and the refusal names the
+/// size.
+#[test]
+fn an_oversized_commit_is_refused_before_it_is_decoded() {
+    let git = Git::init();
+    let tree = plain_tree(&git);
+    // A message that takes the commit object past the blob cap, which is
+    // the import's structure cap too.
+    let message = format!("{}\n", "A".repeat(MAX_OBJECT_BYTES + 1));
+    let head = commit(
+        &tree,
+        &[
+            author_line("+0000"),
+            "committer Ada <ada@example.com> 1700000000 +0000".to_owned(),
+        ],
+        &message,
+    );
+    let head = git.object("commit", &head);
+    git.force_main(&head);
+    match verdict(&git) {
+        Ok(commits) => panic!("a {MAX_OBJECT_BYTES}-byte-plus commit imported {commits} commits"),
+        Err(Error::Git(e)) => {
+            let why = e.to_string();
+            assert!(
+                why.contains(&MAX_OBJECT_BYTES.to_string()),
+                "the refusal names the size: {why}"
+            );
+        }
+        Err(other) => panic!("refused as {other:?}"),
+    }
+}
+
+/// A tree whose entry count passes the byte cap but not the entry cap is
+/// refused before `read_tree` builds its map.
+#[test]
+fn an_oversized_tree_is_refused_before_its_map_is_built() {
+    let git = Git::init();
+    // One million entries take about 29 MB, under the byte cap; the map
+    // for them is what the import refuses to build. Each entry names a
+    // blob id from nowhere: the refusal must come before any read.
+    let name = "a".repeat(40);
+    let mut tree = Vec::with_capacity(1_100_000 * 30);
+    for _ in 0..1_100_000 {
+        tree.extend_from_slice(&entry("100644", b"n", &name));
+    }
+    let tree = git.object("tree", &tree);
+    let head = committer_line(&tree, "many entries\n");
+    let head = git.object("commit", &head);
+    git.force_main(&head);
+    match verdict(&git) {
+        Ok(commits) => panic!("a tree of 1_100_000 entries imported {commits} commits"),
+        Err(Error::Git(e)) => {
+            let why = e.to_string();
+            assert!(
+                why.contains("entries"),
+                "the refusal names the entries: {why}"
+            );
+        }
+        Err(other) => panic!("refused as {other:?}"),
     }
 }
 

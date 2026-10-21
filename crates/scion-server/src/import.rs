@@ -919,6 +919,21 @@ fn read_tree(
     let tree = git
         .find_tree(id)
         .map_err(|e| cause("cannot read".to_owned(), e))?;
+    let (kind, size) = capped_object(git, id, "tree")?;
+    if kind != gix::objs::Kind::Tree {
+        return Err(bad(format!("{id} is a {kind:?}, not a tree")));
+    }
+    // The entry bound is the map `read_tree` is about to build: the
+    // header names the bytes, and no entry is smaller than
+    // `MIN_TREE_ENTRY`, so this is the most entries the decode can
+    // produce.
+    let most_entries = size / MIN_TREE_ENTRY;
+    if most_entries > MAX_TREE_ENTRIES as u64 {
+        return Err(bad(format!(
+            "{id} is {size} bytes, about {most_entries} entries, \
+             past the import's limit of {MAX_TREE_ENTRIES} entries per tree"
+        )));
+    }
     let decoded = tree
         .decode()
         .map_err(|e| cause("cannot decode".to_owned(), e))?;
@@ -984,8 +999,55 @@ fn child_path(commit: ObjectId, dir: &[u8], name: &[u8]) -> Result<RepoPath> {
 }
 
 fn find_commit(git: &gix::Repository, commit: ObjectId) -> Result<gix::Commit<'_>> {
+    // The cap runs on the header, before any decode: the walk reads every
+    // commit, so an oversized one is refused once, cheaply, and the
+    // refusal names the size.
+    capped_object(git, commit, "commit")?;
     git.find_commit(commit)
         .map_err(|e| Error::Git(Git::cause(format!("cannot read commit {commit}"), e)))
+}
+
+/// The most bytes one commit or tree object may take, checked on the
+/// object's header before the import decodes it whole. Files are capped
+/// by `MAX_OBJECT_BYTES`; a commit holds its message and a tree one
+/// entry per path, and neither needs more than the largest file the
+/// store keeps.
+const MAX_STRUCTURE_BYTES: u64 = MAX_OBJECT_BYTES as u64;
+
+/// The most entries one tree may hold, bounded before `read_tree` builds
+/// its map. An entry takes at least 28 bytes (a mode, a one-byte name, a
+/// NUL and a 20-byte object name), so a tree at the byte cap could still
+/// claim millions of entries; past this bound the import refuses rather
+/// than build a map that size.
+const MAX_TREE_ENTRIES: usize = 1_000_000;
+
+/// The smallest bytes one tree entry can take: a mode (5), a space, a
+/// one-byte name, a NUL and a 20-byte object name.
+const MIN_TREE_ENTRY: u64 = 5 + 1 + 1 + 1 + 20;
+
+/// Refuses `id` unless its header says it is `kind` and it fits
+/// [`MAX_STRUCTURE_BYTES`]. The header is read without the body, so an
+/// oversized object costs one ODB lookup, not its own size in memory.
+fn capped_object(
+    git: &gix::Repository,
+    id: ObjectId,
+    what: &str,
+) -> Result<(gix::objs::Kind, u64)> {
+    let header = git
+        .try_find_header(id)
+        .map_err(|e| Error::Git(Git::cause(format!("cannot read {what} {id}"), e)))?
+        .ok_or_else(|| {
+            Error::Git(Git::message(format!(
+                "{what} {id} is not in the repository"
+            )))
+        })?;
+    let (kind, size) = (header.kind(), header.size());
+    if size > MAX_STRUCTURE_BYTES {
+        return Err(Error::Git(Git::message(format!(
+            "{what} {id} is {size} bytes, past the import's limit of {MAX_STRUCTURE_BYTES}"
+        ))));
+    }
+    Ok((kind, size))
 }
 
 fn read_blob(git: &gix::Repository, oid: ObjectId) -> Result<gix::Blob<'_>> {
@@ -1001,6 +1063,19 @@ fn identity(
     let bad = |e: gix::Error| Error::Git(Git::cause(format!("commit {commit}: bad {role}"), e));
     let signature = signature.map_err(bad)?;
     let time = signature.time().map_err(bad)?;
+    // The date must read back as it was written. The parser behind
+    // `SignatureRef::time` treats a timezone it cannot read as zero
+    // (gix-date's `parse_header` defaults the offset), and the import
+    // must not store history that differs from its source without
+    // saying so. The one git spelling that cannot read back as itself
+    // is `-0000`, git's written form of an unknown offset: it parses
+    // to zero, and zero serializes as `+0000`.
+    let raw = signature.time;
+    if zone(raw) != Some((time.seconds, time.offset)) {
+        return Err(Error::Git(Git::message(format!(
+            "commit {commit}: {role} date {raw:?} is not a date git can write"
+        ))));
+    }
     Ok(IdentityTime::new(
         signature.name.to_vec(),
         signature.email.to_vec(),
@@ -1008,6 +1083,34 @@ fn identity(
         time.offset / 60,
     )
     .expect("identity fits the format"))
+}
+
+/// The raw git date `<seconds> <sign><hhmm>`, as the pair gix parses it
+/// to, or `None` when the bytes are not that grammar. A zone with a
+/// seconds field (`+053030`) or a zone too long to read as two two-digit
+/// fields is refused here, where gix would coerce its offset to zero.
+fn zone(raw: &str) -> Option<(i64, i32)> {
+    let (seconds, offset) = raw.split_once(' ')?;
+    let seconds = seconds.parse().ok()?;
+    let sign = match offset.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let digits = offset.get(1..)?;
+    let (hours, minutes) = digits.split_at(2);
+    if minutes.len() != 2
+        || !hours
+            .bytes()
+            .chain(minutes.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((
+        seconds,
+        sign * (hours.parse::<i32>().ok()? * 3600 + minutes.parse::<i32>().ok()? * 60),
+    ))
 }
 
 fn per_sec(count: usize, since: Instant) -> u128 {
