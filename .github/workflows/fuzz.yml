@@ -75,7 +75,7 @@ jobs:
           cd "crates/${{ matrix.crate }}" && cargo fuzz run \
             --target x86_64-unknown-linux-gnu "${{ matrix.target }}" \
             "fuzz/corpus/${{ matrix.target }}" $seeds \
-            -- -max_total_time=$(( matrix.budget * ${{ inputs.budget_scale || 1 }} ))
+            -- -max_total_time=$(( ${{ matrix.budget }} * ${{ inputs.budget_scale || 1 }} ))
       - name: upload the crashing input
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
