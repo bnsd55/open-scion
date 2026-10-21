@@ -6,6 +6,13 @@ on:
     # corpus it grew carries into the next night through the cache.
     - cron: "0 4 * * *"
   workflow_dispatch:
+    inputs:
+      # Every budget of the matrix is multiplied by this: 12 turns the
+      # 300 s targets into one hour. The default is the nightly budget.
+      budget_scale:
+        description: multiply every target's budget by this
+        type: number
+        default: 1
 
 permissions:
   contents: read
@@ -18,7 +25,7 @@ jobs:
   targets:
     name: fuzz ${{ matrix.crate }} ${{ matrix.target }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: ${{ 30 * (inputs.budget_scale || 1) }}
     strategy:
       fail-fast: false
       matrix:
@@ -34,6 +41,8 @@ jobs:
           - { crate: scion-server, target: write-decode, budget: 300 }
           - { crate: scion-server, target: blame-cursor, budget: 300 }
           - { crate: scion-server, target: access, budget: 120 }
+          - { crate: scion-server, target: archive-verify, budget: 300 }
+          - { crate: scion-server, target: archive-read, budget: 300 }
           - { crate: scion-tier, target: snapshot-seed, budget: 300 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -64,7 +73,7 @@ jobs:
           cd "crates/${{ matrix.crate }}" && cargo fuzz run \
             --target x86_64-unknown-linux-gnu "${{ matrix.target }}" \
             "fuzz/corpus/${{ matrix.target }}" $seeds \
-            -- -max_total_time=${{ matrix.budget }}
+            -- -max_total_time=${{ matrix.budget * (inputs.budget_scale || 1) }}
       - name: upload the crashing input
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
