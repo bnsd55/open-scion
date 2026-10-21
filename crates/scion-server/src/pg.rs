@@ -1716,16 +1716,17 @@ fn pg_error_of(code: Option<&str>, e: postgres::Error) -> Error {
             Error::Storage(Storage::internal(e))
         }
         // Out of space: the same shortage, wherever the metadata lives.
-        // 53100 is a full data or WAL directory; 53400 is the temp-file
-        // cap a `temp_file_limit` sets, the space this query may use -
-        // whichever the database hits, the client's answer is the same
-        // fixed retry-later shortage. The other codes of the same
-        // classes stay internal on purpose: 53200 is out of MEMORY (the
-        // fixed reply would name a disk and lie), 53000 is the class's
-        // catch-all (too vague to promise a disk answer), and 58030 is
-        // an io_error - a failing device is the EIO row's internal, not
-        // a space shortage.
-        Some("53100" | "53400") => {
+        // 53100 is the database's one disk-full code - errcode_for_file_access
+        // maps ENOSPC to it for every file, temp files included (elog.c).
+        // The other codes of the same classes stay internal on purpose:
+        // 53200 is out of MEMORY (the fixed reply would name a disk and
+        // lie), 53000 is the class's catch-all (too vague to promise a
+        // disk answer), 53400 is a configured cap - temp_file_limit, or
+        // the replication slots - the same refusal every time, so a
+        // retry-later reply tells the client to retry what cannot
+        // succeed - and 58030 is an io_error - a failing device is the
+        // EIO row's internal, not a space shortage.
+        Some("53100") => {
             tracing::error!("the server is out of disk space: {e}");
             Error::Storage(Storage::disk_full(e))
         }
@@ -3662,11 +3663,9 @@ mod pool_tests {
         // A source of the right type with no SQLSTATE of its own: a
         // connect to port 1, which every kernel refuses. The mapping
         // runs on the SQLSTATE the test hands it, not on this source.
-        let source = || {
-            match Client::connect("postgres://127.0.0.1:1/x", NoTls) {
-                Ok(_) => panic!("a connect to port 1 is refused"),
-                Err(refused) => refused,
-            }
+        let source = || match Client::connect("postgres://127.0.0.1:1/x", NoTls) {
+            Ok(_) => panic!("a connect to port 1 is refused"),
+            Err(refused) => refused,
         };
         let full = |code: &str| {
             let error = pg_error_of(Some(code), source());
@@ -3675,26 +3674,29 @@ mod pool_tests {
                 tonic::Status::from(error),
             )
         };
-        // 53100: the data or WAL directory is full. 53400: the temp-file
-        // cap a temp_file_limit sets. Both are a space shortage, and the
-        // client sees the same fixed reply for either.
-        for code in ["53100", "53400"] {
-            let (full, status) = full(code);
-            assert!(full, "{code} must map to the disk-full storage class");
-            assert_eq!(status.code(), tonic::Code::ResourceExhausted, "{code}");
+        // 53100: the database's one disk-full code, for every file kind
+        // (elog.c maps ENOSPC to it). The client sees the fixed
+        // retry-later reply.
+        {
+            let (full, status) = full("53100");
+            assert!(full, "53100 must map to the disk-full storage class");
+            assert_eq!(status.code(), tonic::Code::ResourceExhausted, "53100");
             assert_eq!(
                 status.message(),
                 "the server is out of disk space; retry later",
-                "{code}"
+                "53100"
             );
         }
         // The codes of the same classes that are NOT a disk shortage
         // stay internal, on purpose: 53200 is out of memory, 53000 is
-        // the class's catch-all, 58030 is an io_error (a failing device
-        // is the EIO row's internal, not a space shortage). Pinning them
-        // keeps a later "helpful" widening from answering a memory
-        // error with a disk reply.
-        for code in ["53200", "53000", "58030"] {
+        // the class's catch-all, 53400 is a configured cap (a
+        // temp_file_limit or the replication slots - the same refusal
+        // every time, so a retry-later reply would tell the client to
+        // retry what cannot succeed), and 58030 is an io_error (a
+        // failing device is the EIO row's internal, not a space
+        // shortage). Pinning them keeps a later "helpful" widening from
+        // answering a memory error with a disk reply.
+        for code in ["53200", "53000", "53400", "58030"] {
             let (full, status) = full(code);
             assert!(!full, "{code} must not map to the disk-full class");
             assert_eq!(status.code(), tonic::Code::Internal, "{code}");

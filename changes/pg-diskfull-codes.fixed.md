@@ -1,18 +1,18 @@
 ---
-ms: "the Postgres disk-full mapping names every code a full disk sends"
+ms: "the Postgres disk-full mapping, pinned code by code"
 ---
 
-A Postgres metadata write that runs out of space can reach the store
-under more than one SQLSTATE. The store's mapping took one of them,
-53100; the others a full disk produces - 53400, the temp-file cap a
-`temp_file_limit` sets - fell through to the internal answer, and a
-client that a full metadata disk hit saw the engine's error where the
-fixed shortage reply was promised.
+A metadata write the database refuses names its SQLSTATE, and the
+store answers by the code. A full disk is one of them and only one:
+53100, which errcode_for_file_access gives every ENOSPC the database
+hits, temp files included (elog.c). The mapping pins it to the fixed
+`ResourceExhausted` shortage reply the blob path already promises.
 
-The mapping now names the codes of a full disk and why: 53100 (the
-data or WAL directory is full) and 53400 (the space this query may
-use) answer the same fixed `ResourceExhausted` shortage as the blob
-path's does; 53200 (out of memory), 53000 (the class's catch-all) and
-58030 (an io_error - a failing device, not a space shortage) stay
-internal on purpose, each pinned by a unit test so a later widening
-cannot answer a memory error with a disk reply.
+The codes beside it stay internal on purpose, each with its reason
+and each pinned by a unit test so a later widening cannot widen
+silently: 53200 is out of memory, where a disk reply lies; 53000 is
+the class's catch-all, too vague to promise a disk answer; 53400 is
+a configured cap - a temp_file_limit or the replication slots - the
+same refusal every time, so a retry-later reply would tell the
+client to retry what cannot succeed; and 58030 is an io_error, a
+failing device, which is the read-only-disk row's internal.
