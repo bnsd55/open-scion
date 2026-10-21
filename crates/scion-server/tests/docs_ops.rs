@@ -184,9 +184,16 @@ fn every_proof_line_names_a_test_that_exists() {
             continue;
         };
         proofs += 1;
-        let (file, fun) = proof
-            .rsplit_once("::")
-            .unwrap_or_else(|| panic!("Proof: {proof} is not path::function"));
+        let named = proof
+            .split(" (")
+            .next()
+            .unwrap_or(proof)
+            .split_whitespace()
+            .next()
+            .unwrap_or(proof);
+        let Some((file, fun)) = named.rsplit_once("::") else {
+            panic!("Proof: {proof} is not path::function");
+        };
         let source = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join(file);
@@ -202,6 +209,141 @@ fn every_proof_line_names_a_test_that_exists() {
         "the guide's Proof lines shrank: only {proofs} found"
     );
 }
+
+/// Every `Proof:` line in the operations guide either names a test
+/// that drives its section's command block through the shared
+/// `runbook_block` helper, or says why it cannot: a `(drill)` proof
+/// names the recorded drill, a `(behaviour, no command)` proof names
+/// the behaviour its test holds when the runbook's steps are operator
+/// actions rather than shell commands, and a proof still converting
+/// sits in `NOT_YET_DRIVING`. Anything else fails here, and so does a
+/// stale row: the list must match the guide exactly, so no proof is
+/// exempt silently and no finished conversion keeps its exemption.
+#[test]
+fn every_proof_runs_the_guides_command_or_says_why() {
+    let doc = doc();
+    let mut heading = String::new();
+    let mut proofs = 0;
+    let mut drivers = 0;
+    let mut pending: Vec<(String, String)> = Vec::new();
+    for line in doc.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("### ") || trimmed.starts_with("## ") {
+            heading = trimmed.trim_start_matches('#').trim().to_owned();
+            continue;
+        }
+        let Some(proof) = trimmed.strip_prefix("Proof: ") else {
+            continue;
+        };
+        proofs += 1;
+        if proof.contains("(drill)") || proof.contains("(behaviour, no command") {
+            continue;
+        }
+        let named = proof
+            .split(" (")
+            .next()
+            .unwrap_or(proof)
+            .split_whitespace()
+            .next()
+            .unwrap_or(proof);
+        let Some((file, fun)) = named.rsplit_once("::") else {
+            panic!("Proof: {proof} is not path::function");
+        };
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(file);
+        let text = std::fs::read_to_string(&source)
+            .unwrap_or_else(|_| panic!("the proof file {file} is not in the repo"));
+        let runs_block = ["runbook_block", "run_guide_block", "run_guide_block_async"]
+            .iter()
+            .any(|helper| text.contains(&format!("{helper}(\"{heading}\"")));
+        if runs_block {
+            drivers += 1;
+            continue;
+        }
+        assert!(
+            NOT_YET_DRIVING.contains(&(heading.as_str(), fun)),
+            "the proof of \"{heading}\" names {file}::{fun}, which does not run the section's own command block through runbook_block; convert the test, mark the Proof line with (behaviour, no command) and a reason, or add a NOT_YET_DRIVING row and list it in the PR body"
+        );
+        pending.push((heading.clone(), fun.to_owned()));
+    }
+    // The list is exactly the pending set: no stale rows, no missing
+    // ones.
+    let mut listed: Vec<(String, String)> = NOT_YET_DRIVING
+        .iter()
+        .map(|(h, f)| ((*h).to_owned(), (*f).to_owned()))
+        .collect();
+    listed.sort();
+    pending.sort();
+    pending.dedup();
+    assert_eq!(
+        listed, pending,
+        "NOT_YET_DRIVING must name exactly the proofs that do not yet run their section's block"
+    );
+    assert!(
+        proofs >= 17,
+        "the guide's Proof lines shrank: only {proofs} found"
+    );
+    assert!(
+        drivers >= 3,
+        "the proofs that drive the guide's own blocks shrank: only {drivers}"
+    );
+}
+
+/// The proofs whose tests still run the guide's commands their own
+/// way, not through the shared `runbook_block` helper. Every row is
+/// work to delete: convert the test to the helper, or move the proof
+/// to a Proof-line marker - the list must match the guide exactly, so
+/// a stale row fails the check. This list, mirrored in the PR body,
+/// is today's honest state: no proof is exempt silently.
+const NOT_YET_DRIVING: &[(&str, &str)] = &[
+    ("First boot", "a_first_boot_serves_probes_and_reads_back"),
+    ("One server", "a_lost_server_lock_fences_the_backend"),
+    ("One server", "an_unreachable_database_is_not_a_takeover"),
+    ("One server", "every_reply_survives_a_kill_of_the_server"),
+    ("One server", "a_first_boot_serves_probes_and_reads_back"),
+    ("The durability point", "every_reply_survives_a_power_cut"),
+    (
+        "The durability point",
+        "an_acknowledged_blob_survives_a_cut_at_the_last_barrier_before_its_reply",
+    ),
+    (
+        "The durability point",
+        "every_reply_survives_a_kill_of_the_server",
+    ),
+    (
+        "The durability point",
+        "a_retry_after_a_failed_dir_fsync_makes_the_kept_file_durable",
+    ),
+    (
+        "The durability point",
+        "a_backup_taken_while_serving_restores_whole",
+    ),
+    (
+        "The durability point",
+        "a_restore_of_a_stated_store_takes_a_stated_time",
+    ),
+    (
+        "A failed migration",
+        "a_newer_schema_refuses_the_open_and_a_restore_serves",
+    ),
+    (
+        "A failed migration",
+        "a_kill_during_a_schema_upgrade_leaves_the_old_schema_or_the_new_one",
+    ),
+    (
+        "5. Routines",
+        "a_real_run_writes_the_report_as_textfile_metrics",
+    ),
+    (
+        "5. Routines",
+        "a_failing_disk_runbook_fscks_restores_and_serves",
+    ),
+    (
+        "Stalled replies high",
+        "a_stalled_log_reply_is_counted_and_closes_the_connection",
+    ),
+];
 
 /// The alerts' responses point at the operations guide, and every
 /// pointer resolves: a `docs/operations.md#anchor` names a heading of

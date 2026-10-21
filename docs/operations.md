@@ -134,6 +134,7 @@ restore from backup (section 3).
 Proof: crates/scion-server/tests/backend_refusals.rs::a_lost_server_lock_fences_the_backend
 Proof: crates/scion-server/tests/backend_refusals.rs::an_unreachable_database_is_not_a_takeover
 Proof: crates/scion-server/tests/crash.rs::every_reply_survives_a_kill_of_the_server
+Proof: crates/scion-server/tests/first_boot.rs::a_first_boot_serves_probes_and_reads_back
 
 #### Stopping it for real: a unit file
 
@@ -459,7 +460,7 @@ serves cannot verify it. The swap on live clients is the recorded drill
 (docs/drills/, template there), not a CI test: no test can hold the
 clients' files of a running fleet.
 
-Proof: crates/scn/tests/tls.rs::a_rotated_server_certificate_needs_no_client_change
+Proof: crates/scn/tests/tls.rs::a_rotated_server_certificate_needs_no_client_change (behaviour, no command: the section's steps are openssl and flag changes, not scion commands; the test holds the behaviour - an old certificate keeps working until the rotation lands, and a rotated one needs no client change)
 
 ### In containers
 
@@ -535,7 +536,7 @@ Rotation, step by step:
 
 A daemon checks no ticket and forwards it, so it needs no key at any step.
 
-Proof: crates/scn/tests/rotation.rs::ticket_key_rotation_while_a_checkout_reads
+Proof: crates/scn/tests/rotation.rs::ticket_key_rotation_while_a_checkout_reads (behaviour, no command: the section's steps are server restarts and cache-key copies, not one command a test can run; the test holds the behaviour - tickets of either key verify while both are given, and a checkout that reads through the rotation never fails)
 
 ## 3. Backup and restore
 
@@ -710,6 +711,7 @@ whole.
 
 Proof: crates/scion-server/tests/crash.rs::a_newer_schema_refuses_the_open_and_a_restore_serves
 
+
 An import reads git revision `--rev` (default `HEAD`) into scion repo
 `--repo` (default `main`), and points scion ref `--ref` (default `main`)
 at the imported tip. Besides every root and merge, it re-checks `--verify`
@@ -730,6 +732,22 @@ query (it opens the directory as the server, so with the server stopped, and
 it is safe to repeat).
 
 Proof: crates/scion-server/tests/crash.rs::a_kill_during_a_schema_upgrade_leaves_the_old_schema_or_the_new_one
+
+### Rollback
+
+The rollback depends on what changed: if the schema did not change, run
+the old binary on the data as it is; if it did, restore the pre-upgrade
+backup (section 3) and run the old binary on the copy. After a
+migration, rollback means restoring the backup taken before the
+upgrade: the old binary refuses the new schema - that refusal is the
+stop, and the backup is the recovery. Never edit `user_version` by
+hand - the version is the migration's bookmark, and a hand-moved one
+leaves the database half-migrated in a way no migration can finish.
+The run-the-old-binary arm is the version matrix's drill, #431: the
+pre-upgrade backup restores and serves under the N-1 binary. The
+restore arm is the failed-migration section's Proof: the test forges a
+newer database, sees the refusal, restores the pre-upgrade backup, and
+serves.
 
 ## 5. Routines
 
@@ -822,7 +840,7 @@ failed out-of-space left no torn file, and when space is back, writes
 resume with no restart. A blob whose upload was refused must be uploaded
 again by the client; the server never kept half of it.
 
-Proof: crates/scion-server/tests/disk_full.rs::a_disk_full_runbook_gcs_then_writes_resume
+Proof: crates/scion-server/tests/disk_full.rs::a_disk_full_runbook_gcs_then_writes_resume (behaviour, no command: the section's steps point at the gc routine and fsck, which the storage tests run their own way; conversion to the helper is pending)
 
 ### A failing disk
 
@@ -840,7 +858,7 @@ first internal error from a read:
    later succeeds means the disk recovered, not that the damage was
    never there: run fsck anyway.
 
-Proof: crates/scion-server/tests/storage.rs::a_failing_disk_runbook_fscks_restores_and_serves
+Proof: crates/scion-server/tests/storage.rs::a_failing_disk_runbook_fscks_restores_and_serves (behaviour, no command: the section's steps are stop, fsck, restore, and start, which the storage test holds as behaviour; conversion to the helper is pending)
 
 ### A Postgres restart
 
@@ -866,7 +884,7 @@ The one thing not to do: do not restart the server while the database
 is down. A start against an unreachable database fails, and a restart
 throws away the sessions that would reconnect on their own.
 
-Proof: crates/scion-server/tests/backend_refusals.rs::an_unreachable_database_is_not_a_takeover
+Proof: crates/scion-server/tests/backend_refusals.rs::an_unreachable_database_is_not_a_takeover (behaviour, no command: the section's steps are actions on the database container, not scion commands; the test holds the behaviour the runbook promises)
 
 ## 6. What to watch
 
