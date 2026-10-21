@@ -11,7 +11,11 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A pull_request run may cancel the run before it (same branch,
+  # superseded); a push to main may not: a run in progress finishes
+  # and verifies the head it ran on, and while it runs only the
+  # newest push waits — an older pending run is replaced, not run.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Every third-party action is pinned to the commit SHA its version tag
 # named when this file last moved, with the version in a comment; Dependabot

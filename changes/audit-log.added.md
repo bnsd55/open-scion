@@ -28,8 +28,11 @@ that made the move. A replayed land (the same request key after it
 landed) moved nothing, so its land line names no old and no ref line
 appears for it; an auditor finds the head the move replaced in the
 land line of the call that made the move, under the same land_id.
-The ref lines of a ref, in file order, are the ref's true history:
-each old is the previous line's new.
+The ref lines of a ref carry the ref's true history: each old is the
+head its move's CAS replaced, so linking old to new rebuilds the
+history. The lines of concurrent changes can appear in a different
+order than the changes themselves (each job records its result after
+its change), so the history is linked, not read in line order.
 
 Blob and tree digests are never logged (a digest is a dictionary key
 to contents), and neither are token bytes or token hashes. Rotation

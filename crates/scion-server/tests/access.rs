@@ -1907,5 +1907,132 @@ fn a_partial_reader_answers_like_the_model() {
         .unwrap();
 }
 
+/// The pass-4 attacks on the shape of a prefix: a path that differs from
+/// the rule only by case, a name that only starts like the rule, and a
+/// principal name that differs by case. Paths are bytes: `DOCS/a` and
+/// `docsx/a` are outside the rule `docs`, and `Pat` is not `pat`.
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_near_a_rule_is_served() {
+    // One repo: `docs/a` inside the rule, `DOCS/a` and `docsx/a` beside
+    // it, `secret/b` outside it.
+    let (dir, store, tip) = {
+        let (dir, store, root, _blob) = store();
+        let (docs, upper, docsx, secret) = (
+            put(&store, b"a\n"),
+            put(&store, b"A\n"),
+            put(&store, b"x\n"),
+            put(&store, b"b\n"),
+        );
+        let cs = changeset(vec![root], "docs/a", Some(regular(docs)));
+        let mut changes = cs.changes().clone();
+        changes.insert(RepoPath::new("DOCS/a").unwrap(), Some(regular(upper)));
+        changes.insert(RepoPath::new("docsx/a").unwrap(), Some(regular(docsx)));
+        changes.insert(RepoPath::new("secret/b").unwrap(), Some(regular(secret)));
+        let cs = Changeset::new(
+            cs.parents().to_vec(),
+            cs.author().clone(),
+            cs.committer().cloned(),
+            cs.message().to_vec(),
+            changes,
+        )
+        .expect("changeset fits the format");
+        let tip = store
+            .write(|c| {
+                let repo = c.repo_id(REPO).unwrap();
+                c.insert_changeset(repo, &cs)
+            })
+            .unwrap();
+        (dir, store, tip)
+    };
+
+    // A whole reader sees every one of them: only the rule hides.
+    let whole = partial_access_whole();
+    let (_stop, mut boss, _) = server(&store, dir.path(), whole, "boss").await;
+    for path in ["DOCS/a", "docsx/a", "secret/b"] {
+        boss.read_file(req::read_file(tip.as_bytes(), path.as_bytes()))
+            .await
+            .unwrap_or_else(|s| panic!("a whole reader reads {path}: {s:?}"));
+    }
+
+    // pat reads `docs`: its file is served; every near-miss answers
+    // exactly as a path that is nowhere in the tree.
+    let (_stop, mut pat, _) = server(&store, dir.path(), partial_access(), "pat").await;
+    let served = pat
+        .read_file(req::read_file(tip.as_bytes(), b"docs/a"))
+        .await
+        .unwrap();
+    let mut bytes = Vec::new();
+    let mut stream = served.into_inner();
+    while let Some(part) = stream.message().await.unwrap() {
+        bytes.extend_from_slice(&part.data);
+    }
+    assert_eq!(bytes, b"a\n");
+    let absent = pat
+        .read_file(req::read_file(tip.as_bytes(), b"zzz/none"))
+        .await
+        .unwrap_err();
+    for near in ["DOCS/a", "docsx/a", "Docs/a", "secret/b"] {
+        let got = pat
+            .read_file(req::read_file(tip.as_bytes(), near.as_bytes()))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            got.code(),
+            absent.code(),
+            "{near} must answer as a missing path: {got:?} vs {absent:?}"
+        );
+        // The same refusal shape, with the path the caller sent echoed:
+        // the reply tells a hidden path from a missing one by nothing but
+        // the name the caller itself put in the request.
+        let shape = |s: &tonic::Status| {
+            let m = s.message();
+            m.starts_with("path \"") && m.ends_with("\" not found")
+        };
+        assert!(shape(&got) && shape(&absent), "{near}: {got:?}");
+    }
+}
+
+/// The access file that `nothing_near_a_rule_is_served`'s whole reader
+/// uses: boss reads the whole of `main`.
+fn partial_access_whole() -> Access {
+    let text = format!("token\tboss\t{}\nread\tboss\t{REPO}\n", hex("boss"));
+    Access::parse(&text).unwrap()
+}
+
+/// A prefix that is not a path is refused when the access file parses:
+/// a trailing slash, an empty prefix, a parent step, and a walk through
+/// one. The server refuses to start over such a rule.
+#[test]
+fn a_prefix_that_is_not_a_path_is_refused() {
+    for bad in ["docs/", "", "..", "docs/../secret", "docs//a"] {
+        let text = format!("token\tpat\t{}\nread\tpat\t{REPO}\t{bad}\n", hex("pat"));
+        let why = Access::parse(&text).expect_err(&format!("the prefix {bad:?} must be refused"));
+        assert!(
+            why.contains("bad path"),
+            "{bad:?}: the refusal must name the path: {why}"
+        );
+    }
+}
+
+/// A principal name that differs by case is another principal: the rules
+/// of `pat` do not follow `Pat`, who sees no repo on any RPC.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_principal_name_that_differs_by_case_is_another_principal() {
+    let (dir, store, tip, _docs, _secret) = repo_with_docs_and_secret();
+    let (_stop, mut pat, _) = server(&store, dir.path(), partial_access(), "pat").await;
+    pat.resolve_ref(req::resolve_ref())
+        .await
+        .unwrap_or_else(|s| panic!("the rules' own principal reads: {s:?}"));
+
+    // The token digest names the principal: `Pat` is no one here, so the
+    // answer is the token refusal, not a repo answer.
+    let (_stop, mut upper, _) = server(&store, dir.path(), partial_access(), "Pat").await;
+    match upper.resolve_ref(req::resolve_ref()).await {
+        Err(status) => assert_eq!(status.code(), Code::Unauthenticated, "{status:?}"),
+        Ok(reply) => panic!("a token with no principal read the repo: {reply:?}"),
+    }
+    let _ = tip;
+}
+
 #[path = "common/mod.rs"]
 mod common;
