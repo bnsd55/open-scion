@@ -254,16 +254,31 @@ fn every_proof_runs_the_guides_command_or_says_why() {
             .join(file);
         let text = std::fs::read_to_string(&source)
             .unwrap_or_else(|_| panic!("the proof file {file} is not in the repo"));
+        // The call may wrap its arguments across lines: read the file
+        // as one whitespace-collapsed line before matching, as the
+        // alert anchors do for YAML.
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
         let runs_block = [
             "runbook_block",
+            "runbook_block_with",
             "run_guide_block",
             "run_guide_block_async",
+            "run_guide_block_with",
             "start_on",
             "spawn_on",
             "guide_argv",
         ]
         .iter()
-        .any(|helper| text.contains(&format!("{helper}(\"{heading}\"")));
+        .any(|helper| {
+            flat.match_indices(helper).any(|(at, _)| {
+                let rest = &flat[at + helper.len()..];
+                let rest = rest.trim_start();
+                rest.starts_with('(') && {
+                    let rest = rest[1..].trim_start();
+                    rest.starts_with(&format!("\"{heading}\""))
+                }
+            })
+        });
         if runs_block {
             drivers += 1;
             continue;
@@ -304,27 +319,6 @@ fn every_proof_runs_the_guides_command_or_says_why() {
 /// a stale row fails the check. This list, mirrored in the PR body,
 /// is today's honest state: no proof is exempt silently.
 const NOT_YET_DRIVING: &[(&str, &str)] = &[
-    (
-        "The durability point",
-        "every_reply_survives_a_kill_of_the_server",
-    ),
-    ("The durability point", "every_reply_survives_a_power_cut"),
-    (
-        "The durability point",
-        "an_acknowledged_blob_survives_a_cut_at_the_last_barrier_before_its_reply",
-    ),
-    (
-        "The durability point",
-        "a_retry_after_a_failed_dir_fsync_makes_the_kept_file_durable",
-    ),
-    (
-        "The durability point",
-        "a_backup_taken_while_serving_restores_whole",
-    ),
-    (
-        "The durability point",
-        "a_restore_of_a_stated_store_takes_a_stated_time",
-    ),
     (
         "A failed migration",
         "a_newer_schema_refuses_the_open_and_a_restore_serves",

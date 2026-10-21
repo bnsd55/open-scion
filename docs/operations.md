@@ -560,10 +560,10 @@ What an acknowledged write has survived, before you need a backup:
 - What the above does **not** survive: the loss of the drive itself, or
   the loss of the machine. That is what the backup below is for.
 
-Proof: crates/scion-server/tests/power.rs::every_reply_survives_a_power_cut
-Proof: crates/scion-server/tests/dm_log_writes.rs::an_acknowledged_blob_survives_a_cut_at_the_last_barrier_before_its_reply
-Proof: crates/scion-server/tests/crash.rs::every_reply_survives_a_kill_of_the_server
-Proof: crates/scion-server/tests/storage.rs::a_retry_after_a_failed_dir_fsync_makes_the_kept_file_durable
+Proof: crates/scion-server/tests/power.rs::every_reply_survives_a_power_cut (behaviour, no command: the proof is the power cut the LazyFS device delivers at the disk boundary, which no shell command reproduces)
+Proof: crates/scion-server/tests/dm_log_writes.rs::an_acknowledged_blob_survives_a_cut_at_the_last_barrier_before_its_reply (behaviour, no command: the proof is a cut at the device's last barrier before the reply, delivered by the dm-log device, which no shell command reproduces)
+Proof: crates/scion-server/tests/crash.rs::every_reply_survives_a_kill_of_the_server (behaviour, no command: the proof is the kill's own timing - a reply answered and the process killed mid-flight - which no guide command reproduces)
+Proof: crates/scion-server/tests/storage.rs::a_retry_after_a_failed_dir_fsync_makes_the_kept_file_durable (behaviour, no command: the proof injects the fsync failure at the directory boundary, which a shell cannot order; the retry it forces is the runbook's promise)
 
 The Postgres metadata half of the first two rules is Postgres's own
 contract (`synchronous_commit = on`), which the server checks at every
