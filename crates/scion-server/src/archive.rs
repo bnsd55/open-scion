@@ -37,11 +37,11 @@ struct RepoSection {
 
 /// A land of an archive, as its file holds it: the fields a restore needs
 /// to record it again.
-struct ArchiveLand {
-    caller: String,
-    request_key: String,
-    target_ref: String,
-    input_cs: ChangesetId,
+pub(crate) struct ArchiveLand {
+    pub(crate) caller: String,
+    pub(crate) request_key: String,
+    pub(crate) target_ref: String,
+    pub(crate) input_cs: ChangesetId,
 }
 
 /// Exports `repo`, or the whole store with `all`, to the archive directory
@@ -735,7 +735,7 @@ fn write_changesets(path: &Path, changesets: &[(ChangesetId, i64, Vec<u8>)]) -> 
 // repo's full history (bodies) in RAM. Ceiling: a repo whose history is
 // gigabytes needs gigabytes. Upgrade path: stream the frames from a
 // `BufReader`, one record at a time, into the replay transaction.
-fn read_changesets(path: &Path) -> Result<Vec<(ChangesetId, i64, Vec<u8>)>> {
+pub(crate) fn read_changesets(path: &Path) -> Result<Vec<(ChangesetId, i64, Vec<u8>)>> {
     let bytes = fs::read(path)?;
     let mut out = Vec::new();
     let mut at = 0_usize;
@@ -788,7 +788,7 @@ fn write_members(path: &Path, members: &[BlobId]) -> Result<()> {
 }
 
 /// Reads the member list back.
-fn read_members(path: &Path) -> Result<Vec<BlobId>> {
+pub(crate) fn read_members(path: &Path) -> Result<Vec<BlobId>> {
     let text = fs::read_to_string(path)?;
     text.lines()
         .filter(|line| !line.is_empty())
@@ -807,7 +807,7 @@ fn read_members(path: &Path) -> Result<Vec<BlobId>> {
 }
 
 /// Writes the refs file: `[{name, target, version}]`.
-fn read_refs(path: &Path) -> Result<Vec<(String, ChangesetId, i64)>> {
+pub(crate) fn read_refs(path: &Path) -> Result<Vec<(String, ChangesetId, i64)>> {
     let value = read_json(path)?;
     let rows = value.as_array().ok_or_else(|| corrupt_json(path))?;
     rows.iter()
@@ -831,7 +831,7 @@ fn read_refs(path: &Path) -> Result<Vec<(String, ChangesetId, i64)>> {
 }
 
 /// Reads the lands file back.
-fn read_lands(path: &Path) -> Result<Vec<ArchiveLand>> {
+pub(crate) fn read_lands(path: &Path) -> Result<Vec<ArchiveLand>> {
     let value = read_json(path)?;
     let rows = value.as_array().ok_or_else(|| corrupt_json(path))?;
     rows.iter()
@@ -866,7 +866,7 @@ fn read_lands(path: &Path) -> Result<Vec<ArchiveLand>> {
 }
 
 /// Reads the provenance file back.
-fn read_provenance(path: &Path) -> Result<Vec<(ObjectId, ChangesetId)>> {
+pub(crate) fn read_provenance(path: &Path) -> Result<Vec<(ObjectId, ChangesetId)>> {
     let value = read_json(path)?;
     let rows = value.as_array().ok_or_else(|| corrupt_json(path))?;
     rows.iter()
@@ -901,7 +901,7 @@ fn read_json(path: &Path) -> Result<serde_json::Value> {
         .map_err(|error| Error::Corrupt(format!("{} does not parse: {error}", path.display())))
 }
 
-fn read_manifest(archive: &Path) -> Result<serde_json::Value> {
+pub(crate) fn read_manifest(archive: &Path) -> Result<serde_json::Value> {
     let manifest = read_json(&archive.join("manifest.json"))?;
     if manifest["format"] != "scion-archive" {
         return Err(Error::FailedPrecondition(format!(

@@ -2688,9 +2688,11 @@ impl MetaTx for PgTx<'_> {
             .transpose()
             .map_err(|e| Error::Corrupt(format!("land {land_id} result: {e}")))?;
         Ok(LandOutcome {
+            moved: false,
             land_id,
             state: LandState::parse(&state)?,
             result,
+            previous: None,
             detail,
             conflict_paths: decode_paths(&paths)
                 .ok_or_else(|| Error::Corrupt(format!("land {land_id} conflict paths")))?,
@@ -2708,8 +2710,8 @@ impl MetaTx for PgTx<'_> {
         conflict_paths: Vec<RepoPath>,
     ) -> Result<LandOutcome> {
         let updated = self.c.execute(
-            "UPDATE lands SET state = $3, result_cs = $4, detail = $5, conflict_paths = $6,
-                 finished_at = now_epoch()
+            "UPDATE lands SET state = $3, result_cs = $4, detail = $5,
+                 conflict_paths = $6, finished_at = now_epoch()
              WHERE repo_id = $1 AND land_id = $2 AND state = 'pending'",
             &[
                 P::i64(repo.0),
@@ -2726,9 +2728,11 @@ impl MetaTx for PgTx<'_> {
             )));
         }
         Ok(LandOutcome {
+            moved: false,
             land_id,
             state,
             result,
+            previous: None,
             detail,
             conflict_paths,
         })

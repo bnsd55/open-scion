@@ -6,6 +6,7 @@
 use std::path::Path;
 use std::process::Command;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use scion_core::FileState;
 use scion_proto::v1::GetObjectsRequest;
@@ -220,6 +221,8 @@ impl Interceptor for Id {
 async fn client(url: &str, id: &'static str) -> ObjectsClient<InterceptedService2> {
     let channel = Endpoint::from_shared(url.to_owned())
         .unwrap()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
         .connect()
         .await
         .unwrap();

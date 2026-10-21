@@ -154,6 +154,15 @@ pub struct LandOutcome {
     pub state: LandState,
     /// The rebased changeset, when landed.
     pub result: Option<ChangesetId>,
+    /// The ref's target the land's move replaced, when landed: the head
+    /// the land rebased onto, set where the move happens, under the
+    /// ref's lock, and not stored. A replay has none: the move's head
+    /// lives in the land line of the call that made the move.
+    pub previous: Option<ChangesetId>,
+    /// Whether this call's own settle moved the ref. A replay of an
+    /// already-landed request reports the first move's outcome, and
+    /// moved nothing itself.
+    pub moved: bool,
     /// Why it conflicted or was rejected.
     pub detail: String,
     /// Paths that conflict.
@@ -698,7 +707,7 @@ fn settle(
             )));
         }
         let generation = c.generation(repo, id)?;
-        let outcome = c.set_land_state(
+        let mut outcome = c.set_land_state(
             repo,
             land_id,
             LandState::Landed,
@@ -706,6 +715,12 @@ fn settle(
             String::new(),
             vec![],
         )?;
+        // The move's CAS pins the version the plan read, so
+        // `head.target` is the target this move replaced: the audit's
+        // old value, set here where the move happens, under the ref's
+        // lock, and not stored.
+        outcome.moved = true;
+        outcome.previous = Some(head.target);
         Ok((outcome, generation))
     });
     match landed {
@@ -1285,6 +1300,13 @@ mod tests {
         }
     }
 
+    /// The stored fields of an outcome: a replay returns the first
+    /// call's outcome. `moved` and `previous` are set in memory by the
+    /// call that moved the ref, and a replay has none.
+    fn stored(out: &LandOutcome) -> (i64, LandState, Option<ChangesetId>, String) {
+        (out.land_id, out.state, out.result, out.detail.clone())
+    }
+
     fn caller() -> Caller {
         Caller("t".into())
     }
@@ -1539,7 +1561,9 @@ mod tests {
         let f = fixture();
         let cs = f.commit(f.root, &[put("a/x", "new")]);
         let first = f.land(cs, "k");
-        assert_eq!(f.land(cs, "k"), first);
+        let replay = f.land(cs, "k");
+        assert_eq!(stored(&replay), stored(&first));
+        assert!(!replay.moved, "the replay moved nothing itself");
         assert_eq!(f.main().version, 2, "the ref moved once");
         let other = f.commit(f.root, &[put("b/y", "other")]);
         assert!(matches!(
@@ -1602,7 +1626,7 @@ mod tests {
         assert_eq!(metrics.land_replans(), 1, "the replan counted once");
         // A retry with the same key returns the same outcome.
         let again = lands.land(&f.store, &caller(), &req(cs, "hook")).unwrap();
-        assert_eq!(again, out);
+        assert_eq!(stored(&again), stored(&out));
     }
 
     #[test]
@@ -1652,7 +1676,9 @@ mod tests {
             assert_eq!(Some(after.target), out.result);
             let landed = f.store.read(|c| c.get_changeset(repo, after.target));
             assert_eq!(landed.unwrap().parents(), [before.target], "{crash:?}");
-            assert_eq!(fresh.land(&f.store, &caller(), &req).unwrap(), out);
+            let replay = fresh.land(&f.store, &caller(), &req).unwrap();
+            assert_eq!(stored(&replay), stored(&out));
+            assert!(!replay.moved, "{crash:?}: the replay moved nothing");
             assert_eq!(f.landed_count(), 1, "{crash:?}");
         }
     }
@@ -1662,8 +1688,8 @@ mod tests {
         let f = fixture();
         let out = f.land(f.commit(f.root, &[put("a/x", "new")]), "k");
         assert_eq!(
-            get_land(&f.store, &caller(), "r", out.land_id).unwrap(),
-            out
+            stored(&get_land(&f.store, &caller(), "r", out.land_id).unwrap()),
+            stored(&out)
         );
         let other = Caller("someone else".into());
         assert!(matches!(
@@ -2676,8 +2702,8 @@ mod tests {
         assert!(f.gone(&rejected));
         f.age(recent.land_id, LAND_RETENTION_SECS - 60);
         f.land(f.commit(f.main().target, &[put("d", "1")]), "next");
-        assert_eq!(f.get(recent.land_id).unwrap(), recent);
-        assert_eq!(f.get(pending.land_id).unwrap(), pending);
+        assert_eq!(stored(&f.get(recent.land_id).unwrap()), stored(&recent));
+        assert_eq!(stored(&f.get(pending.land_id).unwrap()), stored(&pending));
     }
 
     #[test]
@@ -2687,7 +2713,7 @@ mod tests {
         f.age(first.land_id, LAND_RETENTION_SECS + 1);
         // The only land expired, but it is the newest, so it stays.
         f.store.write(|c| c.expire_lands()).unwrap();
-        assert_eq!(f.get(first.land_id).unwrap(), first);
+        assert_eq!(stored(&f.get(first.land_id).unwrap()), stored(&first));
         // The next land gets a higher ID, and then the first one expires.
         let second = f.land(f.commit(f.root, &[put("f2", "x")]), "2");
         assert!(second.land_id > first.land_id);
@@ -2755,8 +2781,8 @@ mod tests {
         f.age(first.land_id, LAND_RETENTION_SECS - 60);
         f.fill("t", 3);
         let retry = f.try_land(cs, "key").unwrap();
-        assert_eq!(retry, first);
-        assert_eq!(retry.land_id, first.land_id);
+        assert_eq!(stored(&retry), stored(&first));
+        assert!(!retry.moved, "the retry moved nothing itself");
     }
 
     #[test]
