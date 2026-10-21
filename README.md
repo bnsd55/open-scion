@@ -110,9 +110,9 @@ how it is stored, so the server can change it freely.
 ### For an agent
 
 ```sh
-scn cat main:src/lib.rs                                      # read one file, no clone
-cs=$(scn commit -m "fix parser" --put src/lib.rs=./lib.rs)   # create a changeset
-scn land "$cs"                                               # rebase onto main and move it
+./target/release/scn cat main:src/lib.rs                                      # read one file, no clone
+cs=$(./target/release/scn commit -m "fix parser" --put src/lib.rs=./lib.rs)   # create a changeset
+./target/release/scn land "$cs"                                               # rebase onto main and move it
 ```
 
 `scn land` exits non-zero on a conflict and prints the paths, so an agent can
@@ -128,14 +128,19 @@ cover and cannot write; the server derives a view of the repo for it.
 
 ## Try it
 
-`scripts/demo.sh` does all of the steps below on a fixed public repository,
-prints the numbers, and removes what it made. The method and the checkout
+`scripts/demo.sh` does all of the steps below on a fixed public repository
+(tokio at commit `be689a35f5ade5a39e507f79d3ec85cdab27806f`), prints the
+numbers, and removes what it made. The method and the checkout
 benchmark against git are in [docs/benchmarks.md](https://github.com/bnsd55/openscion/blob/main/docs/benchmarks.md).
+
+The steps below want a git repository with a `src/` folder and a
+`README.md`; the demo's tokio checkout is one. Wherever you see
+`/path/to/a/repo`, use it (any path to a git repository works).
 
 ```sh
 cargo build --release
 export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
-./target/release/scion-server --data /tmp/scion import /path/to/a/git/repo
+./target/release/scion-server --data /tmp/scion import /path/to/a/repo
 ./target/release/scion-server --data /tmp/scion ticket-key --out /tmp/scion/ticket.key > /tmp/scion/ticket.pub
 # the public key is now in ticket.pub; pass it to the tiers below
 ./target/release/scion-server --data /tmp/scion serve --ticket-key /tmp/scion/ticket.key &
@@ -149,7 +154,12 @@ export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
 ./target/release/scn cat main:README.md
 ./target/release/scn checkout main --into /tmp/work   # --sparse DIR for part of it
 mkdir -p /tmp/view
+# The mount serves NFS from scn itself and holds this terminal: run it
+# in another terminal, and leave it there until `scn unmount`. On macOS
+# it runs `sudo mount_nfs`, so it asks for your password once.
 ./target/release/scn mount /tmp/view main             # files load when first read
+# The mount is read-only, so this commit is refused until you mount
+# with `--unstable-writable` (see below); the refusal names the flag.
 ./target/release/scn commit -m "from the mount" --from-mount /tmp/view
 ./target/release/scn unmount /tmp/view
 echo hello > hello.txt
@@ -166,7 +176,9 @@ error exits 2. A checkout that a signal stops removes what it wrote, and
 then dies by the signal (a shell reports 130 for Ctrl-C).
 
 `scn mount` serves a ref over NFSv3 from `scn` itself, so a file loads when
-it is first read, not when the checkout starts. In v0.1 the mount is
+it is first read, not when the checkout starts. It holds the terminal it
+runs in until `scn unmount` stops it, and on macOS it runs `sudo
+mount_nfs`, so it asks for your password once. In v0.1 the mount is
 read-only: every write is answered `EROFS`, and `scn commit --from-mount`
 refuses, because a symlinked parent directory in the overlay can still
 redirect a write outside it. `scn mount --unstable-writable` takes writes
