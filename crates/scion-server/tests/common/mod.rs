@@ -140,7 +140,11 @@ impl Server {
         // the walk refuses. The rename is atomic, so a server that reads
         // while a sibling test rewrites sees whole bytes.
         let token_file = token_file();
-        let tmp = token_file.with_extension("tmp");
+        // The staging name is unique per call: two tests spawning at once
+        // must not race one staging file's rename.
+        static STAGING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = STAGING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = token_file.with_extension(format!("tmp{n}"));
         {
             use std::os::unix::fs::OpenOptionsExt as _;
             fs::OpenOptions::new()
