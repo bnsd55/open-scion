@@ -51,6 +51,10 @@ jobs:
       tag: ${{ steps.tag.outputs.tag }}
     env:
       GH_TOKEN: ${{ github.token }}
+      # Input never touches the shell directly (a template injection
+      # would read as code here): the commit comes through env, and it
+      # must be a 40-hex-digit SHA before anything else runs.
+      DRY_RUN_COMMIT: ${{ inputs.commit }}
     steps:
       - id: tag
         run: |
@@ -61,7 +65,11 @@ jobs:
             # signature check entirely — verify-tag's signature path
             # first runs on the real tag. Upgrade: a scratch signed tag
             # in a fork, if that ever breaks.
-            commit="${{ inputs.commit }}"
+            case "${DRY_RUN_COMMIT}" in
+              [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+              *) echo "the commit must be a full 40-hex SHA"; exit 1 ;;
+            esac
+            commit="$DRY_RUN_COMMIT"
             # A dry run proves only what could be tagged: the commit is
             # an ancestor of main (or main itself).
             status="$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$commit" --jq .status)"
@@ -74,10 +82,15 @@ jobs:
           tag="${{ github.ref_name }}"
           # An annotated tag only: a lightweight tag has no tag object,
           # so it cannot carry a signature (D18).
-          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object \
-            > tag-object.json
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" \
+            > ref-answer.json
+          [ "$(jq -r .object.type ref-answer.json)" = tag ] || {
+            echo "a release needs an annotated tag, not a lightweight one"; exit 1; }
+          tagsha="$(jq -r .object.sha ref-answer.json)"
+          gh api "repos/$GITHUB_REPOSITORY/git/tags/$tagsha" \
+            > tag-answer.json
           # The verdicts are the script's; the compare needs the API.
-          peeled="$(scripts/release-verify-tag.sh check tag-object.json)"
+          peeled="$(scripts/release-verify-tag.sh check ref-answer.json tag-answer.json)"
           status="$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$peeled" --jq .status)"
           [ "$status" = behind ] || [ "$status" = identical ] || {
             echo "the tagged commit is not on main"; exit 1; }
