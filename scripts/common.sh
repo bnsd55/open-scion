@@ -168,17 +168,26 @@ start() {
   fi
   rm -f "$WORK/.owned.$name"
   pid=$job
+  # Its own counter: the record loop above runs down its own budget.
+  # SHORTCUT: nothing sweeps a pidfile left by a script that died by
+  # SIGKILL — the trap cannot run then. The janitor sweep is the named
+  # upgrade path if stale servers show up.
+  tries_ready=300
   while ! grep -q "$ready" "$WORK/$name.log"; do
     if ! kill -0 "$pid" 2> /dev/null; then
       tail -n 20 "$WORK/$name.log" >&2
       rm -f "$WORK/owned/$name"
       die "$name did not start"
     fi
-    tries=$((tries - 1))
-    [ "$tries" -gt 0 ] || die "$name did not start within 30 s"
+    tries_ready=$((tries_ready - 1))
+    [ "$tries_ready" -gt 0 ] || die "$name did not start within 30 s"
     sleep 0.1
   done
 }
+
+# Out of scope, said where a reader would look for it: a job that calls
+# setsid leaves its group and survives every stop here. Nothing in this
+# repository starts one.
 
 # owned_kill PID PGID: stop one owned job. With a group, TERM the group
 # and KILL it after five seconds; without one, TERM the pid and its
