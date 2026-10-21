@@ -836,10 +836,24 @@ pub(crate) async fn check(
     }
 }
 
-/// Waits until `ready` holds, for at most 10 s.
-pub(crate) async fn wait_until(ready: impl Fn() -> bool) {
+/// Waits until `ready` holds, for at most 10 s, and names the condition
+/// it never saw: a caller that waits for "a large upload is in flight"
+/// must not run its crash on a moment that condition never came.
+pub(crate) async fn wait_until(what: &str, ready: impl Fn() -> bool) {
     let give_up = Instant::now() + Duration::from_secs(10);
-    while !ready() && Instant::now() < give_up {
+    loop {
+        // The condition is checked first and believed: a land that is
+        // pending at this instant may land before a second look, so the
+        // wait must not re-ask after the loop (a re-check races the very
+        // thing it waited for, and names a hold that did happen as one
+        // that never did).
+        if ready() {
+            return;
+        }
+        assert!(
+            Instant::now() < give_up,
+            "the waited-for condition never held within 10 s: {what}"
+        );
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
