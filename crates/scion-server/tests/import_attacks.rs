@@ -307,6 +307,29 @@ fn reserved_names_import_like_any_other_name() {
     }
 }
 
+/// A negative time is a date git cannot write: the import refuses the
+/// commit instead of storing or panicking on it.
+#[test]
+fn a_negative_time_is_refused_not_stored() {
+    let git = Git::init();
+    let tree = plain_tree(&git);
+    let head = commit(
+        &tree,
+        &[
+            author_line("-100"),
+            "committer Ada <ada@example.com> 1700000000 +0000".to_owned(),
+        ],
+        "before the epoch\n",
+    );
+    let head = git.object("commit", &head);
+    git.force_main(&head);
+    match verdict(&git) {
+        Ok(commits) => panic!("a commit dated before the epoch imported {commits} commits"),
+        Err(Error::Git(_) | Error::Corrupt(_)) => {}
+        Err(other) => panic!("refused as {other:?}"),
+    }
+}
+
 /// The caps are the product's only when the seam is at `None`: a test
 /// lowers them on its thread and proves the same refusal with objects a
 /// few bytes big. The compile-time asserts in `import.rs` hold the

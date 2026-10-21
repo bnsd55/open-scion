@@ -94,6 +94,8 @@ thread_local! {
     /// A test's lower bound on one commit or tree object's bytes, and on
     /// one tree's entries: the refusal is proved with small objects, and
     /// the product caps stay the documented ones. `None` is the product.
+    /// Thread-local by design: the cap applies only on the thread that
+    /// set it, so an import on another thread runs at the product's caps.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
     pub static STRUCTURE_CAPS: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
@@ -698,14 +700,18 @@ impl Importer<'_> {
         batch: &mut BlobBatch<'_>,
     ) -> Result<BlobId> {
         cached(&mut self.blobs, oid, || {
-            let blob = read_blob(self.git, oid)?;
-            if blob.data.len() > MAX_OBJECT_BYTES {
+            // The cap runs on the header, before the body loads: an
+            // oversized blob costs one ODB lookup, not its own size in
+            // memory. The same class and the same fix as the trees and
+            // commits (`capped_object`).
+            let (kind, _) = capped_object(self.git, oid, "blob")?;
+            if kind != gix::objs::Kind::Blob {
                 return Err(Error::Git(Git::message(format!(
-                    "commit {commit}: \"{}\" is larger than {MAX_OBJECT_BYTES} bytes, \
-                     the most Scion stores",
+                    "commit {commit}: \"{}\" names a {kind:?}, not a blob",
                     path.as_bytes().escape_ascii()
                 ))));
             }
+            let blob = read_blob(self.git, oid)?;
             let id = BlobId::of(&blob.data);
             // A committed row of this repo names this blob only after the
             // file's and its directory's fsyncs succeeded (the batch syncs
@@ -922,13 +928,15 @@ fn read_tree(
     let cause = |what: String, e: gix::Error| {
         Error::Git(Git::cause(format!("commit {commit}: tree {id}: {what}"), e))
     };
-    let tree = git
-        .find_tree(id)
-        .map_err(|e| cause("cannot read".to_owned(), e))?;
+    // The cap runs on the header, before the body loads: an oversized
+    // tree costs one ODB lookup, not its own size in memory.
     let (kind, size) = capped_object(git, id, "tree")?;
     if kind != gix::objs::Kind::Tree {
         return Err(bad(format!("{id} is a {kind:?}, not a tree")));
     }
+    let tree = git
+        .find_tree(id)
+        .map_err(|e| cause("cannot read".to_owned(), e))?;
     // The entry bound is the map `read_tree` is about to build: the
     // header names the bytes, and no entry is smaller than
     // `MIN_TREE_ENTRY`, so this is the most entries the decode can
@@ -1107,13 +1115,17 @@ fn identity(
             "commit {commit}: {role} date {raw:?} is not a date git can write"
         ))));
     }
-    Ok(IdentityTime::new(
+    IdentityTime::new(
         signature.name.to_vec(),
         signature.email.to_vec(),
         time.seconds,
         time.offset / 60,
     )
-    .expect("identity fits the format"))
+    .map_err(|e| {
+        Error::Git(Git::message(format!(
+            "commit {commit}: {role} identity does not fit the format: {e}"
+        )))
+    })
 }
 
 /// The raw git date `<seconds> <sign><hhmm>`, as the pair gix parses it
