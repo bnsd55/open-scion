@@ -335,13 +335,11 @@ impl Lands {
         let mut derived = None;
         loop {
             let mut index = slot.lock().unwrap_or_else(PoisonError::into_inner);
-            // A call with the same key may have finished the land while this
-            // one waited for the lock.
-            let row = store.read_unflushed(|c| c.land_outcome(repo, caller, land_id))?;
-            if row.state != LandState::Pending {
-                return Ok(row);
-            }
-            let result = finish(self, store, repo, land_id, req, &mut index);
+            // The outcome check rides the plan's read transaction: a call
+            // with the same key may have finished the land while this one
+            // waited for the lock, and the plan must not run for a land
+            // that is already settled.
+            let result = finish(self, store, repo, caller, land_id, req, &mut index);
             // The index may be ahead of the database; rebuild it next time. A
             // lost race wrote nothing, so the index is still good. So is an
             // index that a deadline stopped, or that stopped because the
@@ -522,6 +520,13 @@ enum Finished {
     Derive(ChangesetId),
 }
 
+/// What the plan's read transaction found: the land is already settled
+/// by a twin call, or the plan says what it must do now.
+enum Planned {
+    Settled(LandOutcome),
+    Do(Plan),
+}
+
 /// Says that a land that stopped at its deadline, or whose call went,
 /// stays pending.
 fn stays_pending(e: Error) -> Error {
@@ -564,13 +569,29 @@ fn finish(
     lands: &Lands,
     store: &Backend,
     repo: RepoId,
+    caller: &Caller,
     land_id: i64,
     req: &LandRequest,
     index: &mut Option<PathIndex>,
 ) -> Result<Finished> {
     let mut attempt = 1;
     loop {
-        let plan = store.read_unflushed(|c| plan(lands, c, repo, req, index))?;
+        // The outcome check rides the plan's read transaction: one read
+        // answers both "already settled by a twin call" and "what the
+        // land must do now". On SQLite that read is one snapshot; on
+        // Postgres `read_unflushed` runs its statements in autocommit,
+        // so the outcome row and the plan's reads can see different
+        // states. A twin call that settles between them is still
+        // stopped at `set_land_state`'s pending guard, which answers
+        // "no longer pending" instead of moving the ref twice - the
+        // guard is the backstop there, not the shared read.
+        let planned = store.read_unflushed(|c| {
+            let row = c.land_outcome(repo, caller, land_id)?;
+            if row.state != LandState::Pending {
+                return Ok(Planned::Settled(row));
+            }
+            plan(lands, c, repo, req, index).map(Planned::Do)
+        })?;
         #[cfg(test)]
         if let Some(step) = lands
             .before_settle
@@ -580,6 +601,10 @@ fn finish(
         {
             step();
         }
+        let plan = match planned {
+            Planned::Settled(row) => return Ok(Finished::Outcome(row)),
+            Planned::Do(plan) => plan,
+        };
         match settle(lands, store, repo, land_id, &req.target_ref, plan, index) {
             Err(Error::Aborted(detail)) if attempt < MAX_ATTEMPTS => {
                 tracing::info!(land_id, attempt, %detail, "planning the land again");

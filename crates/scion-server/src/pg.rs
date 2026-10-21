@@ -22,6 +22,8 @@
 //!   twice, and the newest land holds the largest one.
 
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-hooks"))]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
@@ -907,6 +909,7 @@ impl Pg {
         let (mut writer, _waiting) = self.lock_writer();
         let mut pg = PgTx {
             c: &mut writer,
+            gen_cache: std::collections::HashMap::new(),
             ended: true,
         };
         f(&mut pg)
@@ -1132,6 +1135,12 @@ impl Drop for PgWriteWaiter<'_> {
 #[allow(unreachable_pub)]
 pub struct PgTx<'a> {
     c: &'a mut PgClient,
+    /// The generations this transaction has already read. A changeset's
+    /// generation is fixed at insert and never updated, so one read per
+    /// transaction is one round trip saved for every later read of the
+    /// same changeset - the derived walks and the land ask for the same
+    /// few ids again and again.
+    gen_cache: std::collections::HashMap<(i64, Vec<u8>), i64>,
     /// The transaction was ended by `commit` or `rollback`; a drop then
     /// leaves the client alone.
     ended: bool,
@@ -1141,7 +1150,11 @@ impl<'a> PgTx<'a> {
     /// Begins one transaction on the client.
     fn begin(c: &'a mut PgClient) -> Result<PgTx<'a>> {
         c.execute("BEGIN", &[])?;
-        Ok(Self { c, ended: false })
+        Ok(Self {
+            c,
+            gen_cache: std::collections::HashMap::new(),
+            ended: false,
+        })
     }
 
     /// Begins one read-only transaction at repeatable read: every
@@ -1169,7 +1182,11 @@ impl<'a> PgTx<'a> {
         // drops this `PgTx`, and its Drop rolls the transaction back, so
         // the pooled client never stays inside one whose statements no
         // longer run.
-        let tx = Self { c, ended: false };
+        let tx = Self {
+            c,
+            gen_cache: std::collections::HashMap::new(),
+            ended: false,
+        };
         tx.c.execute(
             &format!("SET LOCAL statement_timeout = {}", statement.as_millis()),
             &[],
@@ -1189,6 +1206,7 @@ impl<'a> PgTx<'a> {
     pub(crate) fn reborrow(&mut self) -> PgTx<'_> {
         PgTx {
             c: self.c,
+            gen_cache: std::collections::HashMap::new(),
             ended: true,
         }
     }
@@ -1398,8 +1416,55 @@ fn run_with_retry(
     run_statement(client, job)
 }
 
+/// The statements this process has run against Postgres since the last
+/// reset. A test hook: the land round-trip guard reads the delta around
+/// one land and fails the run when it grows past the budget. The count
+/// lives on the worker thread's side, so the read crosses no lock; the
+/// guard's binary runs one measuring test, so a process-wide total is
+/// one land's count.
+#[cfg(any(test, feature = "test-hooks"))]
+static TEST_STATEMENTS: AtomicU64 = AtomicU64::new(0);
+
+/// The SQL of the statements run since the last reset, for a test that
+/// wants the kinds and not just the count.
+#[cfg(any(test, feature = "test-hooks"))]
+static TEST_STATEMENT_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The SQL of the statements run since the last reset.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn test_statement_log() -> Vec<String> {
+    TEST_STATEMENT_LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// The statement count of this process since the last reset.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn test_statement_count() -> u64 {
+    TEST_STATEMENTS.load(Ordering::Relaxed)
+}
+
+/// Sets the statement count back to zero.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn test_reset_statement_count() {
+    TEST_STATEMENTS.store(0, Ordering::Relaxed);
+    TEST_STATEMENT_LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
 /// Runs one statement of a job on the client.
 fn run_statement(client: &mut Client, job: &Job) -> Result<Reply> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    {
+        TEST_STATEMENTS.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut log) = TEST_STATEMENT_LOG.try_lock() {
+            let sql: String = job.sql.chars().take(90).collect();
+            log.push(sql.replace('\n', " "));
+        }
+    }
     let refs = as_refs(&job.params);
     match job.kind {
         Kind::Batch => client.batch_execute(&job.sql).map(|(): ()| Reply::Count(0)),
@@ -1928,8 +1993,33 @@ impl MetaTx for PgTx<'_> {
         // write, on both backends.
         let (body, id) = cs.encode_with_id();
         let mut parent_gen = 0;
-        for parent in cs.parents() {
-            parent_gen = parent_gen.max(self.generation(repo, *parent)?);
+        let parents: Vec<Vec<u8>> = cs
+            .parents()
+            .iter()
+            .map(|parent| id_bytes(parent.as_bytes()))
+            .collect();
+        if !parents.is_empty() {
+            // One round trip for every parent's generation, however many
+            // parents a merge has.
+            let rows = self.c.query(
+                "SELECT id, gen FROM changesets JOIN repo_changesets ON cs = id
+                 WHERE repo_id = $1 AND id = ANY($2)",
+                &[P::i64(repo.0), P::bytea_array(parents.clone())],
+            )?;
+            let gens: std::collections::HashMap<Vec<u8>, i64> = rows
+                .into_iter()
+                .map(|row| (row.get::<_, Vec<u8>>(0), row.get::<_, i64>(1)))
+                .collect();
+            for (parent, key) in cs.parents().iter().zip(&parents) {
+                // A repeated parent reads the same row twice; `get`, not
+                // `remove`, so parents [X, X] store like they did when
+                // each parent was its own statement.
+                let parent_gen_i = *gens
+                    .get(key)
+                    .ok_or_else(|| Error::NotFound(format!("changeset {parent}")))?;
+                parent_gen = parent_gen.max(parent_gen_i);
+                self.gen_cache.insert((repo.0, key.clone()), parent_gen_i);
+            }
         }
         self.c.execute(
             "INSERT INTO changesets (id, gen, body) VALUES ($1, $2, $3)
@@ -1940,14 +2030,17 @@ impl MetaTx for PgTx<'_> {
                 P::bytes(&body),
             ],
         )?;
-        for (n, parent) in (0_i64..).zip(cs.parents()) {
+        // Every parent as one statement, however many a merge has: the
+        // row number is the parent's place in the array.
+        if !parents.is_empty() {
             self.c.execute(
-                "INSERT INTO changeset_parents (cs, n, parent) VALUES ($1, $2, $3)
+                "INSERT INTO changeset_parents (cs, n, parent)
+                 SELECT $1, ord, parent
+                 FROM unnest($2::bytea[]) WITH ORDINALITY AS parents(parent, ord)
                  ON CONFLICT (cs, n) DO NOTHING",
                 &[
                     P::bytes(&id_bytes(id.as_bytes())),
-                    P::i64(n),
-                    P::bytes(&id_bytes(parent.as_bytes())),
+                    P::bytea_array(parents.clone()),
                 ],
             )?;
         }
@@ -1968,6 +2061,22 @@ impl MetaTx for PgTx<'_> {
             &[P::i64(repo.0), P::bytes(&id_bytes(blob.as_bytes()))],
         )?;
         Ok(added == 1)
+    }
+
+    /// Adds every blob as one statement, however many the changeset
+    /// puts.
+    fn add_repo_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<()> {
+        if blobs.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<Vec<u8>> = blobs.iter().map(|blob| id_bytes(blob.as_bytes())).collect();
+        self.c.execute(
+            "INSERT INTO repo_blobs (repo_id, blob)
+             SELECT $1, x FROM unnest($2::bytea[]) AS x
+             ON CONFLICT (repo_id, blob) DO NOTHING",
+            &[P::i64(repo.0), P::bytea_array(ids)],
+        )?;
+        Ok(())
     }
 
     /// Whether `repo` may name `blob`.
@@ -2024,14 +2133,23 @@ impl MetaTx for PgTx<'_> {
     ///
     /// [`Error::NotFound`] if `repo` does not have it.
     fn generation(&mut self, repo: RepoId, id: ChangesetId) -> Result<i64> {
-        self.c
+        let key = (repo.0, id_bytes(id.as_bytes()));
+        if let Some(cached) = self.gen_cache.get(&key) {
+            return Ok(*cached);
+        }
+        let found = self
+            .c
             .query_opt(
                 "SELECT gen FROM changesets JOIN repo_changesets ON cs = id
                  WHERE repo_id = $1 AND id = $2",
-                &[P::i64(repo.0), P::bytes(&id_bytes(id.as_bytes()))],
+                &[P::i64(repo.0), P::bytes(&key.1)],
             )?
             .map(|row| row.get::<_, i64>(0))
-            .ok_or_else(|| Error::NotFound(format!("changeset {id}")))
+            .ok_or_else(|| Error::NotFound(format!("changeset {id}")));
+        if let Ok(found_gen) = &found {
+            self.gen_cache.insert(key, *found_gen);
+        }
+        found
     }
 
     /// The generation of a changeset, in any repo. For derived data.
@@ -2391,6 +2509,26 @@ impl MetaTx for PgTx<'_> {
             &[P::bytes(&id_bytes(id.as_bytes())), P::bytes(&body)],
         )?;
         Ok(id)
+    }
+
+    /// Stores pre-encoded trees, whose ids are their content hashes, as
+    /// one statement however many the chain built.
+    fn put_trees(&mut self, trees: &[(TreeId, Vec<u8>)]) -> Result<()> {
+        if trees.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<Vec<u8>> = trees
+            .iter()
+            .map(|(id, _)| id_bytes(id.as_bytes()))
+            .collect();
+        let bodies: Vec<Vec<u8>> = trees.iter().map(|(_, body)| body.clone()).collect();
+        self.c.execute(
+            "INSERT INTO trees (id, body)
+             SELECT * FROM unnest($1::bytea[], $2::bytea[])
+             ON CONFLICT (id) DO NOTHING",
+            &[P::bytea_array(ids), P::bytea_array(bodies)],
+        )?;
+        Ok(())
     }
 
     /// Reads a tree and checks it against its ID.
