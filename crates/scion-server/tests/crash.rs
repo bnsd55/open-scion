@@ -299,6 +299,16 @@ fn a_newer_schema_refuses_the_open_and_a_restore_serves() {
         text.contains("newer than this build"),
         "the refusal names the problem: {text}"
     );
+    // The refusal names both versions, as the runbook says: the data's
+    // (the forged version+1) and the build's, as the numbers themselves.
+    assert!(
+        text.contains(&format!("{}", version + 1)),
+        "the refusal names the data's version: {text}"
+    );
+    assert!(
+        text.contains(&version.to_string()),
+        "the refusal names the build's version: {text}"
+    );
 
     // The fix, the restore arm: the backup's database replaces the
     // forged one (the WAL of the refused open goes with it), and the
