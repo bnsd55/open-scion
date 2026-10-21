@@ -303,7 +303,11 @@ impl Tree {
     ///
     /// The bytes must be the canonical encoding: the stored body is
     /// checked against its ID before this runs, and this still refuses
-    /// what the decoder refuses.
+    /// what the decoder refuses up to the point it stops reading. It
+    /// stops at the name it finds — the tail is not checked. That is
+    /// sound: a stored body was checked when it was written and its ID
+    /// is the hash of its whole bytes, and fsck re-checks the store.
+    /// This is a reader, not a validator.
     ///
     /// # Errors
     ///
@@ -320,7 +324,7 @@ impl Tree {
             if let Some(prev) = prev
                 && entry_name <= prev
             {
-                return Err(DecodeError::TrailingBytes);
+                return Err(DecodeError::Unsorted);
             }
             prev = Some(entry_name);
             match entry_name.cmp(name) {
