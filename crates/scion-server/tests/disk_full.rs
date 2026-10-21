@@ -278,6 +278,47 @@ fn seed_client_blob(
 /// step: the disk fills and refuses, the gc routine frees what nothing
 /// names (a dry run first, then a real one), fsck is clean, and writes
 /// resume with no restart and no repair.
+/// The output of one `gc` run on `data`, dry or real. On the database
+/// backend the subprocess needs what the store's own open had: the URL,
+/// whose `options` carry the schema, so the gc's open lands in this
+/// directory's database corner and not beside it.
+fn gc_args(data: &std::path::Path, dry: bool) -> String {
+    let mut args = vec![
+        "--data".to_owned(),
+        data.display().to_string(),
+        "gc".to_owned(),
+        "--grace-secs".to_owned(),
+        "0".to_owned(),
+    ];
+    if Backend::test_is_postgres()
+        && let Ok(url) = std::env::var("SCION_TEST_POSTGRES_URL")
+    {
+        let schema = Backend::test_schema(data).expect("the test names a schema");
+        args.push("--postgres-url".to_owned());
+        args.push(format!(
+            "{url}{}options=--search_path%3D{schema}",
+            if url.contains('?') { "&" } else { "?" }
+        ));
+    }
+    if dry {
+        args.push("--dry-run".to_owned());
+    }
+    let out = common::spawn_guard::across_spawn(|| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
+            .args(&args)
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("the gc command runs")
+    });
+    assert!(
+        out.status.success(),
+        "gc {} failed: {}",
+        if dry { "--dry-run" } else { "real" },
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
 #[test]
 fn a_disk_full_runbook_gcs_then_writes_resume() {
     if !required() {
@@ -329,32 +370,7 @@ fn a_disk_full_runbook_gcs_then_writes_resume() {
     // unnamed blobs. The blobs are seconds old, so the grace must be
     // zero for the run to take them.
     let data = mount.0.join("data");
-    let gc = |dry: bool| {
-        let mut args = vec![
-            "--data".to_owned(),
-            data.display().to_string(),
-            "gc".to_owned(),
-            "--grace-secs".to_owned(),
-            "0".to_owned(),
-        ];
-        if dry {
-            args.push("--dry-run".to_owned());
-        }
-        let out = common::spawn_guard::across_spawn(|| {
-            std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
-                .args(&args)
-                .env("NO_COLOR", "1")
-                .output()
-                .expect("the gc command runs")
-        });
-        assert!(
-            out.status.success(),
-            "gc {} failed: {}",
-            if dry { "--dry-run" } else { "real" },
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).to_string()
-    };
+    let gc = |dry: bool| gc_args(&data, dry);
     let dry = gc(true);
     assert!(dry.contains("(dry run)"), "a dry run labels itself: {dry}");
     let real = gc(false);
@@ -436,10 +452,10 @@ fn data_dir(client: &mut postgres::Client) -> String {
 /// itself can be the write that fails first.
 fn fill(client: &mut postgres::Client, chunk_len: usize, ceiling: u64) -> Option<postgres::Error> {
     client
-        .batch_execute("CREATE SCHEMA IF NOT EXISTS pg_diskfull_filler")
+        .batch_execute("CREATE SCHEMA IF NOT EXISTS diskfull_filler")
         .expect("the filler schema is created");
     client
-        .batch_execute("CREATE TABLE IF NOT EXISTS pg_diskfull_filler.filler (chunk bytea)")
+        .batch_execute("CREATE TABLE IF NOT EXISTS diskfull_filler.filler (chunk bytea)")
         .expect("the filler table is created");
     let chunk = vec![b'f'; chunk_len];
     loop {
@@ -450,10 +466,7 @@ fn fill(client: &mut postgres::Client, chunk_len: usize, ceiling: u64) -> Option
         if size.cast_unsigned() >= ceiling {
             return None;
         }
-        match client.execute(
-            "INSERT INTO pg_diskfull_filler.filler VALUES ($1)",
-            &[&chunk],
-        ) {
+        match client.execute("INSERT INTO diskfull_filler.filler VALUES ($1)", &[&chunk]) {
             Ok(_) => {
                 // A checkpoint keeps the WAL small, so the tmpfs's space
                 // goes to the filler's heap pages and the margin holds.
@@ -544,14 +557,14 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
 
     // Reads work on both arms: the rows the fill landed are still there.
     let read: i64 = client
-        .query_one("SELECT count(*) FROM pg_diskfull_filler.filler", &[])
+        .query_one("SELECT count(*) FROM diskfull_filler.filler", &[])
         .expect("the filler reads")
         .get(0);
     assert!(read > 0, "the filler's rows vanished");
 
     // The space comes back, and the same write lands with no restart.
     client
-        .batch_execute("DROP SCHEMA pg_diskfull_filler CASCADE")
+        .batch_execute("DROP SCHEMA diskfull_filler CASCADE")
         .expect("the filler drops");
     client
         .batch_execute("CHECKPOINT")
