@@ -1,12 +1,15 @@
 # Design: big folders cost too much per land
 
 **Status: proposal. Nothing in this file is built.** It answers the
-land-cost review finding (coder7's `land_cost.rs` measurements): each land
-rewrites one tree node per folder on each changed path, a node holds the
-whole folder, and the cost is linear in folder size. [`format-v1.md`]
-(../format-v1.md) is the contract this design keeps. Numbers marked
-**estimate** are back-of-envelope figures, not measurements; the measured
-counterparts are coder7's `land_cost.rs` numbers, quoted when they arrive.
+land-cost review finding (a measurement of the bytes one land adds, at
+10, 1,000 and 10,000 entries, per folder and per path history): each
+land rewrites one tree node and one history node per folder on each
+changed path, each holds the whole folder (history only until its 64 KiB
+bound), and the cost is linear in folder size. On the tokio store, the
+measurement read `history_nodes` 194 MB against `trees` 137 MB.
+[`format-v1.md`](../format-v1.md) is the contract this design keeps.
+Numbers marked **estimate** are back-of-envelope figures, not
+measurements; the tokio numbers are the measurements.
 
 ## 1. Which bytes are format, which are ours
 
@@ -55,18 +58,62 @@ folder's whole node:
 | 100,000 | 6.4 MB | 64 GB |
 
 The same row is also read whole: `tree::lookup` calls `get_tree` at each
-level and clones the full entry map (`tree.rs:119`), so a file read in a
+level and clones the full entry map (`tree.rs:119`), so one file read in a
 100,000-entry directory costs ~6.4 MB (estimate) to find one entry.
+Section 3.5 takes that read path on its own.
 
-The land's other tree is not the problem: each changeset writes one
-history node per folder on its changed paths, but those nodes already
-chunk at 64 KiB, so a 100,000-name directory's history read is its chunk,
-"about 8 KiB" (`read.rs`), plus the index. `Log` with a path reads one
-history node per path part per step (bounded by `MAX_LOG_NODE_BYTES`), and
-the conflict check reads the same nodes. The folder cost is the root
-tree's.
+The land's other tree costs the same shape, and more. Each changeset also
+writes one history node per folder on its changed paths. Those nodes
+chunk at a 64 KiB bound (7 bits), but the chunking only caps *large*
+folders: a folder of under about 1,000 entries (history entries are
+~64–90 bytes: name, flags, a 32-byte changeset id, a generation, and
+often a 32-byte child id) sits in **one** chunk, and every land rewrites
+that chunk whole. On the tokio store, the measurement read
+`history_nodes` at
+194 MB against `trees` at 137 MB — for typical folders, history is the
+larger half of the per-land cost, not a footnote.
 
-## 3. Three options
+What the two sides cost per land on a folder of n entries (estimate):
+
+| tree | bytes per land | capped at |
+|---|---|---|
+| root tree (`trees`) | ~64 B × n | never — the node is the folder |
+| path history (`history_nodes`) | ~64–90 B × n | ~64 KiB per level |
+
+`Log` with a path and the conflict check read history nodes: one node
+(chunk or index) per path part per step, bounded by `MAX_LOG_NODE_BYTES`.
+A smaller history bound than 64 KiB would cut the land cost for
+medium-size folders (a 500-entry folder becomes two chunks instead of
+one), but it charges reads for it: the index rows grow (each level holds
+more of them, all rebuildable but all written), and every step of `Log`
+with a path reads the index plus one more chunk, so a scan's row count
+rises with the chunk count. The bound trades land bytes against read
+row counts, not against nothing.
+
+## 3.5 The read path is a separate finding
+
+`tree::lookup` reads each level's whole node and clones its entire entry
+map to remove one name (`tree.rs:119`): a file read in a 100,000-entry
+directory copies ~6.4 MB (estimate) on every call — CPU and memory on
+the read path, on every read, not only storage. This is separate from
+the land cost and does not need the chunked layout to fix.
+
+**The cheap fix: binary search in the body, no clone.** `TreeV1` entries
+are sorted by name bytes, and the body's layout is self-describing
+(length-prefixed names, fixed-size ids). A lookup can scan the encoded
+body with a binary search over entry boundaries — or at minimum iterate
+with early exit and stop at the first name above the target — decode one
+entry, and never materialize the map. The change is inside
+`tree::lookup`/`MetaTx::get_tree` plumbing; no format, schema, or
+migration changes.
+
+Note what neither fix changes: `TreeV1` is also what clients fetch, so a
+100,000-entry folder is a ~6.4 MB object on the wire whatever the server
+stores. Storage chunking reassembles the same bytes; shrinking the
+wire object means giving clients partial tree reads — format v2
+territory, out of scope here.
+
+## 4. Three options
 
 ### O1 — chunked folder nodes (content-defined chunks)
 
@@ -75,10 +122,12 @@ entry stream by content-defined cut points (as `history.rs` does). A land
 rewrites only the chunks its entries fall in, plus the spine of chunk
 digests up to the root.
 
-- Bytes per land: about `64 B × chunk_size × touched_chunks` — with
-  128-entry chunks, ~10 KB (estimate), flat in folder size.
-- `Log` with a path: reads history nodes (unchanged) plus one chunk per
-  part to resolve the path — smaller than today's whole node.
+- Bytes per land, root tree: about `64 B × chunk_size × touched_chunks`
+  — with 128-entry chunks, ~10 KB (estimate), flat in folder size.
+- Bytes per land, path history: the same scheme applies; today a typical
+  folder's level is one chunk rewritten whole, so chunking history with a
+  *smaller* bound (or chunking the root tree the same way) is what caps
+  the larger half the measurement read. One mechanism covers both tables.
 - `ListDir`: reads all k chunks of the folder (same bytes, k row reads).
   The `Tree` reply is assembled from the chunks; for the common
   small-folder case the cut never fires and the behavior is identical.
@@ -112,27 +161,36 @@ cost is trivial; the change is one row-encoding seam.
 
 ## 4. Recommendation and trigger
 
-**Recommendation: O1 when the trigger fires, with O3 stacked on top.**
-O1 is the only option that breaks the linear term; it copies the chunking
-the codebase already has for path history; and it also shrinks the read
-side (`lookup`, `ListDir` on big directories). O2 spends complexity to
+**Recommendation: O1 when the trigger fires, with O3 stacked on top, and
+the §3.5 lookup fix first.** The lookup fix is days, not weeks, and pays
+on every read today. O1 is the only option that breaks the linear term
+(on both tables — the same chunking applies to root-tree storage and to
+a smaller history bound); it copies the chunking the codebase already
+has for path history; and it also shrinks the read side (`ListDir` on
+big directories pays row counts, not whole-node copies). O2 spends complexity to
 keep the same linear shape with a smaller constant, and delta chains tax
 the random reads a tree format exists to serve. O3 is cheap and stacks,
 but is not a fix.
 
 **Trigger — pay for the change when a folder is this big and this hot
-(estimate):**
+(estimate, both tables together):**
 
 - A folder of **≥ 1,000 entries** taking **≥ 100 lands a day**: that is
-  ≥ 64 MB/day of write amplification from one folder — 23 GB/year.
-- Or the `trees` table growing **≥ 1 GB/week** with lands whose changed
-  paths share folders.
-- Below 100 entries the per-land cost is 6.4 KB — nothing to fix; do
-  nothing there. The migration's own cost is one rewrite of every tree,
-  the same bytes as one land per folder today.
+  ≥ 64 MB/day of write amplification from one folder — 23 GB/year —
+  split between its root-tree node and its history chunk.
+- Or `trees` + `history_nodes` growing **≥ 1 GB/week** with lands whose
+  changed paths share folders (on tokio the pair measured 331 MB).
+- Below 100 entries the per-land cost is ~6.4 KB per tree — nothing to
+  fix; do nothing there. The migration's own cost is one rewrite of
+  every tree and history node, the same bytes as one land per folder
+  today.
 
 ## 5. What this does not change
 
-`TreeV1` bytes, IDs, the wire protocol, and every client-visible read stay
-as they are. A store migrated to chunks serves the same `TreeV1` bodies;
-`format-v1.md` is untouched, and a client cannot tell.
+`TreeV1` bytes, IDs, and every server-side check stay as they are. A
+store migrated to chunks serves the same `TreeV1` bodies;
+`format-v1.md` is untouched. The wire is the one thing no storage change
+touches: clients fetch whole `TreeV1` objects (§3.5), so a 100,000-entry
+folder is a ~6.4 MB reply whatever the server stores. Smaller wire
+objects for big folders mean partial tree reads for clients — format v2
+territory.
