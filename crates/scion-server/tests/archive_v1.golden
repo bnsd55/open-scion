@@ -1,12 +1,37 @@
-# one row per archive file, hash and path; the manifest's clock
-# reading and store UUID are not the format and pin nothing here
+# The manifest, normalized: the run's UUID and clock pin nothing.
+{
+  "counts": {
+    "blobs": 3,
+    "changesets": 3,
+    "pending_lands": 0,
+    "refs": 1,
+    "repos": 1
+  },
+  "format": "scion-archive",
+  "kind": "store",
+  "repos": [
+    {
+      "changesets": 3,
+      "members": 3,
+      "name": "golden",
+      "pending_lands": 0,
+      "provenance": 0,
+      "refs": 1
+    }
+  ],
+  "snapshot_at": "<time>",
+  "snapshot_note": "the metadata sections are one read snapshot; the blob files are immutable, and gc keeps a blob past its grace",
+  "store_uuid": null,
+  "version": 1
+}
+# One row per archive file, hash and path, sorted by path.
 064985f4ad8ebf2653896ba0e37edc756a6fc6a57ff424322f9a3e4535cfca61  blobs/01/5ba2be537646193be2162f4efc99027ee4f890c1282431ee9d58074cfca06c
-3f898fb2b59eff7f7a535435c6b660d483b0d5cbc191f416b1a48fe54cd61b40  blobs/cb/3373911f5a2ef5cb21fdb49542e53e3f18843f91d1e006ad3fba86772f57f8
-48db72f948da515079e93bcf86a1042e9cea79181ff171dda51cd66832128f93  repos/golden/members.txt
-9308029f3d093cebb587f248079ae5551f0031370252b74ed2e6d79d3026de58  repos/golden/refs.json
 c10c872485edafcf55e43fa04091075ae4c478ba0604eee00d3db04e2827a4b0  blobs/53/9ab6ae796a54470a1fa49006c84ea14cc8d43f890b9c259e10ed5b93057cc1
+3f898fb2b59eff7f7a535435c6b660d483b0d5cbc191f416b1a48fe54cd61b40  blobs/cb/3373911f5a2ef5cb21fdb49542e53e3f18843f91d1e006ad3fba86772f57f8
 cd73889e355d04218b9bbb3393b554c6735808658b11b159b27e3fc881ffcc68  repos/golden/changesets.bin
 d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab  repos/golden/lands.json
+48db72f948da515079e93bcf86a1042e9cea79181ff171dda51cd66832128f93  repos/golden/members.txt
 d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab  repos/golden/provenance.json
-# the restored store's main resolves to
+9308029f3d093cebb587f248079ae5551f0031370252b74ed2e6d79d3026de58  repos/golden/refs.json
+# The restored store's main resolves to:
 main  ad63dcfbf942d7ce47b863afd8a4f42cc0f57a5c708c6971171f6a83faab9525

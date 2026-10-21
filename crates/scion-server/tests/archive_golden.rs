@@ -4,7 +4,9 @@
 //! reading and store UUID excepted), `verify` takes the golden with no
 //! store code, and a restore of it resolves the pinned `main`. A diff
 //! in the golden is a format change: docs/archive-format.md's version,
-//! beside v1, and a changes/ fragment naming the break.
+//! beside v1, and a changes/ fragment naming the break. `open_test` runs
+//! this under test (postgres) too, so the golden also proves both
+//! backends export the same bytes.
 //!
 //! Updating on purpose: run this test with
 //! `SCION_UPDATE_ARCHIVE_GOLDEN=1`, commit the changed
@@ -101,13 +103,49 @@ fn rows(archive: &Path) -> Vec<(String, String)> {
         let hex = blake3::hash(&fs::read(&p).unwrap()).to_hex().to_string();
         rows.push((hex, rel.to_string_lossy().to_string()));
     }
-    rows.sort();
+    rows.sort_by(|a, b| a.1.cmp(&b.1));
     rows
 }
 
 /// The export's files hash to the golden's rows, the manifest's stable
 /// fields say what the format says, and the restore resolves the
 /// golden's `main` - on a fresh store, `fsck` clean.
+/// The manifest is a format surface (docs/archive-format.md names its
+/// keys). Its two run-dependent values normalize: the store UUID to
+/// `<uuid>` after it shows as 32 lowercase hex (a SQLite directory has
+/// none - the UUID lives in the database), and the snapshot instant to
+/// `<time>` after it shows as an RFC 3339 stamp to the second with a
+/// Z. The rest of the manifest pins as text, so a renamed key or a
+/// dropped array shows as a readable diff.
+fn normalized_manifest(manifest: &serde_json::Value) -> String {
+    let uuid = manifest["store_uuid"].as_str().unwrap_or_default();
+    assert!(
+        uuid.is_empty()
+            || (uuid.len() == 32
+                && uuid
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
+        "the store UUID is 32 lowercase hex, or absent on SQLite: {uuid}"
+    );
+    let stamp = manifest["snapshot_at"].as_str().unwrap_or_default();
+    assert_eq!(
+        stamp.len(),
+        20,
+        "the stamp is RFC 3339 to the second with a Z: {stamp}"
+    );
+    assert_eq!(&stamp[..2], "20", "the stamp starts with a year: {stamp}");
+    assert!(stamp.ends_with('Z'), "the stamp ends in Z: {stamp}");
+    let mut normalized = serde_json::to_string_pretty(manifest).unwrap();
+    normalized = normalized.replace(
+        &format!("\"store_uuid\": \"{uuid}\""),
+        "\"store_uuid\": \"<uuid>\"",
+    );
+    normalized.replace(
+        &format!("\"snapshot_at\": \"{stamp}\""),
+        "\"snapshot_at\": \"<time>\"",
+    )
+}
+
 #[test]
 fn the_export_is_the_golden_and_restores_to_it() {
     let data = tempfile::tempdir().unwrap();
@@ -115,30 +153,36 @@ fn the_export_is_the_golden_and_restores_to_it() {
 
     let out = data.path().join("archive");
     let manifest = archive::export(&store, data.path(), None, true, &out).unwrap();
-    assert_eq!(manifest["format"], "scion-archive");
-    assert_eq!(manifest["version"], 1);
-    assert_eq!(manifest["kind"], "store");
-    assert_eq!(manifest["counts"]["changesets"], 3);
-    assert_eq!(manifest["counts"]["refs"], 1);
-    assert_eq!(manifest["counts"]["pending_lands"], 0);
+    let normalized = normalized_manifest(&manifest);
 
     let rows = rows(&out);
+    // The manifest's normalized text is the golden's first section: a
+    // key change shows as a readable diff.
+    let mut text = String::new();
+    text.push_str("# The manifest, normalized: the run's UUID and clock pin nothing.\n");
+    text.push_str(&normalized);
+    text.push('\n');
+    text.push_str("# One row per archive file, hash and path, sorted by path.\n");
+    for (hex, path) in &rows {
+        writeln!(text, "{hex}  {path}").unwrap();
+    }
+    text.push_str("# The restored store's main resolves to:\n");
+    writeln!(text, "main  {main}").unwrap();
     if std::env::var_os("SCION_UPDATE_ARCHIVE_GOLDEN").is_some() {
-        let mut text = String::new();
-        text.push_str("# one row per archive file, hash and path; the manifest's clock\n# reading and store UUID are not the format and pin nothing here\n");
-        for (hex, path) in &rows {
-            writeln!(text, "{hex}  {path}").unwrap();
-        }
-        writeln!(text, "# the restored store's main resolves to").unwrap();
-        writeln!(text, "main  {main}").unwrap();
-        fs::write(GOLDEN, text).unwrap();
+        fs::write(GOLDEN, &text).unwrap();
     }
 
     let golden = fs::read_to_string(GOLDEN).unwrap();
     let mut golden_rows: Vec<(String, String)> = Vec::new();
     let mut pinned_main = String::new();
     for line in golden.lines() {
-        if line.starts_with('#') || line.trim().is_empty() {
+        if line.starts_with('#')
+            || line.trim().is_empty()
+            || line.starts_with('{')
+            || line.starts_with('"')
+            || line.starts_with('}')
+            || line.starts_with("  ")
+        {
             continue;
         }
         let (first, second) = line.split_once("  ").expect("a golden row");
@@ -158,6 +202,27 @@ fn the_export_is_the_golden_and_restores_to_it() {
          version beside v1 (docs/archive-format.md) and a changes/ fragment \
          naming the break; to re-pin on purpose run with \
          SCION_UPDATE_ARCHIVE_GOLDEN=1"
+    );
+    // The manifest's stable text pins too, from the golden: the
+    // normalized manifest the run built appears in it verbatim.
+    let is_manifest_line = |l: &str| {
+        l.starts_with('{') || l.starts_with('"') || l.starts_with("  ") || l == "}" || l == "{"
+    };
+    let manifest_rows = golden.lines().filter(|l| is_manifest_line(l));
+    let golden_manifest: String = manifest_rows.collect::<Vec<_>>().join("\n");
+    let built_manifest: String = normalized
+        .lines()
+        .filter(|l| is_manifest_line(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !golden_manifest.is_empty(),
+        "the golden carries the normalized manifest"
+    );
+    assert_eq!(
+        built_manifest, golden_manifest,
+        "the manifest's keys changed: a format change is a new archive \
+         version beside v1, and a changes/ fragment naming the break"
     );
 
     // The archive is sound, per the format, with no store code.
