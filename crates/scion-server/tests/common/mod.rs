@@ -234,30 +234,40 @@ pub(crate) type Objects = ObjectsClient<InterceptedService<Channel, Bearer>>;
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// One channel for a test client: the timeout is the point.
+/// One channel for a test client: the timeout is the point. Every call
+/// on the channel carries `timeout` (the Endpoint applies it per
+/// request), so a server that dies mid-reply ends the call instead of
+/// parking it. A test that wants a tighter deadline sets its own and
+/// the smaller one fires first.
 pub(crate) async fn channel(url: &str) -> Result<Channel, tonic::transport::Error> {
+    channel_within(url, CALL_TIMEOUT).await
+}
+
+/// The same channel with a ceiling of the test's choosing, for the test
+/// that proves the ceiling itself.
+pub(crate) async fn channel_within(
+    url: &str,
+    timeout: Duration,
+) -> Result<Channel, tonic::transport::Error> {
     Channel::from_shared(url.to_owned())
         .unwrap()
         .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(timeout)
         .connect()
         .await
 }
 
-/// The callers' ceiling: a call that outlives `CALL_TIMEOUT` is the
-/// test's bug, named. A call that carries its own tighter timeout is
-/// wrapped by its test instead.
-pub(crate) async fn within_call_ceiling<T>(
-    what: &str,
-    call: impl std::future::Future<Output = T>,
-) -> T {
-    match tokio::time::timeout(CALL_TIMEOUT, call).await {
-        Ok(done) => done,
-        Err(_) => panic!("{what} outlived its {} s ceiling", CALL_TIMEOUT.as_secs()),
-    }
+pub(crate) async fn connect(url: &str) -> Result<(Scion, Objects), tonic::transport::Error> {
+    connect_within(url, CALL_TIMEOUT).await
 }
 
-pub(crate) async fn connect(url: &str) -> Result<(Scion, Objects), tonic::transport::Error> {
-    let channel = channel(url).await?;
+/// The pair of clients on a channel with a ceiling of the test's
+/// choosing: the proof of the ceiling itself uses 2 s.
+pub(crate) async fn connect_within(
+    url: &str,
+    timeout: Duration,
+) -> Result<(Scion, Objects), tonic::transport::Error> {
+    let channel = channel_within(url, timeout).await?;
     let bearer = Bearer::new(TOKEN).unwrap();
     let objects = ObjectsClient::with_interceptor(channel.clone(), bearer.clone());
     Ok((ScionClient::with_interceptor(channel, bearer), objects))
