@@ -67,6 +67,65 @@ fn source(data: &Path) -> (Backend, ChangesetId) {
     (store, main)
 }
 
+/// The section claims one read snapshot. A writer that lands a changeset
+/// between the section's statements must stay outside it: the section
+/// read the changesets first, so its refs can only name changesets it
+/// holds. Without the snapshot this fails at the verify: the refs query
+/// sees the landed changeset, the changesets query does not, and the
+/// archive names a ref target it does not hold.
+#[test]
+fn a_section_holds_one_snapshot_when_a_writer_lands_between_its_statements() {
+    let data = tempfile::tempdir().unwrap();
+    let (store, _) = source(data.path());
+
+    // The blob the hook's changeset names, stored before the export: the
+    // hook only records the row and moves the ref.
+    let hook_blob = store.blobs().put(b"hook").unwrap();
+
+    // The writer the hook runs: the first call lands one changeset on
+    // `dev` while the section holds its snapshot; the later calls pass.
+    let writes = store.clone();
+    let landed = std::sync::atomic::AtomicBool::new(false);
+    archive::set_section_hook(Some(Box::new(move || {
+        if landed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        writes
+            .write(|c| {
+                let repo = c.repo_id(REPO)?;
+                let state = c.get_ref(repo, "dev")?;
+                let parent = match &state {
+                    Some(state) => state.target,
+                    None => c.get_ref(repo, "main")?.expect("main").target,
+                };
+                let cs = changeset(vec![parent], &[("h", Some(regular("hook")))]);
+                let id = tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0;
+                c.add_repo_blob(repo, hook_blob)?;
+                assert!(c.cas_ref(repo, "dev", state.map(|s| s.version), id)?);
+                Ok(())
+            })
+            .unwrap();
+    })));
+
+    let out = tempfile::tempdir().unwrap().path().join("archive");
+    let manifest = archive::export(&store, data.path(), None, true, &out)
+        .unwrap_or_else(|e| panic!("export failed: {e:#}"));
+    archive::set_section_hook(None);
+    assert_eq!(manifest["format"], "scion-archive");
+
+    // The archive is sound, per the format, with no store code.
+    let damages = archive::verify(&out).unwrap();
+    assert!(damages.is_empty(), "{damages:?}");
+
+    // And a restore replays it into an empty store with a clean fsck.
+    let restored_dir = tempfile::tempdir().unwrap();
+    let names = archive::restore(&out, restored_dir.path(), None, None).unwrap();
+    assert_eq!(names, vec![REPO]);
+    let restored = Backend::open(restored_dir.path(), None, None).unwrap();
+    let problems = fsck::run(&restored, fsck::BATCH, &mut |_| {}).unwrap();
+    assert!(problems.problems.is_empty(), "{problems:?}");
+}
+
 #[test]
 fn an_export_beside_a_writer_verifies_and_restores_resolving_main() {
     let data = tempfile::tempdir().unwrap();
