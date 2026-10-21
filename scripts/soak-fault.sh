@@ -152,6 +152,13 @@ server_pid() {
 }
 server_pid || die "no process listens on the server port"
 CACHE_URL="http://127.0.0.1:$CACHE_PORT"
+# The file size the slow client's drains are checked against, taken
+# once while the server was fresh (common.sh, issue #399). A size of
+# 0 means the file is not in the store: the slow client would read
+# nothing and its check would pass vacuously, so the run stops here.
+SLOW_EXPECTED=$("$TIMEOUT" 60 "$BIN/scn" --server "$SERVER" cat "$SLOW_FILE" | wc -c | tr -d ' ')
+[ -n "$SLOW_EXPECTED" ] && [ "$SLOW_EXPECTED" -gt 0 ] \
+  || die "the slow file $SLOW_FILE is missing from the store"
 
 # start_server: the server line of common.sh's start_scion, alone. The
 # cache and daemon keep running across a server-only restart, which is
@@ -190,7 +197,7 @@ fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
 latency() {
   local t0 t1
   t0=$(date +%s%N)
-  if timeout 60 "$BIN/scn" --server "$SERVER" --objects "$CACHE_URL" \
+  if "$TIMEOUT" 60 "$BIN/scn" --server "$SERVER" --objects "$CACHE_URL" \
     cat main:tokio/Cargo.toml > /dev/null 2>> "$WORK/latency-fail.log"; then
     t1=$(date +%s%N)
     echo $(( (t1 - t0) / 1000000 ))
@@ -211,9 +218,9 @@ writer() {
   head -c 4096 /dev/zero > "$file"
   while [ "$(date +%s)" -lt "$END" ]; do
     n=$((n + 1))
-    if cs=$(timeout 60 "$BIN/scn" --server "$SERVER" commit \
+    if cs=$("$TIMEOUT" 60 "$BIN/scn" --server "$SERVER" commit \
       -m "fault w$w r$n" --put "fault/w$w.bin=$file" 2>> "$WORK/writer-$w.log"); then
-      if out=$(timeout 60 "$BIN/scn" --server "$SERVER" land "$cs" --onto main \
+      if out=$("$TIMEOUT" 60 "$BIN/scn" --server "$SERVER" land "$cs" --onto main \
         2>> "$WORK/writer-$w.log"); then
         case $out in
           landed\ *) printf 'main,main,%s\n' "${out#landed }" >> "$WORK/ledger/$w.csv" ;;
@@ -230,7 +237,7 @@ readers() {
   local n=0
   while [ "$(date +%s)" -lt "$END" ]; do
     n=$((n + 1))
-    if ! timeout 120 "$BIN/scn" --server "$SERVER" --objects "$DAEMON" checkout main \
+    if ! "$TIMEOUT" 120 "$BIN/scn" --server "$SERVER" --objects "$DAEMON" checkout main \
       --sparse "$SPARSE_DIR" --into "$WORK/read/$n" \
       >> "$WORK/readers.log" 2>&1; then
       echo "checkout $n failed" >> "$WORK/read-fail.log"
@@ -245,7 +252,7 @@ importer() {
   local n=0
   while [ "$(date +%s)" -lt "$END" ]; do
     n=$((n + 1))
-    timeout 300 "$BIN/scion-server" --data "$WORK/server" import \
+    "$TIMEOUT" 300 "$BIN/scion-server" --data "$WORK/server" import \
       "${PGFLAGS[@]+"${PGFLAGS[@]}"}" --rev main "$WORK/src.git" \
       >> "$WORK/import-soak.log" 2>&1 || echo "import $n failed" >> "$WORK/import-fail.log"
     sleep 60
@@ -257,10 +264,10 @@ gcer() {
   local n=0
   while [ "$(date +%s)" -lt "$END" ]; do
     n=$((n + 1))
-    timeout 120 "$BIN/scion-server" --data "$WORK/server" gc --dry-run \
+    "$TIMEOUT" 120 "$BIN/scion-server" --data "$WORK/server" gc --dry-run \
       "${PGFLAGS[@]+"${PGFLAGS[@]}"}" >> "$WORK/gc.log" 2>&1 \
       || echo "gc-dry $n failed" >> "$WORK/gc-fail.log"
-    timeout 120 "$BIN/scion-server" --data "$WORK/server" gc \
+    "$TIMEOUT" 120 "$BIN/scion-server" --data "$WORK/server" gc \
       "${PGFLAGS[@]+"${PGFLAGS[@]}"}" >> "$WORK/gc.log" 2>&1 \
       || echo "gc $n failed" >> "$WORK/gc-fail.log"
     sleep 120
@@ -279,18 +286,6 @@ canceller() {
     sleep 3
   done
 }
-slow_reader() {
-  while [ "$(date +%s)" -lt "$END" ]; do
-    # shellcheck disable=SC2016 # the drain reads its own $1, the cat command
-    timeout 120 sh -c '"$1" | while IFS= read -r -N 4096 chunk; do
-        printf %s "$chunk" > /dev/null
-        sleep 0.2
-      done' drain "$BIN/scn --server $SERVER cat main:tokio/Cargo.lock" \
-      >> "$WORK/slow.log" 2>&1 || true
-    sleep 1
-  done
-}
-
 # check_ledger [FROM]: every acknowledged land from line FROM+1 is in
 # main's history. After a restart, FROM is the count already checked,
 # and the new entries sit at the top of the history; at the end, FROM
@@ -307,7 +302,7 @@ check_ledger() {
   count=$(wc -l < "$WORK/ledger-new.csv" | tr -d ' ')
   note "ledger check: $count entries against main's history"
   while :; do
-    if timeout 120 "$BIN/scn" --server "$SERVER" log --json -n $((count + 50)) main \
+    if "$TIMEOUT" 120 "$BIN/scn" --server "$SERVER" log --json -n $((count + 50)) main \
       > "$WORK/history.json" 2>> "$WORK/ledger-check.log"; then
       break
     fi
@@ -332,7 +327,7 @@ check_ledger() {
 # fsck_ok: the store and database hold. Safe beside the running server
 # (release-smoke.sh runs it the same way).
 fsck_ok() {
-  timeout 300 "$BIN/scion-server" --data "$WORK/server" fsck \
+  "$TIMEOUT" 300 "$BIN/scion-server" --data "$WORK/server" fsck \
     "${PGFLAGS[@]+"${PGFLAGS[@]}"}" >> "$WORK/fsck.log" 2>&1
 }
 
@@ -449,7 +444,7 @@ while [ "$(date +%s)" -lt "$END" ]; do
   now=$(date +%s)
   rss=$(ps -o rss= -p "$SERVER_PID" | tr -d ' ')
   echo "$now,$SEG,$rss,\
-$(find "/proc/$SERVER_PID/fd" -maxdepth 1 2> /dev/null | wc -l | tr -d ' '),$(latency)" \
+$(count_fds "$SERVER_PID"),$(latency)" \
     >> "$WORK/metrics.csv"
   # The store's size on disk, next to the RSS it may share a cause with
   # (soak.sh, #365): what a 72-hour run-length decision needs (issue
@@ -466,7 +461,7 @@ done
 # soak's CSVs.
 mkdir -p "${RUNNER_TEMP:-/tmp}/soak-fault-artifacts"
 cp "$WORK/metrics.csv" "$WORK/restarts.csv" "$WORK/metrics-store.csv" \
-  "${RUNNER_TEMP:-/tmp}/soak-fault-artifacts/" 2> /dev/null || true
+  "$WORK/slow-held.csv" "${RUNNER_TEMP:-/tmp}/soak-fault-artifacts/" 2> /dev/null || true
 cp "$WORK"/ledger/*.csv "${RUNNER_TEMP:-/tmp}/soak-fault-artifacts/" 2> /dev/null || true
 cp "$WORK"/*.log "${RUNNER_TEMP:-/tmp}/soak-fault-artifacts/" 2> /dev/null || true
 
@@ -487,7 +482,7 @@ fi
 # daemon match what the server serves. The checkout is sparse over
 # tokio/src, so the file comes from there.
 final="$WORK/final-read"
-if ! timeout 120 "$BIN/scn" --server "$SERVER" --objects "$DAEMON" checkout main \
+if ! "$TIMEOUT" 120 "$BIN/scn" --server "$SERVER" --objects "$DAEMON" checkout main \
   --sparse "$SPARSE_DIR" --into "$final" >> "$WORK/read-fail.log" 2>&1; then
   echo "FAIL: the final checkout failed" >&2
   fail=1
@@ -505,6 +500,12 @@ for f in read-fail latency-fail import-fail gc-fail; do
     fail=1
   fi
 done
+
+# The slow client must have held its stream; a drain that ended early
+# outside a kill window fails the run (common.sh, issue #399).
+if ! check_slow_stream "$SLOW_EXPECTED"; then
+  fail=1
+fi
 
 # The ceilings, per restart segment, from each segment's post-warm-up
 # baseline. A segment with no sample after its warm-up window proves
@@ -535,6 +536,12 @@ for s in $(seq 1 "$SEG"); do
     fi
   fi
   base_fds=$(head -n 1 "$WORK/seg-$s.csv" | cut -d, -f4)
+  # A live server has open files: a segment whose every sample counted
+  # 0 never measured them (macOS's /proc, issue #399).
+  if [ "$(cut -d, -f4 "$WORK/seg-$s.csv" | sort -u | grep -cv '^0$')" -eq 0 ]; then
+    echo "FAIL: segment $s open-file count never read anything" >&2
+    seg_fail=1
+  fi
   if ! awk -F, -v s0="$base_fds" -v g="$SOAK_FD_GROWTH" \
     '$4 > s0 + g { c++; if (c >= 3) exit 1 }' "$WORK/seg-$s.csv"; then
     echo "FAIL: segment $s open files grew for 3 samples in a row" >&2

@@ -5,6 +5,11 @@ steps an operator needs, written from the code on `main`. Every command in
 this guide was run once in a fresh directory. The flags of a release are its
 truth: `--help` of each binary lists everything.
 
+A section whose steps a test runs ends with a `Proof:` line that names the
+test (file and function). The docs_ops tests fail when a proof's test is
+gone, when a command of a shell block names a flag `--help` does not, and
+when the drills of docs/drills/ lose their template.
+
 The pieces:
 
 - `scion-server` — the one process that stores and lands. One data directory
@@ -22,7 +27,7 @@ The pieces:
 ### One server
 
 ```sh
-./scion-server --data /srv/scion serve --token <TOKEN>
+SCION_TOKEN=<TOKEN> ./scion-server --data /srv/scion serve
 ```
 
 That is the whole deployment: clients talk to `127.0.0.1:7878` (or `--listen`
@@ -45,9 +50,13 @@ one client may hold open at once, and `--max-stalled-bytes` (64 MiB)
 bounds what the stalled replies of one connection may hold before the
 connection is closed. A cache and a daemon take the same three flags.
 
-Choose the tokens with care: `--token T` makes one principal, `default`, with
-every right on every repo. For several people or services, use an access
-file instead (see "Tokens: one, or an access file", below).
+Choose the tokens with care: `--token T` (or `SCION_TOKEN=T`) makes one
+principal, `default`, with every right on every repo. A token on the command
+line is readable by every local account, so the argv form warns and goes
+away in a later release; pass the token through `SCION_TOKEN` or
+`--token-file FILE` (a file the owner alone may read). For several people or
+services, use an access file instead (see "Tokens: one, or an access file",
+below).
 
 Stopping the server: Ctrl-C or SIGTERM starts a graceful drain, in this
 order — the health service answers `NOT_SERVING` for the service names
@@ -68,6 +77,29 @@ pending lands sweep themselves after `--land-stale-secs` (see the quotas
 above). The metrics gauge `scion_calls_in_flight` counts the calls the
 drain still waits for.
 
+#### One server, and no automatic failover
+
+There is no automatic failover. One active server holds the store: a
+second server on the same data directory (or the same Postgres database)
+refuses to start, and a running server whose lock the database gave to
+another process is fenced — it answers `FailedPrecondition` to every call
+and exits. That is the guard against two servers taking one store, not a
+failover path.
+
+When the one server dies, every client's calls fail until it is back.
+Nothing takes over by itself: no standby, no leader election, no routing.
+The operator restarts the server on the same data directory (`systemctl
+restart scion`, or the container's restart policy); a restart retakes the
+store and serves the writes that were acknowledged before the death, and
+the calls that were in flight are the client's to retry. While the server
+is down, the tiers and daemons in front of it serve what they have cached
+and refuse the rest. If the directory itself is lost, the recovery is a
+restore from backup (section 3).
+
+Proof: crates/scion-server/tests/backend_refusals.rs::a_lost_server_lock_fences_the_backend
+Proof: crates/scion-server/tests/backend_refusals.rs::an_unreachable_database_is_not_a_takeover
+Proof: crates/scion-server/tests/crash.rs::every_reply_survives_a_kill_of_the_server
+
 ### Server and a regional cache
 
 A cache serves object reads to a region and refuses every other call
@@ -78,8 +110,8 @@ client's `--token` is what it sends, the other side of the pair of the tier
 in front of it.
 
 ```sh
-./scion-cache --token <CACHE_TOKEN> --upstream-token <SERVER_TOKEN> \
-  --upstream http://SERVER:7878 \
+SCION_TOKEN=<CACHE_TOKEN> SCION_UPSTREAM_TOKEN=<SERVER_TOKEN> \
+  ./scion-cache --upstream http://SERVER:7878 \
   --ticket-public-key <PUBLIC_KEY_HEX>
 ```
 
@@ -94,9 +126,8 @@ cache with `scn checkout --server http://SERVER:7878 --objects http://CACHE:7879
 ### Server, cache, and a daemon per user
 
 ```sh
-./scion-daemon --data ~/.scion-daemon \
-  --token <USER_TOKEN> --upstream-token <CACHE_TOKEN> \
-  --upstream http://CACHE:7879
+SCION_TOKEN=<USER_TOKEN> SCION_UPSTREAM_TOKEN=<CACHE_TOKEN> \
+  ./scion-daemon --data ~/.scion-daemon --upstream http://CACHE:7879
 ```
 
 The daemon's data directory must be private to its user (mode 0700, not a
@@ -199,7 +230,7 @@ BLAKE3 digest (never the token itself) and maps each to a principal with
 per-repo read and write rules:
 
 ```sh
-TOK=$(./scion-server hash-token --token <SECRET>)
+TOK=$(printf %s <SECRET> | ./scion-server hash-token)
 printf 'token\tops\t%s\nread\tops\tr\nwrite\tops\tr\n' "$TOK" > /srv/scion/access.txt
 chmod 600 /srv/scion/access.txt
 ./scion-server --data /srv/scion serve --access /srv/scion/access.txt \
@@ -220,6 +251,17 @@ rewrite the file and restart, and either wait out the tickets (15 minutes)
 or rotate the ticket key (`--ticket-key`) to cut them off at once. Objects
 already on a user's daemon are out of reach of both; give a daemon only
 repos all its users may read whole.
+
+### Folder read rules
+
+The server records an audit log: an append-only JSON-lines file of
+refused authentication (counted per peer), writes, ref changes, lands
+and administrative changes, with no tokens and no contents. It lives at
+`audit.log` in the data directory; `--audit-file` puts it elsewhere.
+There is no way to turn it off: a server that cannot record refuses the
+changes it cannot account for, and flips readiness until a restart. The
+file is mode 0600, never a symlink, in a directory only the server's
+user may write.
 
 ### Folder read rules
 
@@ -299,9 +341,9 @@ it):
 | Variable | Flag | Read by | Notes |
 | --- | --- | --- | --- |
 | `SCION_DATA` | `--data` | `scion-server` | Data directory, default `scion-data`. |
-| `SCION_POSTGRES_URL` | `--postgres-url` | `scion-server` | The URL holds the database credentials; the environment keeps them out of the process list (`ps`). |
-| `SCION_TOKEN` | `--token` | `scion-server` (`serve`, `hash-token`), `scion-cache`, `scion-daemon`, `scn` | A secret; the environment keeps it out of the process list. |
-| `SCION_UPSTREAM_TOKEN` | `--upstream-token` | `scion-cache`, `scion-daemon` | A secret, as `SCION_TOKEN`. |
+| `SCION_POSTGRES_URL` | `--postgres-url` | `scion-server` | The URL holds the database credentials; the environment keeps them out of the process list (`ps`). `--postgres-url-file` reads it from a file the owner alone may read, and the argv form is deprecated. |
+| `SCION_TOKEN` | `--token` | `scion-server` (`serve`, `hash-token`), `scion-cache`, `scion-daemon`, `scn` | A secret; the environment keeps it out of the process list. The `--token-file` flag reads the token from a file the owner alone may read, and `hash-token` reads it from stdin. The argv form prints a deprecation warning and goes away in a later release. |
+| `SCION_UPSTREAM_TOKEN` | `--upstream-token` | `scion-cache`, `scion-daemon` | A secret, as `SCION_TOKEN`; `--upstream-token-file` reads it from a file, and the argv form is deprecated. |
 | `SCION_DAEMON_DATA` | `--data` | `scion-daemon` | Data directory, default `scion-daemon-data`. |
 | `SCION_AUTHOR` | `--author` | `scn commit` | Default `scn <scn@localhost>`. |
 | `SCION_SERVER` | `--server` | `scn` | Default `http://127.0.0.1:7878`. |
@@ -346,7 +388,51 @@ Rotation, step by step:
 
 A daemon checks no ticket and forwards it, so it needs no key at any step.
 
+Proof: crates/scn/tests/rotation.rs::ticket_key_rotation_while_a_checkout_reads
+
 ## 3. Backup and restore
+
+### The durability point
+
+What an acknowledged write has survived, before you need a backup:
+
+- A **blob put** is answered after the blob's temp file was fsynced, the
+  file was renamed into `objects/`, the directories of every new file were
+  fsynced, and the drive's write cache was flushed. The server does not
+  answer from its page cache: a power cut after the reply can lose nothing
+  the caller was told was stored, on either backend — the blob path is the
+  data directory's in both.
+- A **land** is answered after its blobs were synced as above and its
+  metadata commit was made durable. On SQLite, the commit fsyncs the WAL
+  (`synchronous = FULL`); on Postgres, every connection runs
+  `synchronous_commit = on`, and the server refuses to open a database
+  that turned it off. A land's reply therefore names a commit the
+  database will not lose, and the database's own durability rules carry
+  it from there.
+- What the above does **not** survive: the loss of the drive itself, or
+  the loss of the machine. That is what the backup below is for.
+
+Proof: crates/scion-server/tests/power.rs::every_reply_survives_a_power_cut
+Proof: crates/scion-server/tests/dm_log_writes.rs::an_acknowledged_blob_survives_a_cut_at_the_last_barrier_before_its_reply
+Proof: crates/scion-server/tests/crash.rs::every_reply_survives_a_kill_of_the_server
+Proof: crates/scion-server/tests/storage.rs::a_retry_after_a_failed_dir_fsync_makes_the_kept_file_durable
+
+The Postgres metadata half of the first two rules is Postgres's own
+contract (`synchronous_commit = on`), which the server checks at every
+open (`crates/scion-server/src/pg.rs`, the `SHOW synchronous_commit`
+check): a test of the database's fsync would test Postgres, not Scion.
+
+A backup (data taken outside the server) has a wider point: the
+**recovery point** of a backup is the moment of its metadata snapshot.
+Every write acknowledged after the snapshot began may be lost — a backup
+run every N minutes has a recovery point of about N minutes of
+acknowledged writes, plus the write in flight while the snapshot ran.
+Writes acknowledged **before** the snapshot read back whole after a
+restore, whatever was happening in the meantime.
+
+Proof: crates/scion-server/tests/backup.rs::a_backup_taken_while_serving_restores_whole
+Proof (open, #411): the live-backup test of that PR pins what a backup taken while
+the server keeps writing may and may not hold
 
 A data directory is `scion.db` plus `objects/`; the lock files and `tmp/`
 are process state, not data. A copy of the directory is a backup:
@@ -421,6 +507,20 @@ new database), the marker, and `objects/` into a fresh directory; run
 gc-raced backup left, so run it after every restore, before the server
 serves.
 
+The restore takes a measured time, not a promise: the `restore-bench`
+workflow (a run on `main` or a dispatch, on the fixed `ubuntu-24.04`
+runner, never a local machine) restores a stated store — 20 repos, 1000
+changesets, about 32 MiB of raw blob content in files of about 32 KiB —
+with `fsck`, an open and a read, prints the seconds, and fails past a
+600 s bound. The measured number lives in the workflow's run log and
+this section names it once the first run has printed it.
+
+Proof: crates/scion-server/tests/restore_bench.rs::a_restore_of_a_stated_store_takes_a_stated_time
+
+Proof: crates/scion-server/tests/backup.rs::a_backup_taken_while_serving_restores_whole
+
+Proof: crates/scion-server/tests/backup.rs::a_backup_taken_while_serving_restores_whole
+
 ## 4. Upgrades
 
 The schema version lives in the database. On open, a server migrates an
@@ -455,6 +555,8 @@ backfills a whole history in steps when you want it done before the first
 query (it opens the directory as the server, so with the server stopped, and
 it is safe to repeat).
 
+Proof: crates/scion-server/tests/crash.rs::a_kill_during_a_schema_upgrade_leaves_the_old_schema_or_the_new_one
+
 ## 5. Routines
 
 The routines are these:
@@ -483,6 +585,8 @@ The routines are these:
   file batch, one when it ends, each with the counts and the time it
   took, and a line at most every 10 s of a long run with the repos done
   and the total.
+
+  Proof: crates/scion-server/tests/gc_metrics.rs::a_real_run_writes_the_report_as_textfile_metrics
 
 **The collector's metrics file.** The collector runs as its own process,
 so the server's `/metrics` cannot show what it did. Instead, give the run
@@ -624,3 +728,60 @@ of one operation.
 
 A ticket refusal, an access refusal, or a corrupt blob each log one line
 per event, never the bytes or the token that caused them.
+
+## 7. Capacity
+
+What one server takes, measured on one named machine, so the numbers have
+a bottom. The table below is the published envelope
+([#387](https://github.com/bnsd55/openscion/issues/387)): every cell is a
+run of [`scripts/capacity.sh`](../scripts/capacity.sh) on a GitHub-hosted
+runner of the class named in the caption, with the dataset of
+[benchmarks.md](benchmarks.md) (tokio at a pinned commit), SQLite or
+Postgres behind the server, `scn bench` landing through it and readers
+checking out through a cache and a daemon beside it.
+
+| | |
+|---|---|
+| Commit | the `git rev-parse HEAD` of the run that produced the table |
+| Runner | the hosted runner class, by its public label and spec |
+| Repetitions | 2 per cell; the table reports the cell's whole run, and the run's raw samples are the workflow run's `capacity.csv` artifact |
+
+| backend | writers | readers | lands/min | land p99 ms | checkout p50 ms | checkout p99 ms | errors | server RSS MiB | store KiB per 1k lands |
+|---|---|---|---|---|---|---|---|---|---|
+| sqlite | 2 | 0 | - | - | - | - | - | - | - |
+| sqlite | 2 | 5 | - | - | - | - | - | - | - |
+| sqlite | 2 | 20 | - | - | - | - | - | - | - |
+| sqlite | 50 | 0 | - | - | - | - | - | - | - |
+| sqlite | 50 | 5 | - | - | - | - | - | - | - |
+| sqlite | 50 | 20 | - | - | - | - | - | - | - |
+| sqlite | 200 | 0 | - | - | - | - | - | - | - |
+| sqlite | 200 | 5 | - | - | - | - | - | - | - |
+| sqlite | 200 | 20 | - | - | - | - | - | - | - |
+| postgres | 2 | 0 | - | - | - | - | - | - | - |
+| postgres | 2 | 5 | - | - | - | - | - | - | - |
+| postgres | 2 | 20 | - | - | - | - | - | - | - |
+| postgres | 50 | 0 | - | - | - | - | - | - | - |
+| postgres | 50 | 5 | - | - | - | - | - | - | - |
+| postgres | 50 | 20 | - | - | - | - | - | - | - |
+| postgres | 200 | 0 | - | - | - | - | - | - | - |
+| postgres | 200 | 5 | - | - | - | - | - | - | - |
+| postgres | 200 | 20 | - | - | - | - | - | - | - |
+
+The cells with `-` are the ones no run has filled yet. The errors column
+is part of the data, not a failure of the run: the envelope's edge IS
+where errors start, so a cell whose clients failed is recorded with its
+error count and stands in the table. The edge, the point where a cell
+stops being an answer: a checkout p99 over 5 seconds, a land p99 over
+5 seconds, or a client error outside the accepted classes of the soak -
+in the table, that is a cell with errors above 0. A reader who wants a
+different edge applies it to the run's `capacity.csv` artifact, which
+the footer's workflow run keeps. A cell whose bench died names no land
+percentile (`-` there); its lands per minute still come from the
+server's counter.
+
+The store growth column is the SQLite store's only; the Postgres cells
+name no store growth, because the database's disk is its service
+container's, not a file tree the script can measure. RSS is the server's
+at the end of the cell: a capacity cell is minutes long, not the hours a
+warm-up would need, so it is a level, not a leak bound - the leak bound
+is the soak's.

@@ -143,6 +143,7 @@ async fn serve_tls(certs: &TestCerts) -> String {
         TOKEN,
         service::ServeOptions {
             data: data.clone(),
+            audit: scion_server::test_support::audit::Audit::off(),
             limits: Limits::default(),
             quotas: scion_server::Quotas::off(),
             pending_lands: None,
