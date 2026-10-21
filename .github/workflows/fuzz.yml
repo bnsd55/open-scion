@@ -19,7 +19,9 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # This file has no pull_request trigger, so the expression always
+  # reads false: a dispatch cannot cancel the nightly in flight.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   targets:
