@@ -28,3 +28,10 @@ files ran 106 statements before the batch and 56 after.
 A repeated parent now stores the same way on both backends (the
 batched read had diverged from the per-row loop on Postgres), and a
 test holds the two backends to the same answer.
+
+The land's outcome check rides the plan's read transaction: one read
+answers both whether a twin call settled the land and what the land
+must do now, where the loop read them in two steps before. The counts
+do not move (the loop's read ran without transaction boilerplate
+already); what moves is that the plan can no longer run for a land
+that a twin call has settled.
