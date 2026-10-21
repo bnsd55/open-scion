@@ -53,7 +53,7 @@ env:
 
 jobs:
   measure:
-    name: coverage, ${{ matrix.backend }}, slice ${{ matrix.slice }}
+    name: coverage, ${{ matrix.backend }}, slice ${{ matrix.slice }} of ${{ matrix.total }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -64,34 +64,62 @@ jobs:
             value: ""
             name: sqlite
             slice: 1
+            total: 8
           - backend: the default backend
             value: ""
             name: sqlite
             slice: 2
+            total: 8
           - backend: the default backend
             value: ""
             name: sqlite
             slice: 3
+            total: 8
           - backend: the default backend
             value: ""
             name: sqlite
             slice: 4
+            total: 8
+          - backend: the default backend
+            value: ""
+            name: sqlite
+            slice: 5
+            total: 8
+          - backend: the default backend
+            value: ""
+            name: sqlite
+            slice: 6
+            total: 8
+          - backend: the default backend
+            value: ""
+            name: sqlite
+            slice: 7
+            total: 8
+          - backend: the default backend
+            value: ""
+            name: sqlite
+            slice: 8
+            total: 8
           - backend: the postgres backend
             value: postgres
             name: postgres
             slice: 1
+            total: 4
           - backend: the postgres backend
             value: postgres
             name: postgres
             slice: 2
+            total: 4
           - backend: the postgres backend
             value: postgres
             name: postgres
             slice: 3
+            total: 4
           - backend: the postgres backend
             value: postgres
             name: postgres
             slice: 4
+            total: 4
     services:
       postgres:
         image: postgres:17.11
@@ -258,7 +286,7 @@ jobs:
           # shellcheck disable=SC2086
           nice -n 19 timeout -k 60 900 cargo nextest run $pkgs \
             --no-fail-fast \
-            --partition hash:${{ matrix.slice }}/4 \
+            --partition hash:${{ matrix.slice }}/${{ matrix.total }} \
             > measure.log 2>&1
           status=$?
           kill "$watcher"
