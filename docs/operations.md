@@ -131,8 +131,8 @@ is down, the tiers and daemons in front of it serve what they have cached
 and refuse the rest. If the directory itself is lost, the recovery is a
 restore from backup (section 3).
 
-Proof: crates/scion-server/tests/backend_refusals.rs::a_lost_server_lock_fences_the_backend
-Proof: crates/scion-server/tests/backend_refusals.rs::an_unreachable_database_is_not_a_takeover
+Proof: crates/scion-server/tests/backend_refusals.rs::a_lost_server_lock_fences_the_backend (behaviour, no command: the section's serve command is not in the test's path - the test works at the database's own session lock, and the fence it proves is what the runbook's one-server rule protects)
+Proof: crates/scion-server/tests/backend_refusals.rs::an_unreachable_database_is_not_a_takeover (behaviour, no command: the section's steps are actions on the database and its container, not scion commands; the test holds the behaviour the runbook promises - a stopped database is not a takeover)
 Proof: crates/scion-server/tests/crash.rs::every_reply_survives_a_kill_of_the_server
 Proof: crates/scion-server/tests/first_boot.rs::a_first_boot_serves_probes_and_reads_back
 

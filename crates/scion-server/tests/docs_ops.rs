@@ -254,9 +254,16 @@ fn every_proof_runs_the_guides_command_or_says_why() {
             .join(file);
         let text = std::fs::read_to_string(&source)
             .unwrap_or_else(|_| panic!("the proof file {file} is not in the repo"));
-        let runs_block = ["runbook_block", "run_guide_block", "run_guide_block_async"]
-            .iter()
-            .any(|helper| text.contains(&format!("{helper}(\"{heading}\"")));
+        let runs_block = [
+            "runbook_block",
+            "run_guide_block",
+            "run_guide_block_async",
+            "start_on",
+            "spawn_on",
+            "guide_argv",
+        ]
+        .iter()
+        .any(|helper| text.contains(&format!("{helper}(\"{heading}\"")));
         if runs_block {
             drivers += 1;
             continue;
@@ -297,19 +304,14 @@ fn every_proof_runs_the_guides_command_or_says_why() {
 /// a stale row fails the check. This list, mirrored in the PR body,
 /// is today's honest state: no proof is exempt silently.
 const NOT_YET_DRIVING: &[(&str, &str)] = &[
-    ("First boot", "a_first_boot_serves_probes_and_reads_back"),
-    ("One server", "a_lost_server_lock_fences_the_backend"),
-    ("One server", "an_unreachable_database_is_not_a_takeover"),
-    ("One server", "every_reply_survives_a_kill_of_the_server"),
-    ("One server", "a_first_boot_serves_probes_and_reads_back"),
+    (
+        "The durability point",
+        "every_reply_survives_a_kill_of_the_server",
+    ),
     ("The durability point", "every_reply_survives_a_power_cut"),
     (
         "The durability point",
         "an_acknowledged_blob_survives_a_cut_at_the_last_barrier_before_its_reply",
-    ),
-    (
-        "The durability point",
-        "every_reply_survives_a_kill_of_the_server",
     ),
     (
         "The durability point",

@@ -36,6 +36,11 @@ pub fn runbook_block(heading: &str, subs: &[(&str, &str)]) -> String {
     }
     assert!(!block.is_empty(), "no sh block under {heading}");
     let mut command = block.join("\n");
+    // The longest documented literal goes first: /srv/scion is a prefix
+    // of /srv/scion-token, and a prefix-first replace would destroy the
+    // longer literal before its turn.
+    let mut subs: Vec<&(&str, &str)> = subs.iter().collect();
+    subs.sort_by_key(|(documented, _)| std::cmp::Reverse(documented.len()));
     for (documented, value) in subs {
         assert!(
             command.contains(documented),
