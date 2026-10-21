@@ -100,6 +100,12 @@ fn entry_who(entry: *mut c_void) -> Option<u32> {
 /// returned). The handle was obtained and the walk started at
 /// `ACL_FIRST_ENTRY`, so `EINVAL` on a `ACL_NEXT_ENTRY` call can only
 /// mean the end; any other failure must not pass for it.
+///
+/// `EINVAL` on the first call is a failure, not an empty ACL: measured
+/// on macOS, an ACL added (`chmod +a`) and then removed (`chmod -a`)
+/// leaves no handle at all — `acl_get_fd_np` answers `ENOENT`, the
+/// no-ACL case — so a zero-entry ACL does not arise, and a first call
+/// that fails has read nothing and cannot vouch for the rest.
 fn walk_step(entry_id: c_int, got: c_int, errno: c_int) -> Step {
     if got == 0 {
         return Step::Entry;
