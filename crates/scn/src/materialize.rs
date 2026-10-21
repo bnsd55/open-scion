@@ -1696,4 +1696,45 @@ mod tests {
         assert!(checkout.symlink(&path("a/b\x1b"), b"x").is_err());
         assert_eq!(fs::read_dir(checkout.temp_path()).unwrap().count(), 0);
     }
+
+    /// The pass-3 attack: a tree entry named like the metadata a tool
+    /// keeps, with a trailing dot or space — `.git `, `.scion.` — slips
+    /// past the reserved-name check, which compares the whole name. The
+    /// checkout writes it, and the checkout then holds a directory that
+    /// every tool reads as `.git` on a filesystem that trims the tail.
+    /// The check must trim before it compares.
+    #[test]
+    fn a_reserved_name_with_a_trailing_dot_or_space_is_refused() {
+        for name in [".git ", " .git", ".git.", ".scion ", ".scion.", ".GIT ", ".git\t"] {
+            let why = check_name(name.as_bytes())
+                .expect_err(&format!("{name:?} must be refused as a reserved name"));
+            assert!(
+                why.contains("reserved"),
+                "{name:?}: the refusal must say why: {why}"
+            );
+        }
+    }
+
+    /// The pass-3 attack, for real on this disk: two tree entries whose
+    /// names fold to one name (README and readme). The checkout must
+    /// refuse the fold and lose nothing — the first file stays what the
+    /// tree said it was. Runs where the fold is real.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn two_tree_names_that_fold_are_refused_before_any_loss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let mut checkout = Checkout::start(&dest).unwrap();
+        checkout.file(&path("README"), false, b"upper\n").unwrap();
+        let err = checkout
+            .file(&path("readme"), false, b"lower\n")
+            .expect_err("two names that fold to one file must be refused");
+        assert!(
+            format!("{err:#}").contains("collides"),
+            "the refusal must name the fold: {err:#}"
+        );
+        // The first file is what it was: the refusal did not touch it.
+        let staged = checkout.temp_path();
+        assert_eq!(fs::read(staged.join("README")).unwrap(), b"upper\n");
+    }
 }
