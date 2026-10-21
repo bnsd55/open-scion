@@ -62,7 +62,10 @@ impl Git {
 
     /// Writes a raw object and returns its name.
     fn object(&self, kind: &str, bytes: &[u8]) -> String {
-        self.raw(&["hash-object", "-w", "-t", kind, "--stdin", "--literal"], bytes)
+        self.raw(
+            &["hash-object", "-w", "-t", kind, "--stdin", "--literal"],
+            bytes,
+        )
     }
 
     /// Points `refs/heads/main` at `name` without any check git could make.
@@ -100,6 +103,18 @@ fn commit(tree: &str, headers: &[String], message: &str) -> Vec<u8> {
     bytes.push(b'\n');
     bytes.extend_from_slice(message.as_bytes());
     bytes
+}
+
+/// A commit with a valid committer line and the given message.
+fn committer_line(tree: &str, message: &str) -> Vec<u8> {
+    commit(
+        tree,
+        &[
+            author_line("+0000"),
+            "committer Ada <ada@example.com> 1700000000 +0000".to_owned(),
+        ],
+        message,
+    )
 }
 
 fn author_line(offset: &str) -> String {
@@ -157,7 +172,7 @@ fn a_tree_name_with_a_slash_is_refused() {
         "tree",
         &[entry("100644", b"a/b", &blob), entry("100644", b"f", &blob)].concat(),
     );
-    let head = commit(&tree, &[author_line("+0000"), format!("committer Ada <ada@example.com> 1700000000 +0000")], "bad name\n");
+    let head = committer_line(&tree, "bad name\n");
     let head = git.object("commit", &head);
     git.force_main(&head);
     refusal(&git, "a name with a slash is not one path part");
@@ -171,7 +186,7 @@ fn a_tree_name_that_walks_out_is_refused() {
         "tree",
         &[entry("100644", b"..", &blob), entry("100644", b"f", &blob)].concat(),
     );
-    let head = commit(&tree, &[author_line("+0000"), format!("committer Ada <ada@example.com> 1700000000 +0000")], "bad name\n");
+    let head = committer_line(&tree, "bad name\n");
     let head = git.object("commit", &head);
     git.force_main(&head);
     refusal(&git, "a '..' name does not name one part");
@@ -185,7 +200,7 @@ fn an_empty_tree_name_is_refused() {
         "tree",
         &[entry("100644", b"", &blob), entry("100644", b"f", &blob)].concat(),
     );
-    let head = commit(&tree, &[author_line("+0000"), format!("committer Ada <ada@example.com> 1700000000 +0000")], "bad name\n");
+    let head = committer_line(&tree, "bad name\n");
     let head = git.object("commit", &head);
     git.force_main(&head);
     refusal(&git, "an empty name is not a path");
@@ -197,7 +212,7 @@ fn a_duplicate_tree_entry_is_refused() {
     let blob = blob(&git);
     let twice = [entry("100644", b"f", &blob), entry("100644", b"f", &blob)].concat();
     let tree = git.object("tree", &twice);
-    let head = commit(&tree, &[author_line("+0000"), format!("committer Ada <ada@example.com> 1700000000 +0000")], "duplicate\n");
+    let head = committer_line(&tree, "duplicate\n");
     let head = git.object("commit", &head);
     git.force_main(&head);
     refusal(&git, "two entries with one name have no Scion tree");
@@ -211,7 +226,7 @@ fn a_directory_entry_pointing_at_a_blob_is_refused() {
         "tree",
         &[entry("40000", b"d", &blob), entry("100644", b"f", &blob)].concat(),
     );
-    let head = commit(&tree, &[author_line("+0000"), format!("committer Ada <ada@example.com> 1700000000 +0000")], "dir is a blob\n");
+    let head = committer_line(&tree, "dir is a blob\n");
     let head = git.object("commit", &head);
     git.force_main(&head);
     refusal(&git, "a directory entry must name a tree");
@@ -246,7 +261,7 @@ fn a_deep_tree_past_the_path_limit_is_refused() {
     for _ in 0..300 {
         tree = git.object("tree", &entry("40000", b"d", &tree));
     }
-    let head = commit(&tree, &[author_line("+0000"), format!("committer Ada <ada@example.com> 1700000000 +0000")], "deep\n");
+    let head = committer_line(&tree, "deep\n");
     let head = git.object("commit", &head);
     git.force_main(&head);
     refusal(&git, "a path past 256 parts has no Scion form");
@@ -258,7 +273,10 @@ fn a_bad_identity_line_is_refused_not_a_panic() {
     let tree = plain_tree(&git);
     let head = commit(
         &tree,
-        &[author_line("+999999999999999999"), "committer Ada <ada@example.com> 1700000000 +0000".to_owned()],
+        &[
+            author_line("+999999999999999999"),
+            "committer Ada <ada@example.com> 1700000000 +0000".to_owned(),
+        ],
         "huge offset\n",
     );
     let head = git.object("commit", &head);
@@ -278,7 +296,7 @@ fn reserved_names_import_like_any_other_name() {
             "tree",
             &[entry("100644", name, &blob), entry("100644", b"f", &blob)].concat(),
         );
-        let head = commit(&tree, &[author_line("+0000"), format!("committer Ada <ada@example.com> 1700000000 +0000")], "reserved\n");
+        let head = committer_line(&tree, "reserved\n");
         let head = git.object("commit", &head);
         git.force_main(&head);
         match verdict(&git) {
@@ -296,9 +314,13 @@ fn a_symlink_stores_its_target_bytes() {
     let target = git.object("blob", b"/etc/passwd");
     let tree = git.object(
         "tree",
-        &[entry("120000", b"link", &target), entry("100644", b"f", &blob(&git))].concat(),
+        &[
+            entry("120000", b"link", &target),
+            entry("100644", b"f", &blob(&git)),
+        ]
+        .concat(),
     );
-    let head = commit(&tree, &[author_line("+0000"), format!("committer Ada <ada@example.com> 1700000000 +0000")], "link\n");
+    let head = committer_line(&tree, "link\n");
     let head = git.object("commit", &head);
     git.force_main(&head);
     match verdict(&git) {
@@ -323,7 +345,7 @@ fn a_gitlink_never_follows_its_commit() {
         ]
         .concat(),
     );
-    let head = commit(&tree, &[author_line("+0000"), format!("committer Ada <ada@example.com> 1700000000 +0000")], "submodule\n");
+    let head = committer_line(&tree, "submodule\n");
     let head = git.object("commit", &head);
     git.force_main(&head);
     match verdict(&git) {
