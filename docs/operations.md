@@ -135,6 +135,31 @@ Proof: crates/scion-server/tests/backend_refusals.rs::a_lost_server_lock_fences_
 Proof: crates/scion-server/tests/backend_refusals.rs::an_unreachable_database_is_not_a_takeover
 Proof: crates/scion-server/tests/crash.rs::every_reply_survives_a_kill_of_the_server
 
+#### Stopping it for real: a unit file
+
+An operator does not run the server in a shell; it runs under a
+supervisor. The minimal systemd unit — the token through the file
+(§1), the restart on a crash, and the drain on a stop — is:
+
+```ini
+# /etc/systemd/system/scion.service
+[Service]
+ExecStart=/usr/local/bin/scion-server --data /srv/scion serve \
+  --token-file /etc/scion/token \
+  --ticket-key /srv/scion-keys/ticket.key
+Restart=on-failure
+User=scion
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`systemctl stop scion` sends SIGTERM, and the drain of the last
+section is what happens next. Never kill by pattern: on a machine that
+runs more than one service, `pkill -f scion-server` kills every
+project's server, not yours. Stop by unit, or by the exact PID of the
+process you started.
+
 ### Server and a regional cache
 
 A cache serves object reads to a region and refuses every other call
@@ -434,12 +459,14 @@ Rotation, step by step:
 3. Restart the server with both keys: `--ticket-key NEW.key
    --ticket-key-old OLD-PUBLIC`. The old argument is a file holding the
    **public** key of the previous key (the hex that the old run printed),
-   not its seed. A public key is not a secret: anyone may read the file,
-   but group and others must not be able to WRITE it (a changed key breaks
-   every tier that verifies against the old one), it must not be a
-   symlink, and the directories above it must be private to its owner or
-   root. `chmod go-w OLD-PUBLIC` fixes a copy tool's 0666. Tickets of
-   either key verify while both are given.
+   not its seed — and the file holds the bare hex and nothing else: 64
+   hex characters, no `name=` prefix, no trailing line. A public key is
+   not a secret: anyone may read the file, but group and others must not
+   be able to WRITE it (a changed key breaks every tier that verifies
+   against the old one), it must not be a symlink, and the directories
+   above it must be private to its owner or root. `chmod go-w
+   OLD-PUBLIC` fixes a copy tool's 0666. Tickets of either key verify
+   while both are given.
 4. When no client can hold a ticket of the old key any more (tickets live 15
    minutes), restart the server without `--ticket-key-old` and the caches
    with only the new public key.
@@ -567,15 +594,22 @@ serves.
 
 The restore takes a measured time, not a promise: the `restore-bench`
 workflow (a run on `main` or a dispatch, on the fixed `ubuntu-24.04`
-runner, never a local machine) restores a stated store — 20 repos, 1000
-changesets, about 32 MiB of raw blob content in files of about 32 KiB —
-with `fsck`, an open and a read, prints the seconds, and fails past a
-600 s bound. The measured number lives in the workflow's run log and
-this section names it once the first run has printed it.
+runner, never a local machine) restores a stated store — 40 repos,
+12000 changesets, 750 MiB of raw blob content in files of about 64 KiB,
+every blob distinct and incompressible — with `fsck`, an open and a
+read, prints the seconds, and fails past a 600 s bound. The measured
+time includes the fsync of every restored file and directory: a
+restore is done when a crash cannot lose it. A real store's restore
+time scales with its blob bytes and its changeset count. On the fixed
+runner that store restored in 10.5 s (run 39539498175: 72 MiB/s on
+disk, 1147 changesets/s; the 750 MiB on disk matched the raw bytes,
+and the store built in 28.0 s). One sample at one size; a second size
+is the next step when the number starts steering a decision. The
+current numbers live in the workflow's run log on `main`, and a run
+that drifts far from them is a regression to look at, not a promise
+to restate here.
 
 Proof: crates/scion-server/tests/restore_bench.rs::a_restore_of_a_stated_store_takes_a_stated_time
-
-Proof: crates/scion-server/tests/backup.rs::a_backup_taken_while_serving_restores_whole
 
 Proof: crates/scion-server/tests/backup.rs::a_backup_taken_while_serving_restores_whole
 
@@ -593,6 +627,26 @@ schema 4 walks every repo's changesets). Two rules:
 - If other processes (an `import`, a `fsck`) share the directory, a
   migration waits for them to stop: the error says `stop the other processes
   that use ...`. One process at a time migrates.
+
+### A failed migration
+
+A migration that cannot finish leaves the database at one whole step, so
+the two failures an operator sees are the two rules above, and the runbook
+is the rule that names the case:
+
+1. The open refuses with `schema version N is newer than this build`:
+   the data ran on a newer build than this binary. The fix is the old
+   binary, or the restore of section 3. Never edit `user_version` by
+   hand: the version is the migration's bookmark, and a hand-moved one
+   leaves the database half-migrated in a way no migration can finish.
+2. The start waits with `stop the other processes that use ...`: another
+   process holds the directory. Stop it; the migration runs on the next
+   start.
+
+After the fix, the server starts and serves; `fsck` says the store is
+whole.
+
+Proof: crates/scion-server/tests/crash.rs::a_newer_schema_refuses_the_open_and_a_restore_serves
 
 An import reads git revision `--rev` (default `HEAD`) into scion repo
 `--repo` (default `main`), and points scion ref `--ref` (default `main`)
@@ -622,6 +676,14 @@ The routines are these:
 - `fsck` on a schedule (it is read-only, so it can run beside a live
   server), and always on a fresh backup copy. Exit 1 with the problem lines
   is the signal to restore from a backup; there is no automatic repair.
+
+  An fsck failure (exit 1) is the restore runbook of section 3, and the
+  test that proves it is the failing-disk runbook's: damage on disk,
+  the `fsck` command to its exit 1 with the problem named, the restore
+  into a fresh directory, and fsck clean on the restored copy before
+  the server starts.
+
+  Proof: crates/scion-server/tests/storage.rs::a_failing_disk_runbook_fscks_restores_and_serves
 - `tmp/` needs no attention: every open removes the staging folders of dead
   processes, and a lone open also removes files a build older than the
   schema left there.
@@ -803,7 +865,9 @@ the process, scraped from there. The names:
 token: the server's health covers the services `scion.v1.Scion` and
 `scion.v1.Objects`, a tier's covers `scion.v1.Objects`. The server
 serves no gRPC reflection, so a probe tool must know the health protocol
-itself (`grpc_health_probe` does).
+itself (`grpc_health_probe` does). Get it from that project's GitHub
+releases (a single static binary per platform — no other install), or
+use Kubernetes probes, which speak the same protocol natively.
 
 Probe the service's name for readiness and the empty name for liveness.
 Readiness is `NOT_SERVING` from the start of a drain to the exit, so a load
@@ -854,6 +918,161 @@ of one operation.
 
 A ticket refusal, an access refusal, or a corrupt blob each log one line
 per event, never the bytes or the token that caused them.
+
+### Latency p99 high
+
+`LatencyP99High` fires when one RPC's 99th-percentile duration has sat
+over 4 s for 15 minutes. One slow RPC is that call's path; every RPC
+slow at once is the machine or the store under everything.
+
+Find the RPC and the bucket its p99 sits in — the first `le` whose
+cumulative count reaches 99% of the RPC's calls:
+
+```sh
+curl -s 127.0.0.1:9100/metrics | awk '
+  /^scion_request_seconds_bucket/ {
+    match($0, /rpc="[^"]*"/); rpc = substr($0, RSTART + 5, RLENGTH - 6)
+    match($0, /le="[^"]*"/);  le  = substr($0, RSTART + 4, RLENGTH - 5)
+    n[rpc]++; b[rpc, n[rpc]] = le; c[rpc, n[rpc]] = $NF
+  }
+  END {
+    for (r in n) {
+      total = c[r, n[r]] + 0
+      for (i = 1; i <= n[r]; i++)
+        if (c[r, i] + 0 >= 0.99 * total) { print r, "p99 in", b[r, i]; break }
+    }
+  }'
+```
+
+Tell the causes apart by which RPC is slow:
+
+- A write RPC (`Scion/Land`, `Scion/CreateChangeset`): the store's
+  fsyncs. `BlobSyncSlow` fires beside it when the mean fsync passes 2 s;
+  if it does, the drive is the cause, and the fix is faster storage or
+  fewer imports beside serving (section 5's import routine).
+- A read RPC (`Objects/GetObjects`, `Objects/ReadFile`):
+  `scion_cache_misses_total` rising on the tier in front points at cache
+  misses (the tier miss rate runbook below); `scion_pg_pool_wait_seconds`
+  with a rising tail (Postgres) points at readers held by long walks
+  (the pool metrics above); a partial reader's slow first read of a rule
+  set is the view memo warming (the runbook below).
+- Every RPC: the host is short of CPU, memory or disk headroom; the
+  fixes are off the server (move imports, scale out, add a cache).
+
+Escalate when a read RPC's p99 stays over 4 s with the caches warm and
+the drive quiet: that is a store shape a restart does not fix, and it
+needs the store's owner.
+
+Proof: crates/scion-server/tests/docs_alerts.rs::latency_p99_names_the_slow_rpc_from_the_served_histogram
+
+### View memo bypassed
+
+`ViewMemoBypassed` fires when the rate of `scion_view_trees_walked_total`
+stays over 5 per second for 30 minutes: partial readers' view
+derivations keep opening real trees instead of finding the per-tree
+memo rows the derivation cached before (the `view_trees` table).
+
+Read the counter twice, a minute apart, and subtract:
+
+```sh
+curl -s 127.0.0.1:9100/metrics | grep '^scion_view_trees_walked_total'
+```
+
+Tell the causes apart:
+
+- The rate is high but falling, and the repo's tip moves fast: every new
+  changeset re-derives the folders its changes touched. That is the
+  design working — a new changeset walks only what moved — and no fix
+  applies. The alert's 30-minute `for` exists so this warmup does not
+  fire it.
+- The rate is high and steady: the same (tree, context) pairs derive
+  again and again. The memo rows were swept: rows of a rule-set digest
+  that no grant hashes to any more die in bounded steps, so a recent
+  change to the access file's read rules (or a projection upgrade) makes
+  every read walk until the rows rebuild. Restore the rules, or let the
+  first reads pay and the rate falls.
+- The rate is high, steady, and `LatencyP99High` fires on a read RPC
+  with it: the derivations hold the store's readers. On Postgres,
+  `scion_pg_readers_busy` pinned at 8 with a growing
+  `scion_pg_tx_age_seconds` says the walks hold the pool; stagger the
+  readers, so the walks do not all run at once.
+
+Escalate when steady high walks and read latency land together and the
+access file has not changed for days: the working set outgrew the
+memo's shape, and it needs the store's owner.
+
+Proof: crates/scion-server/tests/docs_alerts.rs::view_memo_serves_the_second_read_of_one_changeset
+
+### Stalled replies high
+
+`StalledRepliesHigh` fires when `scion_stalled_reply_bytes` has sat over
+48 MiB for 15 minutes: replies whose clients stopped reading mid-reply
+hold their buffers in the server. The cap is `--max-stalled-bytes`
+(default 64 MiB) per connection; a connection over it is closed with
+everything it holds, and the server logs
+`closing a connection: its stalled replies hold too much` once, with the
+bytes it held.
+
+Read the gauge and find the client that stopped:
+
+```sh
+curl -s 127.0.0.1:9100/metrics | grep '^scion_stalled_reply_bytes'
+grep 'closing a connection' server.log
+```
+
+Tell the causes apart:
+
+- One client, once: a crashed reader or a paused consumer. The cap
+  already handled it — the buffers went with the connection. No fix.
+- The same peer, again and again: its reader is slower than the
+  server's producer. Fix the client (read the reply as it streams; the
+  close notice names the peer address, and the calls of one client
+  carry its `request_id` in both logs).
+- Many clients, bytes near the cap on several connections: the replies
+  are large and the clients are many — raise
+  `--max-stalled-bytes` only if the box has the memory for it, or add a
+  cache tier so the large replies do not all reach the server.
+
+Escalate when the close notice repeats for one peer and the client is
+not yours to fix: the client's owner stops the waste, not the server.
+
+Proof: crates/scion-server/tests/log_stream.rs::a_stalled_log_reply_is_counted_and_closes_the_connection
+
+### Tier miss rate
+
+`TierMissRate` fires when a tier's misses have held over half its reads
+for 30 minutes: the tier fetches from upstream what it should have
+served from its own store.
+
+Read the two counters and divide — misses over all reads:
+
+```sh
+curl -s 127.0.0.1:9100/metrics \
+  | awk '/^scion_cache_hits_total/ {h = $NF}
+         /^scion_cache_misses_total/ {m = $NF}
+         END {if (h + m > 0) print m / (h + m)}'
+```
+
+Tell the causes apart:
+
+- The ratio falls over the first minutes after a tier restart: the
+  memory store warms from the reads it serves. No fix. A cache cannot
+  refill itself from its own snapshot file at start; what the snapshot
+  is for is the daemon's warm start: the cache writes the file with
+  `--snapshot`, and a daemon starts from it with `--seed` (section 1).
+- The ratio is steady high and `CacheDown` is not firing: the working
+  set does not fit the tier's memory. Raise `--max-bytes` (and
+  `--snapshot-bytes`, so the snapshot can hold it), or put a tier near
+  each group of users instead of one tier for all.
+- The ratio is 1: nothing ever hits. The tier's store never sees a
+  second read of the same object — the clients are cold readers of
+  disjoint data, and a cache is the wrong tool for them; point the
+  clients at the server or accept the misses.
+
+Escalate when the ratio stays high with the caps raised and the box's
+memory free: the tier's placement or shape needs its owner.
+
+Proof: crates/scion-server/tests/docs_alerts.rs::tier_miss_ratio_falls_when_the_store_serves_the_second_read
 
 ## 7. Capacity
 

@@ -127,11 +127,12 @@ A release is cut through one PR from a branch named
      account (D18), and the build signs nothing of its own — the
      provenance comes from GitHub's hosted builder.
 
-   The dry-run proves all of it before the first tag: run the workflow
-   from the branch with `dry_run` on and a tag name (push that tag
-   first, unsigned), read the run — the diff job prints
-   `NO DIFFERENCE`, the `verify` job's `gh attestation verify` output
-   is the proof — and nothing is published.
+   The dry-run proves all of it before the first tag: dispatch the
+   workflow from `main` with `dry_run` on and the `commit` input set to
+   a main commit's SHA, and push no tag — the run checks out that
+   commit and refuses one that is not an ancestor of `main`. Read the
+   run: the diff job prints `NO DIFFERENCE`, the `verify` job's `gh
+   attestation verify` output is the proof — and nothing is published.
 
 ## Undoing a bad tag
 

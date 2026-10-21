@@ -199,6 +199,17 @@ that breaks one is caught.
   symlinked snapshot is refused, and `--seed-full-repo` must say so.
   `scion-tier/src/snapshot.rs::a_group_writable_snapshot_is_refused`,
   `scion-tier/src/snapshot.rs::a_symlinked_snapshot_is_refused`
+- **Two repos whose names differ only by case do not share one
+  snapshot file.** On a case-insensitive disk, `main` and `MAIN` would
+  fold one onto the other: the second repo's snapshot write replaced
+  the first's, and a seed of the first read the second's file;
+  `scion-tier/src/snapshot.rs::file_name` escapes
+  every capital (and every byte outside the plain name set) as `%XX`,
+  so the file name keeps lowercase only, and the property test holds
+  it for any repo name
+  (`scion-tier/src/snapshot.rs::any_repo_name_gives_one_plain_file_name`,
+  with its regression file in
+  `scion-tier/proptest-regressions/snapshot.txt`). #452
 - **Checkout writes nothing it should not.** Names that are unsafe fail
   before anything is written, a failed checkout removes what it wrote,
   a signal cleans up, and an existing destination is left untouched on
