@@ -1,5 +1,3 @@
-clippy now runs on macOS too (added.md)
-
 ci.yml's macOS test job runs the same two clippy passes as the Linux
 lint job (lib+bins and all-targets, -D warnings) before the tests.
 The Linux job never compiles macOS-only code - the workspace's one
