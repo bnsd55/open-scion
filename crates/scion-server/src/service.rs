@@ -448,11 +448,8 @@ impl ScionService {
         event: &'static str,
         fields: serde_json::Value,
     ) -> Result<(), Status> {
-        let line = crate::audit::Event::new(
-            event,
-            "intent",
-            json_fields(request_id, principal, &fields),
-        );
+        let line =
+            crate::audit::Event::new(event, "intent", json_fields(request_id, principal, &fields));
         self.audit.record(line).await.map_err(|why| {
             tracing::error!(reason = %why, "an audit intent was not made durable");
             Status::unavailable("the audit line was not made durable")
@@ -470,11 +467,8 @@ impl ScionService {
         outcome: &'static str,
         fields: serde_json::Value,
     ) {
-        let line = crate::audit::Event::new(
-            event,
-            outcome,
-            json_fields(request_id, principal, &fields),
-        );
+        let line =
+            crate::audit::Event::new(event, outcome, json_fields(request_id, principal, &fields));
         if let Err(why) = self.audit.record(line).await {
             tracing::error!(reason = %why, "an audit result was not made durable");
         }
@@ -684,11 +678,7 @@ fn json_fields(request_id: &str, principal: &str, fields: &serde_json::Value) ->
 
 /// `ResolveRef`, served by both services.
 /// The shared fields of an audit line: who, which call, on which RPC.
-fn json_fields(
-    request_id: &str,
-    principal: &str,
-    fields: &serde_json::Value,
-) -> serde_json::Value {
+fn json_fields(request_id: &str, principal: &str, fields: &serde_json::Value) -> serde_json::Value {
     let mut all = serde_json::json!({
         "request_id": request_id,
         "principal": principal,
@@ -1359,7 +1349,6 @@ impl Scion for ScionService {
         }))
     }
 
-
     async fn create_changeset(
         &self,
         request: Request<CreateChangesetRequest>,
@@ -1456,7 +1445,12 @@ impl Scion for ScionService {
             .run({
                 let repo = req.repo.clone();
                 let target_ref = req.target_ref.clone();
-                move |store| Ok(store.resolve_ref(&repo, &target_ref).ok().map(|id| hex_id(id.as_bytes())))
+                move |store| {
+                    Ok(store
+                        .resolve_ref(&repo, &target_ref)
+                        .ok()
+                        .map(|id| hex_id(id.as_bytes())))
+                }
             })
             .await
             .ok()
@@ -1527,8 +1521,8 @@ impl Scion for ScionService {
             })
             .await;
         match outcome {
-            Ok(Ok(outcome)) => {
-                self.land_recorded(
+            Ok(Ok(outcome)) => self
+                .land_recorded(
                     &request_id,
                     &principal,
                     &repo,
@@ -1537,8 +1531,7 @@ impl Scion for ScionService {
                     outcome,
                 )
                 .await
-                .map(|outcome| Response::new(land_response(outcome)))
-            }
+                .map(|outcome| Response::new(land_response(outcome))),
             Ok(Err(e)) => {
                 let status = Status::from(e);
                 self.metrics.land(code_label(status.code()));
