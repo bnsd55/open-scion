@@ -644,26 +644,29 @@ async fn concurrent_lands_ref_lines_tell_one_true_history() {
         "only the calls that moved the ref have ref lines: {}",
         refs.len()
     );
-    let chain: Vec<(String, String)> = refs
-        .iter()
-        .map(|line| {
-            (
-                line["old"].as_str().unwrap_or_default().to_string(),
-                line["new"].as_str().unwrap_or_default().to_string(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        chain.first().map(|(old, _)| old.as_str()),
-        Some(start_hex.as_str()),
-        "the first move moved the head the lands started from"
-    );
-    for pair in chain.windows(2) {
-        assert_eq!(
-            pair[0].1, pair[1].0,
-            "each move moved the ref its predecessor left it at"
+    // Each land's job writes its ref line after its commit and outside
+    // the write transaction, so the file's order is the record order
+    // and not the move order. Link the lines as a set instead: from the
+    // head the lands started from, exactly one move moves the ref from
+    // the head it stands at (no fork), every move's old is the head its
+    // predecessor left it at (no gap), and the walk visits all eight.
+    let mut by_old: std::collections::HashMap<&str, &serde_json::Value> =
+        std::collections::HashMap::new();
+    for line in &refs {
+        let old = line["old"].as_str().expect("a ref line names its old");
+        assert!(
+            by_old.insert(old, *line).is_none(),
+            "two moves claim the same old: the history forks at {old}"
         );
     }
+    let mut head = start_hex.as_str();
+    for _ in 0..refs.len() {
+        let line = by_old
+            .get(head)
+            .unwrap_or_else(|| panic!("no move moves the ref from {head}: the history has a gap"));
+        head = line["new"].as_str().expect("a ref line names its new");
+    }
+    assert_ne!(head, start_hex.as_str(), "the lands moved the ref");
 }
 
 /// The ref line of the call whose request id is `id`.
