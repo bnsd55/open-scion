@@ -134,39 +134,46 @@ numbers, and removes what it made. The method and the checkout
 benchmark against git are in [docs/benchmarks.md](https://github.com/bnsd55/openscion/blob/main/docs/benchmarks.md).
 
 The steps below want a git repository with a `src/` folder and a
-`README.md`; the demo's tokio checkout is one. Wherever you see
-`/path/to/a/repo`, use it (any path to a git repository works).
+`README.md`. Get one:
+
+```sh
+git clone https://github.com/tokio-rs/tokio /tmp/tokio
+git -C /tmp/tokio checkout be689a35f5ade5a39e507f79d3ec85cdab27806f
+```
+
+(any git repository with those two works). Every line below runs as
+written.
 
 ```sh
 cargo build --release
 export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
-./target/release/scion-server --data /tmp/scion import /path/to/a/repo
+./target/release/scion-server --data /tmp/scion import /tmp/tokio
 ./target/release/scion-server --data /tmp/scion ticket-key --out /tmp/scion/ticket.key > /tmp/scion/ticket.pub
 # the public key is now in ticket.pub; pass it to the tiers below
 ./target/release/scion-server --data /tmp/scion serve --ticket-key /tmp/scion/ticket.key &
 ./target/release/scion-server --data /tmp/scion fsck              # check the data directory; safe while the server runs
 ./target/release/scion-server --data /tmp/scion gc --dry-run      # what a collection would remove; safe while the server runs
 
-./target/release/scn ls main:src    # mode, kind, size, name per entry
+./target/release/scn ls main:src                    # mode, kind, size, name per entry
 ./target/release/scn log -n 5
-./target/release/scn log --path src -n 5          # changesets that changed src/
-./target/release/scn blame main:README.md         # last changeset of each line
+./target/release/scn log --path src -n 5            # changesets that changed src/
+./target/release/scn blame main:README.md
 ./target/release/scn cat main:README.md
-./target/release/scn checkout main --into /tmp/work   # --sparse DIR for part of it
+./target/release/scn checkout main --into /tmp/work # --sparse DIR for part of it
 mkdir -p /tmp/view
 # The mount serves NFS from scn itself and holds this terminal: run it
 # in another terminal, and leave it there until `scn unmount`. On macOS
 # it runs `sudo mount_nfs`, so it asks for your password once.
-./target/release/scn mount /tmp/view main             # files load when first read
+./target/release/scn mount /tmp/view main           # files load when first read
 # The mount is read-only, so this commit is refused until you mount
 # with `--unstable-writable` (see below); the refusal names the flag.
 ./target/release/scn commit -m "from the mount" --from-mount /tmp/view
 ./target/release/scn unmount /tmp/view
 echo hello > hello.txt
 cs=$(./target/release/scn commit -m "add hello" --put hello.txt=hello.txt)
-./target/release/scn diff main "$cs"              # A hello.txt, as git diff --name-status
-./target/release/scn merge-base main "$cs"        # as git merge-base --all
-./target/release/scn is-ancestor main "$cs"       # exits 0 for yes, 1 for no
+./target/release/scn diff main "$cs"                # A hello.txt, as git diff --name-status
+./target/release/scn merge-base main "$cs"          # as git merge-base --all
+./target/release/scn is-ancestor main "$cs"         # exits 0 for yes, 1 for no
 ./target/release/scn land "$cs"
 ./target/release/scn bench --agents 200 --lands 10000
 ```
