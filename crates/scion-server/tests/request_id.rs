@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Duration;
 
+#[path = "common/log_fields.rs"]
+mod log_fields;
+
 use scion_proto::v1::ResolveRefRequest;
 use scion_proto::v1::scion_client::ScionClient;
 use tempfile::TempDir;
@@ -125,11 +128,12 @@ async fn a_calls_request_id_names_its_span_in_the_servers_log() {
     assert_eq!(reply.err().unwrap().code(), tonic::Code::Unauthenticated);
 
     let text = fs::read_to_string(&server.log).unwrap();
-    assert!(
-        text.lines()
-            .any(|line| line.contains("request_id=e2e-req-1")
-                && line.contains("the call is unauthenticated")),
-        "the refusal line names the request ID:\n{text}"
+    let refusal = log_fields::find_line(&text, "the call is unauthenticated")
+        .unwrap_or_else(|| panic!("the refusal line is not in the log:\n{text}"));
+    assert_eq!(
+        refusal.field("request_id"),
+        Some("e2e-req-1"),
+        "the refusal line names the call's request ID: {refusal:?}"
     );
 }
 
