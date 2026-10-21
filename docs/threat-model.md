@@ -291,7 +291,11 @@ They become issues as the project moves past alpha.
 - The token compare is constant time: the code is (`auth.rs`,
   `constant_time_eq`), but no test observes it, and a timing test would
   be flaky by nature. The digest form of the access file is the main
-  defence, and that is the load-time format.
+  defence, and that is the load-time format. The check's whole work
+  still scales with the number of tokens the access file holds, so its
+  duration lets a caller estimate how many principals are configured.
+  That is config size, not identity, and the compare itself stays
+  constant time; a fixed-worst-case loop would buy nothing else.
 - A narrowed access file does not cut outstanding tickets: they hold
   for at most 15 minutes from signing, by design (rotate the key to cut
   at once). The window and the cut are pinned:

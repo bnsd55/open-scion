@@ -719,7 +719,10 @@ async fn the_model_holds_across_lands_retries_and_restarts() {
         tokio::time::sleep(Duration::from_millis(150)).await;
         if round % 3 != 0 {
             let conn = rusqlite::Connection::open(data.join("scion.db")).unwrap();
-            wait_until(|| pending_lands(&conn) > 0).await;
+            wait_until("a land is pending in the database", || {
+                pending_lands(&conn) > 0
+            })
+            .await;
         }
         tokio::time::sleep(Duration::from_millis(u64::try_from(rng.below(60)).unwrap())).await;
         signals.killed.store(true, Ordering::SeqCst);
