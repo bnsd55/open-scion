@@ -2972,7 +2972,8 @@ mod tests {
         assert_ne!(b_out.land_id, a_land.land_id, "two rows, one per caller");
 
         // A land's id answers only to its own caller.
-        f.get(a_land.land_id).unwrap_or_else(|e| panic!("A reads its land: {e:?}"));
+        f.get(a_land.land_id)
+            .unwrap_or_else(|e| panic!("A reads its land: {e:?}"));
         let b_gets_a = get_land(&f.store, &Caller("b".into()), "r", a_land.land_id);
         assert!(matches!(b_gets_a, Err(Error::NotFound(_))), "{b_gets_a:?}");
         let a_gets_b = get_land(&f.store, &caller(), "r", b_out.land_id);

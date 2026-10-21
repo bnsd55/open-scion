@@ -2332,6 +2332,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "hyper",
+ "jiff",
  "open-scion-core",
  "open-scion-proto",
  "postgres",
