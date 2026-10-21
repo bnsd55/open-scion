@@ -68,11 +68,15 @@ jobs:
         run: |
           # The prebuilt cargo-fuzz defaults to a musl target, where the
           # address sanitizer cannot run (ci.yml's smoke notes this too).
-          mkdir -p "crates/${{ matrix.crate }}/fuzz/corpus/${{ matrix.target }}"
+          # Everything is crate-relative: the corpus, the seeds, and the
+          # build all live under this crate's fuzz directory.
+          cd "crates/${{ matrix.crate }}"
+          mkdir -p "fuzz/corpus/${{ matrix.target }}"
           seeds=""
-          [ -d "crates/${{ matrix.crate }}/fuzz/seeds/${{ matrix.target }}" ] && \
-            seeds="crates/${{ matrix.crate }}/fuzz/seeds/${{ matrix.target }}"
-          cd "crates/${{ matrix.crate }}" && cargo fuzz run \
+          if [ -d "fuzz/seeds/${{ matrix.target }}" ]; then
+            seeds="fuzz/seeds/${{ matrix.target }}"
+          fi
+          cargo fuzz run \
             --target x86_64-unknown-linux-gnu "${{ matrix.target }}" \
             "fuzz/corpus/${{ matrix.target }}" $seeds \
             -- -max_total_time=$(( ${{ matrix.budget }} * ${{ inputs.budget_scale || 1 }} ))
