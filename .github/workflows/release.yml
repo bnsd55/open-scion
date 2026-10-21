@@ -44,12 +44,17 @@ jobs:
       tag: ${{ steps.tag.outputs.tag }}
     env:
       GH_TOKEN: ${{ github.token }}
+      # The dry-run flag and the tag name are resolved here, in YAML,
+      # so the run script below carries no `a && b || c` for shellcheck
+      # to misread as if-then-else.
+      DRY: ${{ inputs.dry_run && 'true' || 'false' }}
+      TAG: ${{ inputs.dry_run && inputs.tag || github.ref_name }}
     steps:
       - id: tag
         run: |
           set -euo pipefail
-          dry="${{ inputs.dry_run && 'true' || 'false' }}"
-          tag="${{ inputs.dry_run && inputs.tag || github.ref_name }}"
+          dry="$DRY"
+          tag="$TAG"
           # An annotated tag only: a lightweight tag has no tag object,
           # so it cannot carry a signature (D18).
           ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag")"
@@ -60,8 +65,9 @@ jobs:
           if [ "$dry" != true ]; then
             v="$(echo "$object" | jq -r '.verification.verified | tostring')"
             r="$(echo "$object" | jq -r '.verification.reason')"
-            [ "$v" = true ] && [ "$r" = valid ] || {
-              echo "the tag is not verified: reason=$r (D18: sign it)"; exit 1; }
+            if [ "$v" != true ] || [ "$r" != valid ]; then
+              echo "the tag is not verified: reason=$r (D18: sign it)"; exit 1
+            fi
             [ "$(echo "$object" | jq -r .tagger.email)" = bnsd55@gmail.com ] || {
               echo "the tagger is not the owner"; exit 1; }
           fi
