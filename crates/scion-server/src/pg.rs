@@ -1801,6 +1801,14 @@ fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
              ({PG_SCHEMA_VERSION}); run this build's older server, or upgrade it"
         )));
     }
+    if version == PG_SCHEMA_VERSION {
+        return Ok(());
+    }
+    tracing::info!(
+        from_version = version,
+        to_version = PG_SCHEMA_VERSION,
+        "migrating the metadata schema"
+    );
     for (n, sql) in PG_MIGRATIONS.iter().enumerate() {
         let n = u32::try_from(n + 1).expect("a schema version fits in a u32");
         if n <= version {
@@ -1809,6 +1817,7 @@ fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
         // One transaction per migration, with its version bump: a
         // migration that fails rolls its own statements back, and the
         // versions before it stand.
+        let step = std::time::Instant::now();
         let mut tx = PgTx::begin(client)?;
         tx.c.batch(&format!(
             "{sql}\nINSERT INTO schema_migrations (version, name) \
@@ -1816,7 +1825,18 @@ fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
             i64::from(n)
         ))?;
         tx.commit()?;
+        tracing::info!(
+            from_version = n - 1,
+            to_version = n,
+            elapsed_ms = u64::try_from(step.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "the metadata schema migrated one step"
+        );
     }
+    tracing::info!(
+        from_version = version,
+        to_version = PG_SCHEMA_VERSION,
+        "the metadata migration is done"
+    );
     Ok(())
 }
 
