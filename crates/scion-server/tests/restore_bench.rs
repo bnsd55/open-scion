@@ -52,16 +52,24 @@ fn a_restore_of_a_stated_store_takes_a_stated_time() {
             // 64 KiB file of one repeated block stores tens of bytes),
             // and the restore would move a fraction of the raw bytes.
             let mut seed = (u64::from(repo) << 32) ^ u64::from(step);
+            // The stream: the LCG's middle bits, truncated to a byte on
+            // purpose (clippy::cast_possible_truncation is fine here: the
+            // top 31 bits ARE the stream).
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "the top 31 bits of the LCG state are the stream"
+            )]
+            let next = |seed: &mut u64| -> u8 {
+                *seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (*seed >> 33) as u8
+            };
             let bytes = (0..FILE_BYTES)
-                .map(|_| {
-                    seed = seed
-                        .wrapping_mul(6364136223846793005)
-                        .wrapping_add(1442695040888963407);
-                    (seed >> 33) as u8
-                })
+                .map(|_| next(&mut seed))
                 .collect::<Vec<u8>>();
             let blob = store.blobs().put(&bytes).unwrap();
-            blob_bytes += bytes.len() as u64;
+            blob_bytes += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
             let cs = chain_changeset(&name, step, blob, parent);
             let id = store
                 .write(|c| {
@@ -121,30 +129,48 @@ fn a_restore_of_a_stated_store_takes_a_stated_time() {
     // bytes on disk are the restore's real payload, stated beside the
     // raw content bytes: they are the same only while nothing
     // deduplicates.
-    let on_disk: u64 = walk(&restored_dir.path().join("objects"))
-        .iter()
-        .filter(|p| p.is_file())
-        .filter_map(|p| fs::metadata(p).ok())
-        .map(|m| m.len())
-        .sum();
-    let raw_mib = f64::from(u32::try_from(blob_bytes).unwrap_or(u32::MAX)) / (1024.0 * 1024.0);
-    let disk_mib = f64::from(u32::try_from(on_disk).unwrap_or(u32::MAX)) / (1024.0 * 1024.0);
+    let on_disk = bytes_on_disk(&restored_dir.path().join("objects"));
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "byte and changeset counts stay far below 2^53"
+    )]
+    let raw_mib = blob_bytes as f64 / (1024.0 * 1024.0);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "byte and changeset counts stay far below 2^53"
+    )]
+    let disk_mib = on_disk as f64 / (1024.0 * 1024.0);
     println!(
         "restore: {:.1} s (build {:.1} s) for {REPOS} repos, {changesets} changesets, \
          {blob_bytes} raw blob bytes ({raw_mib:.0} MiB) in files of about {FILE_BYTES} bytes;          {on_disk} bytes ({disk_mib:.0} MiB) on disk after the restore",
         restore.as_secs_f64(),
         build.as_secs_f64(),
     );
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "byte and changeset counts stay far below 2^53"
+    )]
+    let changeset_rate = changesets as f64 / restore.as_secs_f64().max(0.001);
     println!(
         "restore rate: {:.0} MiB/s on disk, {:.0} changesets/s (ubuntu-24.04, one sample, fsync included)",
         disk_mib / restore.as_secs_f64().max(0.001),
-        f64::from(changesets as u16) / restore.as_secs_f64().max(0.001),
+        changeset_rate,
     );
     assert!(
         restore.as_secs() < RESTORE_BOUND_SECS,
         "the restore took {restore:?}, past the {RESTORE_BOUND_SECS} s bound: something \
          changed in the restore path, not in the machine"
     );
+}
+
+/// The byte size of every file under `root`: the restore's real payload.
+fn bytes_on_disk(root: &Path) -> u64 {
+    walk(root)
+        .iter()
+        .filter(|p| p.is_file())
+        .filter_map(|p| fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum()
 }
 
 /// fsyncs every file under `root`, then the directories on the way down.
