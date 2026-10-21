@@ -473,6 +473,35 @@ impl Store {
         (result, self.inner.committing.load(Ordering::Acquire))
     }
 
+    /// Runs `f` on one reader connection inside one explicit read
+    /// transaction, so every statement of `f` sees one snapshot. Plain
+    /// [`Store::read`] runs each statement autocommit, and a commit
+    /// between them changes what the later ones see. The cost is the
+    /// snapshot: the log cannot restart while `f` runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns what `f` returns, or an error from the transaction's
+    /// begin.
+    pub(crate) fn read_snapshot<T>(
+        &self,
+        f: impl for<'x> FnOnce(&'x mut SqliteTx<'x>) -> Result<T>,
+    ) -> Result<T> {
+        let reader = self.inner.readers.take();
+        let result = reader
+            .unchecked_transaction()
+            .map_err(from_sqlite)
+            .and_then(|tx| {
+                // A read transaction: nothing to keep, and the drop rolls
+                // it back. The drop must not hide what `f` returned.
+                let out = f(&mut SqliteTx(&reader));
+                drop(tx);
+                out
+            });
+        self.wait_durable(self.inner.committing.load(Ordering::Acquire))?;
+        result
+    }
+
     /// Returns once every commit that a read with count `seen` could see is
     /// durable ([`Store::read_counted`]). Call it after that read.
     ///

@@ -430,6 +430,26 @@ impl Backend {
             Inner::Postgres(pg) => pg.tx_age(),
         }
     }
+
+    /// Runs `f` so every statement sees one snapshot, as an export's
+    /// sections claim. On Postgres, [`Backend::read`] already runs in one
+    /// REPEATABLE READ transaction. On SQLite, [`Backend::read`] runs each
+    /// statement autocommit, so the snapshot needs an explicit read
+    /// transaction on the reader connection.
+    ///
+    /// # Errors
+    ///
+    /// What `f` returns, or a database error from the transaction's
+    /// begin.
+    pub(crate) fn read_snapshot<T>(
+        &self,
+        f: impl FnOnce(&mut BackendTx<'_>) -> Result<T>,
+    ) -> Result<T> {
+        match &self.inner {
+            Inner::Sqlite(store) => store.read_snapshot(|tx| f(&mut BackendTx::Sqlite(tx))),
+            Inner::Postgres(pg) => pg.read(|tx| f(&mut BackendTx::Postgres(tx.reborrow()))),
+        }
+    }
 }
 
 impl Backend {}
