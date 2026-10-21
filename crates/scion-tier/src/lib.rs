@@ -493,7 +493,16 @@ impl<S: Store> Tier<S> {
             );
             endpoint
         };
-        let channel = endpoint.connect_lazy();
+        // The mirror of the server's own keepalive (listen.rs): a peer
+        // that died without a FIN or RST is noticed in about
+        // `CLIENT_KEEPALIVE_INTERVAL` plus its timeout, not at the tier's
+        // upstream timeout of a whole call.
+        let channel = endpoint
+            .http2_keep_alive_interval(scion_proto::runtime::listen::CLIENT_KEEPALIVE_INTERVAL)
+            .keep_alive_timeout(scion_proto::runtime::listen::CLIENT_KEEPALIVE_TIMEOUT)
+            .keep_alive_while_idle(true)
+            .tcp_keepalive(Some(scion_proto::runtime::listen::CLIENT_TCP_KEEPALIVE))
+            .connect_lazy();
         let bearer = if upstream_token.is_empty() {
             None
         } else {

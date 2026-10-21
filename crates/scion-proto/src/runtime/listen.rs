@@ -91,6 +91,24 @@ pub(crate) const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 /// keeps for life (a daemon keeps one to its cache) gives its place up.
 pub(crate) const MAX_CONNECTION_AGE: Duration = Duration::from_secs(30 * 60);
 
+/// The HTTP/2 keepalive a client of a scion server runs: it pings its
+/// peer at this interval, busy or idle, and the peer's answer must come
+/// within [`CLIENT_KEEPALIVE_TIMEOUT`]. The server pings its side at
+/// [`KEEPALIVE_INTERVAL`] (60 s); a client that asks sooner sees a dead
+/// server first, and a kill without a FIN or RST (a frozen process, a
+/// host gone) ends its calls in about the interval plus the timeout,
+/// not at a call deadline.
+pub const CLIENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long a client's connection waits for a keepalive answer before
+/// the connection is dead: a third of [`CLIENT_KEEPALIVE_INTERVAL`], so
+/// a dead peer costs about 40 s.
+pub const CLIENT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The TCP keepalive probe interval of a client connection, under the
+/// HTTP/2 interval, so a dead connection is visible below HTTP/2 too.
+pub const CLIENT_TCP_KEEPALIVE: Duration = Duration::from_secs(15);
+
 /// A connection that was asked to close is closed this long later, with any
 /// call still in it. At least the server's longest call (600 s).
 pub const CONNECTION_GRACE: Duration = Duration::from_secs(600);
