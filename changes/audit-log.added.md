@@ -27,5 +27,10 @@ to contents), and neither are token bytes or token hashes. Rotation
 is by size, keeps a bounded number of old files, and names what it
 dropped in an admin line.
 
-Not covered yet: nothing - the events above are the whole of the
-issue's list.
+Not covered yet: the ref moves that happen outside the server.
+Import moves a ref to each imported tip (import.rs), and archive
+restore writes refs back (restore_ref); they run as their own
+processes and cannot hand lines to the server's writer, so they must
+append their own lines to the same audit file, intent before the
+move. Until they do, a reader of the log must not take it as
+complete: a ref can move without a line.
