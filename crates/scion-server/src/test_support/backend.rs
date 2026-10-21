@@ -127,6 +127,14 @@ impl Backend {
     pub fn test_first_sweep_done() -> bool {
         crate::service::TEST_FIRST_SWEEP_DONE.load(std::sync::atomic::Ordering::Acquire)
     }
+
+    /// The SQL of the statements run since the last reset.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn test_statement_log() -> Vec<String> {
+        crate::pg::test_statement_log()
+    }
     /// The schema that [`Backend::open_test`] gave this data directory on
     /// Postgres: a test that counts rows through its own Postgres client
     /// names it the same way. A result, so the callers unwrap one shape.

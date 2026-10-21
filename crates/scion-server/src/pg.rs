@@ -907,6 +907,7 @@ impl Pg {
         let (mut writer, _waiting) = self.lock_writer();
         let mut pg = PgTx {
             c: &mut writer,
+            gen_cache: std::collections::HashMap::new(),
             ended: true,
         };
         f(&mut pg)
@@ -1132,6 +1133,12 @@ impl Drop for PgWriteWaiter<'_> {
 #[allow(unreachable_pub)]
 pub struct PgTx<'a> {
     c: &'a mut PgClient,
+    /// The generations this transaction has already read. A changeset's
+    /// generation is fixed at insert and never updated, so one read per
+    /// transaction is one round trip saved for every later read of the
+    /// same changeset - the derived walks and the land ask for the same
+    /// few ids again and again.
+    gen_cache: std::collections::HashMap<(i64, Vec<u8>), i64>,
     /// The transaction was ended by `commit` or `rollback`; a drop then
     /// leaves the client alone.
     ended: bool,
@@ -1141,7 +1148,11 @@ impl<'a> PgTx<'a> {
     /// Begins one transaction on the client.
     fn begin(c: &'a mut PgClient) -> Result<PgTx<'a>> {
         c.execute("BEGIN", &[])?;
-        Ok(Self { c, ended: false })
+        Ok(Self {
+            c,
+            gen_cache: std::collections::HashMap::new(),
+            ended: false,
+        })
     }
 
     /// Begins one read-only transaction at repeatable read: every
@@ -1169,7 +1180,11 @@ impl<'a> PgTx<'a> {
         // drops this `PgTx`, and its Drop rolls the transaction back, so
         // the pooled client never stays inside one whose statements no
         // longer run.
-        let tx = Self { c, ended: false };
+        let tx = Self {
+            c,
+            gen_cache: std::collections::HashMap::new(),
+            ended: false,
+        };
         tx.c.execute(
             &format!("SET LOCAL statement_timeout = {}", statement.as_millis()),
             &[],
@@ -1189,6 +1204,7 @@ impl<'a> PgTx<'a> {
     pub(crate) fn reborrow(&mut self) -> PgTx<'_> {
         PgTx {
             c: self.c,
+            gen_cache: std::collections::HashMap::new(),
             ended: true,
         }
     }
@@ -1407,6 +1423,20 @@ fn run_with_retry(
 #[cfg(any(test, feature = "test-hooks"))]
 static TEST_STATEMENTS: AtomicU64 = AtomicU64::new(0);
 
+/// The SQL of the statements run since the last reset, for a test that
+/// wants the kinds and not just the count.
+#[cfg(any(test, feature = "test-hooks"))]
+static TEST_STATEMENT_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The SQL of the statements run since the last reset.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn test_statement_log() -> Vec<String> {
+    TEST_STATEMENT_LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 /// The statement count of this process since the last reset.
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn test_statement_count() -> u64 {
@@ -1417,12 +1447,22 @@ pub(crate) fn test_statement_count() -> u64 {
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn test_reset_statement_count() {
     TEST_STATEMENTS.store(0, Ordering::Relaxed);
+    TEST_STATEMENT_LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
 }
 
 /// Runs one statement of a job on the client.
 fn run_statement(client: &mut Client, job: &Job) -> Result<Reply> {
     #[cfg(any(test, feature = "test-hooks"))]
-    TEST_STATEMENTS.fetch_add(1, Ordering::Relaxed);
+    {
+        TEST_STATEMENTS.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut log) = TEST_STATEMENT_LOG.try_lock() {
+            let sql: String = job.sql.chars().take(90).collect();
+            log.push(sql.replace('\n', " "));
+        }
+    }
     let refs = as_refs(&job.params);
     match job.kind {
         Kind::Batch => client.batch_execute(&job.sql).map(|(): ()| Reply::Count(0)),
@@ -1910,8 +1950,30 @@ impl MetaTx for PgTx<'_> {
         // write, on both backends.
         let (body, id) = cs.encode_with_id();
         let mut parent_gen = 0;
-        for parent in cs.parents() {
-            parent_gen = parent_gen.max(self.generation(repo, *parent)?);
+        let parents: Vec<Vec<u8>> = cs
+            .parents()
+            .iter()
+            .map(|parent| id_bytes(parent.as_bytes()))
+            .collect();
+        if !parents.is_empty() {
+            // One round trip for every parent's generation, however many
+            // parents a merge has.
+            let rows = self.c.query(
+                "SELECT id, gen FROM changesets JOIN repo_changesets ON cs = id
+                 WHERE repo_id = $1 AND id = ANY($2)",
+                &[P::i64(repo.0), P::bytea_array(parents.clone())],
+            )?;
+            let mut gens: std::collections::HashMap<Vec<u8>, i64> = rows
+                .into_iter()
+                .map(|row| (row.get::<_, Vec<u8>>(0), row.get::<_, i64>(1)))
+                .collect();
+            for (parent, key) in cs.parents().iter().zip(&parents) {
+                let parent_gen_i = gens
+                    .remove(key)
+                    .ok_or_else(|| Error::NotFound(format!("changeset {parent}")))?;
+                parent_gen = parent_gen.max(parent_gen_i);
+                self.gen_cache.insert((repo.0, key.clone()), parent_gen_i);
+            }
         }
         self.c.execute(
             "INSERT INTO changesets (id, gen, body) VALUES ($1, $2, $3)
@@ -2006,14 +2068,23 @@ impl MetaTx for PgTx<'_> {
     ///
     /// [`Error::NotFound`] if `repo` does not have it.
     fn generation(&mut self, repo: RepoId, id: ChangesetId) -> Result<i64> {
-        self.c
+        let key = (repo.0, id_bytes(id.as_bytes()));
+        if let Some(cached) = self.gen_cache.get(&key) {
+            return Ok(*cached);
+        }
+        let found = self
+            .c
             .query_opt(
                 "SELECT gen FROM changesets JOIN repo_changesets ON cs = id
                  WHERE repo_id = $1 AND id = $2",
-                &[P::i64(repo.0), P::bytes(&id_bytes(id.as_bytes()))],
+                &[P::i64(repo.0), P::bytes(&key.1)],
             )?
             .map(|row| row.get::<_, i64>(0))
-            .ok_or_else(|| Error::NotFound(format!("changeset {id}")))
+            .ok_or_else(|| Error::NotFound(format!("changeset {id}")));
+        if let Ok(found_gen) = &found {
+            self.gen_cache.insert(key, *found_gen);
+        }
+        found
     }
 
     /// The generation of a changeset, in any repo. For derived data.

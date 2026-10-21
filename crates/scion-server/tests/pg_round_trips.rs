@@ -42,11 +42,11 @@ const REPO: &str = "r";
 /// sweep's first pass, so no background statement can fall inside it).
 /// The design lowers both to a budget of 15; each step of that work
 /// moves these numbers down before it can claim to.
-const BUDGET: u64 = 51;
+const BUDGET: u64 = 48;
 
 /// The same for a land whose base is no longer the ref's head, so the
 /// land must rebase: the slow case under contention.
-const REBASE_BUDGET: u64 = 56;
+const REBASE_BUDGET: u64 = 55;
 
 /// A one-commit git repository, imported on `main`.
 fn git_seed() -> (TempDir, ChangesetId) {
@@ -217,6 +217,9 @@ async fn one_land_stays_under_the_round_trip_budget() {
 
     let statements = Backend::test_statement_count();
     println!("one land through the server ran {statements} statements");
+    for sql in Backend::test_statement_log() {
+        println!("  {sql}");
+    }
     assert!(
         statements <= BUDGET,
         "one land through the server ran {statements} statements, above the budget {BUDGET}"
