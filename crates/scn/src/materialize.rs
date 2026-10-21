@@ -114,11 +114,28 @@ pub(crate) fn check_name(name: &[u8]) -> Result<(), &'static str> {
             return Err("it contains a bidirectional text control");
         }
     }
+    // The name as the disk reads it: NTFS drops trailing ASCII spaces and
+    // dots (git's ntfs check), and HFS+ ignores U+200C..U+200F anywhere
+    // (git's hfs check). Both are in scope: scn checks out to any local
+    // disk (docs/support.md). The compare folds ASCII case, so `.GIT ` is
+    // the reserved name too.
+    let mut slim = String::with_capacity(name.len());
+    for chunk in name.utf8_chunks() {
+        slim.push_str(chunk.valid());
+        for _ in chunk.invalid() {
+            slim.push('\u{fffd}');
+        }
+    }
+    let slim: String = slim
+        .chars()
+        .filter(|c| !matches!(c, '\u{200c}'..='\u{200f}'))
+        .collect();
+    let slim = slim.trim_end_matches([' ', '.']);
     if RESERVED
         .iter()
-        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+        .any(|reserved| slim.as_bytes().eq_ignore_ascii_case(reserved))
     {
-        return Err("it uses a reserved metadata name");
+        return Err("it names metadata a tool keeps, once the parts a disk folds are gone");
     }
     Ok(())
 }
@@ -1705,13 +1722,25 @@ mod tests {
     /// The check must trim before it compares.
     #[test]
     fn a_reserved_name_with_a_trailing_dot_or_space_is_refused() {
-        for name in [".git ", " .git", ".git.", ".scion ", ".scion.", ".GIT ", ".git\t"] {
+        for name in [".git ", ".git.", ".scion ", ".scion.", ".GIT ", ".Git."] {
             let why = check_name(name.as_bytes())
                 .expect_err(&format!("{name:?} must be refused as a reserved name"));
             assert!(
-                why.contains("reserved"),
+                why.contains("metadata"),
                 "{name:?}: the refusal must say why: {why}"
             );
+        }
+        // The code points HFS+ ignores are gone before the compare, so
+        // `.g\u{200c}it` is `.git` on such a disk.
+        for name in [".g\u{200c}it", ".git\u{200d}"] {
+            let why = check_name(name.as_bytes())
+                .expect_err(&format!("{name:?} must be refused as a reserved name"));
+            assert!(why.contains("metadata"), "{name:?}: {why}");
+        }
+        // A name that only starts like a reserved name stays allowed.
+        for name in [".gitignore", ".gitignore ", ".gitmodules", ".github"] {
+            check_name(name.as_bytes())
+                .unwrap_or_else(|why| panic!("{name:?} must stay allowed: {why}"));
         }
     }
 
