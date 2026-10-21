@@ -2,17 +2,23 @@
 # aggregate score. A check below its floor fails the scorecard job
 # unless an unexpired exception covers it; every exception names an
 # owner, a reason, and an expiry date (YYYY-MM-DD), and expires hard.
-# The floors are checks the project meets today; the checks it does
-# not meet yet are exceptions, not low floors.
+# Most floors are checks the project meets today. Two were never met
+# and stand as exceptions, not floors: Maintained (the repo is younger
+# than 90 days, a fact about time) and Branch-Protection (the check
+# needs a token with admin read, Ben's call).
 policy: 1
 
 floors:
   Binary-Artifacts: 10
+  # Branch-Protection keeps the floor of 8 for when the exception
+  # expires; today the check cannot run (the exception below).
   Branch-Protection: 8
   CI-Tests: 10
   Dangerous-Workflow: 10
   Dependency-Update-Tool: 10
   License: 10
+  # Maintained keeps the floor of 10 for when the repo is 90 days old;
+  # the exception below covers the time before that.
   Maintained: 10
   Pinned-Dependencies: 10
   Security-Policy: 10
@@ -20,6 +26,18 @@ floors:
   Vulnerabilities: 10
 
 exceptions:
+  - check: Maintained
+    owner: Ben Shaharizad <bnsd55@gmail.com>
+    reason: the repository was created 2026-10-14, younger than the 90
+      days the check needs; the score rises on its own when the repo
+      turns 90 days old (2027-01-12), so the exception expires then
+    expires: "2027-01-12"
+  - check: Branch-Protection
+    owner: Ben Shaharizad <bnsd55@gmail.com>
+    reason: the check could not run (it needs a token with admin read
+      of the branch rules, or a decision on what protection to turn
+      on); deciding and configuring is Ben's call
+    expires: "2026-11-30"
   - check: Signed-Releases
     owner: Ben Shaharizad <bnsd55@gmail.com>
     reason: no release has been cut yet; the first release ships signed
