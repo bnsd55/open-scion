@@ -443,16 +443,19 @@ fn sqlstate(e: &Error) -> Option<String> {
 /// The bytes free on the database's data directory: the tmpfs's size
 /// minus what the default tablespace holds. The run prints it at each
 /// phase, so one run shows the whole picture.
-fn free_bytes(client: &mut postgres::Client) -> i64 {
+fn free_bytes(client: &mut postgres::Client) -> String {
     let used: i64 = client
         .query_one("SELECT pg_tablespace_size('pg_default')", &[])
         .expect("the tablespace size answers")
         .get(0);
-    let total: i64 = std::env::var("SCION_PG_TMPFS_BYTES")
+    match std::env::var("SCION_PG_TMPFS_BYTES")
         .ok()
-        .and_then(|v| v.parse().ok())
-        .expect("SCION_PG_TMPFS_BYTES names the tmpfs");
-    total - used
+        .and_then(|v| v.parse::<i64>().ok())
+    {
+        Some(total) => format!("{} bytes free", total - used),
+        // The dry run has no tmpfs witness: report what is held.
+        None => format!("{used} bytes held (no tmpfs witness)"),
+    }
 }
 
 /// The database's data directory, as the database names it.
@@ -529,6 +532,28 @@ fn fill(client: &mut postgres::Client, chunk_len: usize) -> Option<postgres::Err
     }
 }
 
+/// Fills to a byte budget instead of to the wall: the dry run's fill,
+/// which stops while the disk still has room.
+fn fill_to(client: &mut postgres::Client, chunk_len: usize, budget: usize) {
+    client
+        .batch_execute(
+            "CREATE SCHEMA IF NOT EXISTS diskfull_filler;
+             CREATE TABLE IF NOT EXISTS diskfull_filler.filler (chunk bytea)",
+        )
+        .expect("the filler table is created");
+    let chunk = incompressible(chunk_len);
+    let mut put = 0usize;
+    while put < budget {
+        client
+            .execute("INSERT INTO diskfull_filler.filler VALUES ($1)", &[&chunk])
+            .expect("the dry fill's insert lands");
+        put += chunk_len;
+    }
+    client
+        .batch_execute("CHECKPOINT")
+        .expect("the dry fill's checkpoint runs");
+}
+
 /// A changeset whose rows are wide: many entries, each naming a path,
 /// so one land's metadata write must grow the database.
 /// The paths the lands rewrite: the root creates them, and each land
@@ -574,75 +599,131 @@ fn wide_changeset(
     )
     .expect("changeset fits the format")
 }
+/// Fills the margin and the filler: to the wall on the wet run (the
+/// 53100 must be the filler's own insert's error), to a budget on the
+/// dry one. The lands' count starts at the fill's chunk count, so the
+/// land names stay distinct.
+fn fill_all(client: &mut postgres::Client, dry: bool) -> usize {
+    println!("phase: before the fill, {}", free_bytes(client));
+    let margin = if dry { 8 } else { 64 } * 1024 * 1024;
+    fill_margin(client, 4 * 1024 * 1024, margin);
+    // The lands' count starts at the fill's chunk count, so the land
+    // names stay distinct from the filler's row names.
+    let landed = 0usize;
+    let filled_by = if dry {
+        // No wall to reach: the fill stops at a budget the dry disk
+        // holds with room to spare.
+        fill_to(client, 4 * 1024 * 1024, 32 * 1024 * 1024);
+        None
+    } else {
+        fill(client, 4 * 1024 * 1024)
+    };
+    if !dry {
+        match &filled_by {
+            Some(e) if e.code() == Some(&postgres::error::SqlState::DISK_FULL) => {
+                println!("the filler's insert took the 53100 first");
+            }
+            Some(e) => panic!("the fill failed with something else: {e:?}"),
+            None => {}
+        }
+    }
+    println!("phase: the fill ended, {}", free_bytes(client));
+    landed
+}
+
+/// Lands wide changesets until the wall stops one (the wet run), or
+/// until `stop` have landed (the dry run). The count rides in `landed`
+/// so the caller's phase prints can say how far it got.
+fn land_until(
+    store: &Backend,
+    from: usize,
+    blob: scion_core::BlobId,
+    dry: bool,
+) -> Result<(), Error> {
+    let mut landed = from;
+    loop {
+        // A backstop: lands that never stop mean the fill was not full,
+        // which is this test's own failure, not the server's.
+        assert!(landed < 5000, "the lands never hit the database's limit");
+        if dry && landed == 40 {
+            return Ok(());
+        }
+        landed += 1;
+        let cs = wide_changeset(store, &format!("fill{landed}"), landed % 2 == 1, blob);
+        // The helper stores the changeset and its tree; the ref move is
+        // the land's own act, so main advances here and the next land's
+        // base tree holds the last land's files.
+        let id = write::create_changeset(store, REPO, &cs.encode())?;
+        let head = store
+            .read(|c| {
+                let repo = c.repo_id(REPO)?;
+                Ok(c.get_ref(repo, "main")?
+                    .map(|r| (repo, r.version))
+                    .expect("main exists"))
+            })
+            .unwrap();
+        store
+            .write(|c| {
+                assert!(c.cas_ref(head.0, "main", Some(head.1), id)?, "main moves");
+                Ok(())
+            })
+            .expect("main advances");
+    }
+}
+
 #[test]
 fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
-    if !required() {
-        return;
-    }
     if !Backend::test_is_postgres() {
         println!("skipping: the database's own disk full is a Postgres row");
         return;
     }
-    // The fill only proves the row where the database's data directory
-    // sits on a small tmpfs: the workflow's own job mounts it and says
-    // so here. SHORTCUT: the env var is the tmpfs's only witness - a
-    // local run against a big disk would fill for hours before 53100.
-    let Ok(bytes) = std::env::var("SCION_PG_TMPFS_BYTES") else {
-        println!("skipping: set SCION_PG_TMPFS_BYTES to the service's tmpfs size");
-        return;
+    // The dry run: the plumbing of this row - margin, drop, open, repo,
+    // wide lands - against any Postgres, with the fill capped small and
+    // the lands stopped by a count. No wall, so no 53100 to assert; the
+    // point is that a dispatch is not the first run of a change here.
+    let dry = std::env::var("SCION_PG_DISKFULL_DRY").is_ok();
+    // The wet run needs the tmpfs's witness: the workflow's job mounts
+    // the small disk and says so here. SHORTCUT: the env var is the
+    // tmpfs's only witness - a local run against a big disk would fill
+    // for hours before 53100.
+    let bytes = match std::env::var("SCION_PG_TMPFS_BYTES") {
+        Ok(bytes) => bytes,
+        Err(_) if dry => String::new(),
+        Err(_) => {
+            println!(
+                "skipping: set SCION_PG_TMPFS_BYTES to the service's tmpfs size, or SCION_PG_DISKFULL_DRY=1 for the dry run"
+            );
+            return;
+        }
     };
-    let Ok(_bytes) = bytes.parse::<u64>() else {
-        panic!("SCION_PG_TMPFS_BYTES must be a number of bytes");
-    };
+    if !dry {
+        bytes
+            .parse::<u64>()
+            .expect("SCION_PG_TMPFS_BYTES must be a number of bytes");
+    }
     let url = std::env::var("SCION_TEST_POSTGRES_URL").expect("SCION_TEST_POSTGRES_URL");
     let mut client = raw(&url);
-    let dir = data_dir(&mut client);
-    if !std::path::Path::new(&dir).exists() {
-        // A service container's path: the job cannot see it, and the
-        // env var is the witness instead.
-        println!("the data directory {dir} is the service's own; the env var vouches for it");
-    }
-    // The fill needs only a sane size: big enough that a handful of
-    // chunks fill it, small enough that the job stays quick. The WAL
-    // is off the tmpfs (the service mounts it elsewhere), so a heap
-    // extend is the write that fails, with the clean 53100 - a lost
-    // connection is the Database unreachable row, not this one.
-
-    // The fill: the database's own disk fills until an insert meets the
-    // wall - no ceiling, the wall is the evidence.
-    println!(
-        "phase: before the fill, {} bytes free",
-        free_bytes(&mut client)
-    );
-    fill_margin(&mut client, 4 * 1024 * 1024, 64 * 1024 * 1024);
-    let mut landed = 0usize;
-    let filled_by = fill(&mut client, 4 * 1024 * 1024);
-    match &filled_by {
-        Some(e) if e.code() == Some(&postgres::error::SqlState::DISK_FULL) => {
-            println!("the filler's insert took the 53100 first");
+    if !dry {
+        // The wet run's data directory is the service container's own;
+        // the job cannot see it, and the env var is the witness instead.
+        let dir = data_dir(&mut client);
+        if !std::path::Path::new(&dir).exists() {
+            println!("the data directory {dir} is the service's own; the env var vouches for it");
         }
-        Some(e) => panic!("the fill failed with something else: {e:?}"),
-        None => {}
     }
-    println!(
-        "phase: the wall closed, {} bytes free",
-        free_bytes(&mut client)
-    );
-
-    // The fill ended at the wall. Free the margin: the DROP unlinks
-    // the margin table's files at commit, so the room returns to the
-    // filesystem with nothing left to luck - a VACUUM only truncates a
-    // table's empty tail, so where the deleted rows sat would decide
-    // (run 4's evidence: the open met the wall through 16 deleted
-    // chunks). The store's open and lands spend the freed room until
-    // the wall closes again.
+    // The WAL is off the tmpfs (the service mounts it elsewhere), so a
+    // heap extend is the write that fails, with the clean 53100 - a
+    // lost connection is the Database unreachable row, not this one.
+    let landed = fill_all(&mut client, dry);
+    // Free the margin: the DROP unlinks the margin table's files at
+    // commit, so the room returns with nothing left to luck - a VACUUM
+    // only truncates a table's empty tail (run 4's evidence). The
+    // store's open and lands spend the freed room until the wall
+    // closes again.
     client
         .batch_execute("DROP TABLE diskfull_filler.margin;")
         .expect("the margin frees");
-    println!(
-        "phase: the margin dropped, {} bytes free",
-        free_bytes(&mut client)
-    );
+    println!("phase: the margin dropped, {}", free_bytes(&mut client));
 
     // The proving write: lands a client would run, through the store's
     // own write path, until the wall stops one of them.
@@ -653,6 +734,9 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
     // same open the lands below use: a second open of one schema cannot
     // run beside the first (the per-schema one-server lock), and a bare
     // repo has no main for the lands' parent read.
+    // The blob the re-creations share: stored first, then named a
+    // member of the repo, so the lands' checks accept it.
+    let blob = store.blobs().put(&incompressible(64)).unwrap();
     store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
@@ -666,22 +750,27 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
             .expect("the root fits the format");
             let (id, _) = tree::store_changeset(c, repo, &root, &mut tree::lens_of(&store))?;
             assert!(c.cas_ref(repo, "main", None, id)?);
+            c.add_repo_blobs(repo, &[blob])?;
             Ok(())
         })
         .expect("the repo and its main land");
-    let blob = store.blobs().put(&incompressible(64)).unwrap();
-    let outcome = loop {
-        // A backstop: lands that never stop mean the fill was not full,
-        // which is this test's own failure, not the server's.
-        assert!(landed < 5000, "the lands never hit the database's limit");
-        landed += 1;
-        let cs = wide_changeset(&store, &format!("fill{landed}"), landed % 2 == 1, blob);
-        match write::create_changeset(&store, REPO, &cs.encode()) {
-            Ok(_) => {}
-            Err(e) => break e,
-        }
+    let outcome = land_until(&store, landed, blob, dry);
+    let Err(outcome) = outcome else {
+        // The dry arm: the plumbing ran; the row's read, drop, and the
+        // land after, close it out.
+        println!("dry: the lands landed with no wall in the way");
+        client
+            .batch_execute("DROP SCHEMA diskfull_filler CASCADE")
+            .expect("the filler drops");
+        client
+            .batch_execute("CHECKPOINT")
+            .expect("the checkpoint runs");
+        store
+            .write(|c| c.create_repo("after"))
+            .expect("the same write lands");
+        return;
     };
-    // The loop's break carries the error; a land that never fails is
+    // The wet run's break carries the error; a land that never fails is
     // the backstop's own panic above.
     assert!(
         sqlstate(&outcome).as_deref() == Some("53100"),
