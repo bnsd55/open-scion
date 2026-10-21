@@ -124,6 +124,37 @@ enum Step {
     Failed,
 }
 
+/// One walked entry or the walk's end, as [`verdict_of`] sees it: the
+/// step the call made, and — for an entry — the tag it typed with the
+/// account it names, or `None` when the kind could not be read.
+type Walked = (Step, Option<(c_int, Option<u32>)>);
+
+/// The verdict a walk's steps carry: any entry that grants something
+/// grants, a walk that failed grants (the check cannot vouch for what
+/// it did not read), an entry whose kind could not be read grants, and
+/// a walk that read every entry and found only deny entries denies
+/// only. The one place the walk's decision lives.
+fn verdict_of(steps: impl Iterator<Item = Walked>) -> Verdict {
+    for (step, typed) in steps {
+        match step {
+            // A failed walk cannot vouch for the entries it did not
+            // read, so the ACL is treated as granting: this check never
+            // accepts what it cannot read whole.
+            Step::Failed => return Verdict::Granting("an ACL whose walk failed", None),
+            // The walk read every entry and typed them all; none grants.
+            Step::End => return Verdict::DenyOnly,
+            Step::Entry => match typed {
+                None => return Verdict::Granting("an entry whose kind could not be read", None),
+                Some((tag, who)) if tag != ACL_EXTENDED_DENY => {
+                    return Verdict::Granting(entry_kind(tag), who);
+                }
+                Some((_, _)) => {}
+            },
+        }
+    }
+    Verdict::DenyOnly
+}
+
 pub(crate) fn fd_acl(fd: std::os::fd::RawFd) -> Verdict {
     // SAFETY: `acl_get_fd_np` reads the descriptor's ACL and returns a
     // handle the caller must release with `acl_free`; it writes nothing
@@ -140,8 +171,10 @@ pub(crate) fn fd_acl(fd: std::os::fd::RawFd) -> Verdict {
             Verdict::Granting("an ACL that could not be read", None)
         };
     }
-    let verdict = Verdict::DenyOnly;
-    let mut granting: Option<(&'static str, Option<u32>)> = None;
+    // The FFI side of the walk: each call's step, and for an entry the
+    // tag it typed and the account it names. The decision is the fold's
+    // (`verdict_of`), not this loop's.
+    let mut walked: Vec<Walked> = Vec::new();
     let mut entry_id = ACL_FIRST_ENTRY;
     loop {
         // SAFETY: `acl` is the handle `acl_get_fd_np` returned and is not
@@ -154,17 +187,12 @@ pub(crate) fn fd_acl(fd: std::os::fd::RawFd) -> Verdict {
         // The errno the call just set: read it now, before anything
         // else can clobber it.
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        match walk_step(entry_id, got, errno) {
-            Step::Entry => {}
-            Step::End => break,
-            // A walk that failed cannot vouch for the entries it did
-            // not read, so the ACL is treated as granting: this check
-            // never accepts what it cannot read whole.
-            Step::Failed => {
-                granting = Some(("an ACL whose walk failed", None));
-                break;
-            }
+        let step = walk_step(entry_id, got, errno);
+        if step != Step::Entry {
+            walked.push((step, None));
+            break;
         }
+        entry_id = ACL_NEXT_ENTRY;
         let mut tag: c_int = 0;
         // SAFETY: `entry` is the handle `acl_get_entry` just returned
         // from the live `acl`; `tag` is the out-pointer the header asks
@@ -173,14 +201,16 @@ pub(crate) fn fd_acl(fd: std::os::fd::RawFd) -> Verdict {
         if typed != 0 {
             // An entry this check cannot type is one it cannot vouch
             // for.
-            granting = Some(("an entry whose kind could not be read", None));
+            walked.push((Step::Entry, None));
             break;
         }
+        // SAFETY: `entry` is the same live handle; the qualifier is
+        // owned by the `acl` and released with it.
+        let who = entry_who(entry);
+        walked.push((Step::Entry, Some((tag, who))));
         if tag != ACL_EXTENDED_DENY {
-            granting = Some((entry_kind(tag), entry_who(entry)));
             break;
         }
-        entry_id = ACL_NEXT_ENTRY;
     }
     // SAFETY: `acl` is the same un-freed handle; `acl_free` releases it
     // exactly once on every path from here.
@@ -188,10 +218,7 @@ pub(crate) fn fd_acl(fd: std::os::fd::RawFd) -> Verdict {
     if freed != 0 {
         return Verdict::Granting("an ACL that could not be released", None);
     }
-    match granting {
-        Some((kind, who)) => Verdict::Granting(kind, who),
-        None => verdict,
-    }
+    verdict_of(walked.into_iter())
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -216,5 +243,48 @@ mod tests {
         // Any other errno is a failure, wherever the walk stands.
         assert_eq!(walk_step(ACL_NEXT_ENTRY, -1, ENOENT), Step::Failed);
         assert_eq!(walk_step(ACL_FIRST_ENTRY, -1, 0), Step::Failed);
+    }
+
+    #[test]
+    fn a_failed_walk_grants_even_after_deny_entries() {
+        let steps = vec![
+            (Step::Entry, Some((ACL_EXTENDED_DENY, None))),
+            (Step::Failed, None),
+        ];
+        assert_eq!(
+            verdict_of(steps.into_iter()),
+            Verdict::Granting("an ACL whose walk failed", None)
+        );
+    }
+
+    #[test]
+    fn a_walk_that_read_every_entry_and_found_only_deny_denies_only() {
+        let steps = vec![
+            (Step::Entry, Some((ACL_EXTENDED_DENY, Some(0)))),
+            (Step::Entry, Some((ACL_EXTENDED_DENY, None))),
+            (Step::End, None),
+        ];
+        assert_eq!(verdict_of(steps.into_iter()), Verdict::DenyOnly);
+    }
+
+    #[test]
+    fn an_allow_entry_grants() {
+        let steps = vec![(Step::Entry, Some((ACL_EXTENDED_ALLOW, Some(1))))];
+        assert_eq!(
+            verdict_of(steps.into_iter()),
+            Verdict::Granting(entry_kind(ACL_EXTENDED_ALLOW), Some(1))
+        );
+    }
+
+    #[test]
+    fn an_entry_whose_kind_could_not_be_read_grants() {
+        let steps = vec![
+            (Step::Entry, Some((ACL_EXTENDED_DENY, None))),
+            (Step::Entry, None),
+        ];
+        assert_eq!(
+            verdict_of(steps.into_iter()),
+            Verdict::Granting("an entry whose kind could not be read", None)
+        );
     }
 }
