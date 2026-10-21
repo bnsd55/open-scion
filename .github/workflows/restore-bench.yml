@@ -1,0 +1,35 @@
+# The measured restore time of docs/operations.md, section 3: a store of
+# a stated size, restored and fscked, seconds printed. The runner label
+# is the machine class the docs quote; this fixed image is the only
+# machine the number comes from.
+#
+# No pull_request trigger on purpose: a restore time does not need to
+# run per PR, and an edit to this file is not a workflow-lane PR that
+# every open PR must merge. The same reason coverage.yml and bench.yml
+# are their own files.
+
+name: restore-bench
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  restore:
+    name: restore time
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test -p open-scion-server --test restore_bench -- --ignored --nocapture
