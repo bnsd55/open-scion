@@ -456,35 +456,31 @@ impl ScionService {
         })
     }
 
-    /// Records the audit's result line after a state change. The
-    /// change has happened, so a lost result line cannot take it back:
-    /// the writer latches readiness, and this logs the loss.
-    async fn audit_result(
-        &self,
-        request_id: &str,
-        principal: &str,
-        event: &'static str,
-        outcome: &'static str,
-        fields: serde_json::Value,
-    ) {
-        let line =
-            crate::audit::Event::new(event, outcome, json_fields(request_id, principal, &fields));
-        if let Err(why) = self.audit.record(line).await {
+    /// The audit's result lines a state change leaves, written by the
+    /// store job that made the change, after it and outside any write
+    /// transaction: a call cut between the intent and the result (a
+    /// client that left, a deadline, a shutdown) still leaves the
+    /// audit's answer to its intent. A free function on the audit
+    /// handle, because the job that calls it is not a method on the
+    /// service.
+    fn audit_result_blocking(audit: &crate::audit::Audit, line: &crate::audit::Event) {
+        if let Err(why) = audit.record_blocking(line) {
             tracing::error!(reason = %why, "an audit result was not made durable");
         }
     }
 
-    /// Records the audit's land and ref lines of a land that ran, and
-    /// passes its outcome through.
-    async fn land_recorded(
-        &self,
+    /// The audit lines of a land that ran: the land's result line, and
+    /// — when this call moved the ref — the move's own line. A replay
+    /// of a landed request reports the first move's outcome and moved
+    /// nothing itself: the move's line exists from the call that made
+    /// it.
+    fn land_result_lines(
         request_id: &str,
         principal: &str,
         repo: &str,
         target_ref: &str,
-        old: Option<&str>,
-        outcome: land::LandOutcome,
-    ) -> Result<land::LandOutcome, Status> {
+        outcome: &land::LandOutcome,
+    ) -> Vec<crate::audit::Event> {
         let mut fields = serde_json::json!({
             "rpc": "Land",
             "repo": repo,
@@ -494,65 +490,39 @@ impl ScionService {
         });
         if let Some(landed) = outcome.result {
             fields["new"] = serde_json::json!(hex_id(landed.as_bytes()));
-            if let Some(from) = old {
-                fields["old"] = serde_json::json!(from);
+            if let Some(from) = outcome.previous.as_ref() {
+                fields["old"] = serde_json::json!(hex_id(from.as_bytes()));
             }
         }
         if !outcome.detail.is_empty() {
             fields["detail"] = serde_json::json!(outcome.detail);
         }
-        self.audit_result(request_id, principal, "land", "ok", fields)
-            .await;
-        // A replay of a landed request reports the first move's
-        // outcome and moved nothing itself: the move's line exists
-        // from the call that made it.
-        // A replay of a landed request reports the first move's
-        // outcome and moved nothing itself: the move's line exists
-        // from the call that made it. The move's own line: which
-        // principal moved which ref from what to what. The land's
-        // intent line made the evidence first; this line is the
-        // move's record.
+        let mut lines = vec![crate::audit::Event::new(
+            "land",
+            "ok",
+            json_fields(request_id, principal, &fields),
+        )];
+        // The move's own line: which principal moved which ref from
+        // what to what. The land's intent line made the evidence
+        // first; this line is the move's record.
         if let (true, Some(landed)) = (outcome.moved, outcome.result) {
-            self.audit_result(
-                request_id,
-                principal,
+            lines.push(crate::audit::Event::new(
                 "ref",
                 "ok",
-                serde_json::json!({
-                    "rpc": "Land",
-                    "repo": repo,
-                    "ref": target_ref,
-                    "old": old,
-                    "new": hex_id(landed.as_bytes()),
-                }),
-            )
-            .await;
+                json_fields(
+                    request_id,
+                    principal,
+                    &serde_json::json!({
+                        "rpc": "Land",
+                        "repo": repo,
+                        "ref": target_ref,
+                        "old": outcome.previous.as_ref().map(|id| hex_id(id.as_bytes())),
+                        "new": hex_id(landed.as_bytes()),
+                    }),
+                ),
+            ));
         }
-        Ok(outcome)
-    }
-
-    /// Records the audit's result line of a write that ran, and passes
-    /// its outcome through: `ok`, or `failed` with the reply's code.
-    async fn write_outcome<T>(
-        &self,
-        request_id: &str,
-        principal: &str,
-        mut fields: serde_json::Value,
-        outcome: Result<T, Status>,
-    ) -> Result<T, Status> {
-        match outcome {
-            Ok(value) => {
-                self.audit_result(request_id, principal, "write", "ok", fields)
-                    .await;
-                Ok(value)
-            }
-            Err(status) => {
-                fields["why"] = serde_json::json!(code_label(status.code()));
-                self.audit_result(request_id, principal, "write", "failed", fields)
-                    .await;
-                Err(status)
-            }
-        }
+        lines
     }
 
     /// Runs a `MergeBase`, `IsAncestor` or `Log` with a path: at most
@@ -683,20 +653,6 @@ fn json_fields(request_id: &str, principal: &str, fields: &serde_json::Value) ->
 }
 
 /// `ResolveRef`, served by both services.
-/// The shared fields of an audit line: who, which call, on which RPC.
-fn json_fields(request_id: &str, principal: &str, fields: &serde_json::Value) -> serde_json::Value {
-    let mut all = serde_json::json!({
-        "request_id": request_id,
-        "principal": principal,
-    });
-    if let (Value::Object(all), Value::Object(extra)) = (&mut all, fields) {
-        for (key, value) in extra {
-            all.insert(key.clone(), value.clone());
-        }
-    }
-    all
-}
-
 pub(crate) async fn resolve_ref(
     worker: &Worker,
     access: &Access,
@@ -730,7 +686,9 @@ fn parse_optional_path(bytes: Vec<u8>) -> Result<Option<RepoPath>, Status> {
 }
 
 /// The caller's request ID, if it sent one that fits: the audit's
-/// intent and result lines join by it.
+/// intent and result lines join by it. A call that sent no usable ID
+/// gets one the server made, so every line it leaves still carries a
+/// `request_id` its pair can be found by.
 fn request_id_of<T>(request: &Request<T>) -> String {
     scion_proto::runtime::request_id::sanitize(
         request
@@ -738,7 +696,7 @@ fn request_id_of<T>(request: &Request<T>) -> String {
             .get(scion_proto::runtime::request_id::REQUEST_ID)
             .map(tonic::metadata::MetadataValue::as_bytes),
     )
-    .unwrap_or_default()
+    .unwrap_or_else(scion_proto::runtime::request_id::generate)
 }
 
 /// The hex of a content ID, as the audit's old and new ref values.
@@ -1305,6 +1263,7 @@ impl Scion for ScionService {
         self.access.check_writer(&caller, &first.repo)?;
         let repo_name = first.repo.clone();
         let principal = caller.0.clone();
+        let audit = self.audit.clone();
         let mut bytes_total = first.data.len();
         // The first message's bytes, and the budget that the later messages
         // of this upload take from. Held until the reply, on every path.
@@ -1344,12 +1303,39 @@ impl Scion for ScionService {
         .await?;
         let written = self
             .worker
-            .run(move |store| write::put_blob(&store, repo, upload))
+            .run(move |store| {
+                let written = write::put_blob(&store, repo, upload).map_err(Status::from);
+                // The job that changed the state writes the state
+                // change's own line, after the commit and outside the
+                // write transaction: the evidence does not depend on the
+                // call that asked for the write living on.
+                let mut fields =
+                    serde_json::json!({ "rpc": "PutBlob", "repo": repo_name, "bytes": bytes });
+                match &written {
+                    Ok(_) => Self::audit_result_blocking(
+                        &audit,
+                        &crate::audit::Event::new(
+                            "write",
+                            "ok",
+                            json_fields(&request_id, &principal, &fields),
+                        ),
+                    ),
+                    Err(status) => {
+                        fields["why"] = serde_json::json!(code_label(status.code()));
+                        Self::audit_result_blocking(
+                            &audit,
+                            &crate::audit::Event::new(
+                                "write",
+                                "failed",
+                                json_fields(&request_id, &principal, &fields),
+                            ),
+                        );
+                    }
+                }
+                Ok(written)
+            })
             .await;
-        let fields = serde_json::json!({ "rpc": "PutBlob", "repo": repo_name, "bytes": bytes });
-        let id = self
-            .write_outcome(&request_id, &principal, fields, written)
-            .await?;
+        let id = written??;
         Ok(Response::new(PutBlobResponse {
             blob_id: id.as_bytes().to_vec(),
         }))
@@ -1374,34 +1360,70 @@ impl Scion for ScionService {
         .await?;
         let access = Arc::clone(&self.access);
         let repo_for_write = repo.clone();
+        let job_repo = repo.clone();
+        let audit = self.audit.clone();
         let outcome = self
             .worker
             .run(move |store| {
-                // The rules first, so a change that the caller may not make
-                // reads no blob. Decoding twice costs little next to reading
-                // every blob back.
-                let (cs, _) = write::decode(&changeset)?;
-                access.check_write(&caller, &repo_for_write, cs.changes().keys())?;
-                write::create_changeset(&store, &repo_for_write, &changeset)
+                let outcome = (|| {
+                    // The rules first, so a change that the caller may not make
+                    // reads no blob. Decoding twice costs little next to reading
+                    // every blob back.
+                    let (cs, _) = write::decode(&changeset)?;
+                    access.check_write(&caller, &repo_for_write, cs.changes().keys())?;
+                    Ok(write::create_changeset(&store, &repo_for_write, &changeset)
+                        .map_err(Status::from))
+                })();
+                // The job that changed the state writes the state change's
+                // own line, after the commit and outside the write
+                // transaction: the evidence does not depend on the call
+                // that asked for the write living on.
+                match &outcome {
+                    Ok(Ok(id)) => {
+                        Self::audit_result_blocking(
+                            &audit,
+                            &crate::audit::Event::new(
+                                "write",
+                                "ok",
+                                json_fields(
+                                    &request_id,
+                                    &principal,
+                                    // A changeset ID names content the caller
+                                    // already had; the audit never names a blob
+                                    // or a tree.
+                                    &serde_json::json!({
+                                        "rpc": "CreateChangeset",
+                                        "repo": job_repo,
+                                        "changeset": hex_id(id.as_bytes()),
+                                    }),
+                                ),
+                            ),
+                        );
+                    }
+                    Ok(Err(status)) => {
+                        Self::audit_result_blocking(
+                            &audit,
+                            &crate::audit::Event::new(
+                                "write",
+                                "failed",
+                                json_fields(
+                                    &request_id,
+                                    &principal,
+                                    &serde_json::json!({
+                                        "rpc": "CreateChangeset",
+                                        "repo": job_repo,
+                                        "why": code_label(status.code()),
+                                    }),
+                                ),
+                            ),
+                        );
+                    }
+                    Err(_) => {}
+                }
+                outcome
             })
             .await;
-        // A changeset ID names content the caller already had; the
-        // audit never names a blob or a tree.
-        let fields = match &outcome {
-            Ok(id) => serde_json::json!({
-                "rpc": "CreateChangeset",
-                "repo": repo,
-                "changeset": hex_id(id.as_bytes()),
-            }),
-            Err(status) => serde_json::json!({
-                "rpc": "CreateChangeset",
-                "repo": repo,
-                "why": code_label(status.code()),
-            }),
-        };
-        let id = self
-            .write_outcome(&request_id, &principal, fields, outcome)
-            .await?;
+        let id = outcome??;
         Ok(Response::new(CreateChangesetResponse {
             changeset_id: id.as_bytes().to_vec(),
         }))
@@ -1443,11 +1465,14 @@ impl Scion for ScionService {
             request_key: req.request_key,
             deadline,
         };
-        // The ref's current target, so the audit's ref line can name
-        // what it moved from. A ref that does not exist yet moves from
-        // nothing.
         let (lands, access) = (Arc::clone(&self.lands), Arc::clone(&self.access));
         let (repo, target_ref) = (req.repo.clone(), req.target_ref.clone());
+        // The job writes the land's own result lines, so the evidence
+        // does not depend on this handler living: the job needs its own
+        // copies of what the lines name.
+        let (job_request_id, job_principal) = (request_id.clone(), principal.clone());
+        let (job_repo, job_ref) = (repo.clone(), target_ref.clone());
+        let audit = self.audit.clone();
         // The land's own result comes back inside an Ok, so this handler,
         // not the worker, builds the reply's Status: a land that ends in
         // an error moves the land counter, by the code of the reply the
@@ -1458,41 +1483,63 @@ impl Scion for ScionService {
                 // A rebase keeps the changes, so these are the paths that the
                 // land changes, on any ref of the repo. Checked on every call,
                 // before the land records anything, also on a retry.
-                let cs = read::get_changeset(&store, &req.repo, req.changeset)?;
-                access.check_write(&caller, &req.repo, cs.changes().keys())?;
-                Ok(lands.land(&store, &caller, &req))
+                // A rebase keeps the changes, so these are the paths that the
+                // land changes, on any ref of the repo. Checked on every call,
+                // before the land records anything, also on a retry. The
+                // outer Result is the checks and the worker's own failures;
+                // the inner one is the land's own verdict, whose code the
+                // reply names.
+                let outcome = (|| {
+                    let cs = read::get_changeset(&store, &req.repo, req.changeset)?;
+                    access.check_write(&caller, &req.repo, cs.changes().keys())?;
+                    Ok(lands.land(&store, &caller, &req).map_err(Status::from))
+                })();
+                // The job that changed the state writes the state change's
+                // own lines, after the commit and outside the write
+                // transaction: the evidence does not depend on the call
+                // that asked for the land living on. The worker's own
+                // failures (a panic, a shutdown) built no land outcome,
+                // and the worker logged them.
+                match &outcome {
+                    Ok(Ok(outcome)) => {
+                        for line in Self::land_result_lines(
+                            &job_request_id,
+                            &job_principal,
+                            &job_repo,
+                            &job_ref,
+                            outcome,
+                        ) {
+                            Self::audit_result_blocking(&audit, &line);
+                        }
+                    }
+                    Ok(Err(status)) => {
+                        Self::audit_result_blocking(
+                            &audit,
+                            &crate::audit::Event::new(
+                                "land",
+                                "failed",
+                                json_fields(
+                                    &job_request_id,
+                                    &job_principal,
+                                    &serde_json::json!({
+                                        "rpc": "Land",
+                                        "repo": job_repo,
+                                        "ref": job_ref,
+                                        "why": code_label(status.code()),
+                                    }),
+                                ),
+                            ),
+                        );
+                    }
+                    Err(_) => {}
+                }
+                outcome
             })
             .await;
         match ran {
-            Ok(Ok(outcome)) => {
-                let old = outcome.previous.map(|id| hex_id(id.as_bytes()));
-                self.land_recorded(
-                    &request_id,
-                    &principal,
-                    &repo,
-                    &target_ref,
-                    old.as_deref(),
-                    outcome,
-                )
-                .await
-                .map(|outcome| Response::new(land_response(outcome)))
-            }
-            Ok(Err(e)) => {
-                let status = Status::from(e);
+            Ok(Ok(outcome)) => Ok(Response::new(land_response(outcome))),
+            Ok(Err(status)) => {
                 self.metrics.land(code_label(status.code()));
-                self.audit_result(
-                    &request_id,
-                    principal.as_str(),
-                    "land",
-                    "failed",
-                    serde_json::json!({
-                        "rpc": "Land",
-                        "repo": repo,
-                        "ref": target_ref,
-                        "why": code_label(status.code()),
-                    }),
-                )
-                .await;
                 Err(status)
             }
             // The worker's own failures (a panic, a shutdown) built no
