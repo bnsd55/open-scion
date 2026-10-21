@@ -246,14 +246,19 @@ that breaks one is caught.
   `scion-proto/src/runtime/auth/mod.rs::a_file_that_is_not_a_file_is_refused`,
   `scion-proto/src/runtime/auth/mod.rs::a_reader_that_yields_one_byte_past_the_cap_is_refused`
 - **An archive cannot fold two names onto one file, duplicate a repo,
-  or land half.** A manifest that names one repo twice is refused
-  before any write; two names that fold to one directory on a
-  case-insensitive disk are refused by the disk's own (device, inode),
-  not by a fold table; two pending lands sharing a request key are
-  named or tolerated, never half-restored; and a replay that dies
-  halfway leaves the target empty, because the restore publishes by
-  rename into an empty store. (#438, open — the checks and their tests
-  land with it.)
+  or land half.** `verify` refuses a manifest that names one repo
+  twice, and refuses two names that fold to one directory on a
+  case-insensitive disk — the disk's own (device, inode) is the judge,
+  not a fold table (`scion-server/src/archive.rs::check_section_dir`); colliding land
+  keys are named or tolerated, never half-restored; and a replay that
+  dies halfway leaves the target empty, because `restore` fills a
+  staging directory and publishes by one rename
+  (`scion-server/src/archive.rs::restore_impl`). (#438) The tests:
+  `scion-server/tests/archive.rs::an_archive_naming_two_repos_that_fold_to_one_is_refused`,
+  `scion-server/tests/archive_attacks.rs::a_manifest_naming_one_repo_twice_is_refused_before_any_write`,
+  `scion-server/tests/archive_attacks.rs::two_pending_lands_sharing_a_request_key_are_named_or_tolerated`,
+  `scion-server/tests/archive_attacks.rs::a_mid_replay_failure_leaves_the_target_empty`,
+  `scion-server/tests/archive_attacks.rs::a_pg_replay_that_dies_halfway_leaves_the_database_empty`
 - **A refused-auth flood is counted by the machine, not the socket.**
   The audit meter folds one peer's refusals into counted lines keyed
   by the address — an IPv6 by its /64, the smallest block one site
@@ -275,7 +280,8 @@ They become issues as the project moves past alpha.
 - The token compare is constant time: the code is (`auth.rs`,
   `constant_time_eq`), but no test observes it, and a timing test would
   be flaky by nature. The digest form of the access file is the main
-  defence, and that is the load-time format.- A narrowed access file does not cut outstanding tickets: they hold
+  defence, and that is the load-time format.
+- A narrowed access file does not cut outstanding tickets: they hold
   for at most 15 minutes from signing, by design (rotate the key to cut
   at once). The window and the cut are pinned:
   `scion-server/tests/access.rs::an_outstanding_ticket_survives_a_narrowed_access_file_until_the_key_rotates`
@@ -292,11 +298,6 @@ They become issues as the project moves past alpha.
   the hardware below the process, so no test of this repository can
   observe them, let alone refuse them. The data directory's file modes
   are the only wall, and they are tested.
-- A tier snapshot's names are not checked against folds on a
-  case-insensitive disk yet: the archive sections got their fold check
-  in #438, and the snapshot loader's is still to come. A snapshot is
-  read through the checked descriptor, so a planted file cannot hang
-  or flood the read either way.
 - The mount's single-user rule rests on the operating system: the NFS
   server cannot tell local users apart, so the code has nothing to
   check, and a test of this repository cannot observe other local users
