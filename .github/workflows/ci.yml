@@ -97,6 +97,13 @@ jobs:
         run: |
           for lock in crates/*/fuzz/Cargo.lock; do
             dir="$(dirname "$lock")"
+            # Fail closed: cargo-deny only warns when its config is
+            # missing and runs with defaults, which could pass with the
+            # wrong rules. A moved or renamed config fails the job here.
+            if [ ! -f "$dir/deny.toml" ]; then
+              echo "::error::$dir has no deny.toml; refusing to run cargo deny with defaults"
+              exit 1
+            fi
             echo "== cargo deny check in $dir"
             (cd "$dir" && cargo deny --config deny.toml check)
           done
