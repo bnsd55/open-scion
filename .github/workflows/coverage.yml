@@ -303,6 +303,13 @@ jobs:
           else
             pkgs="--workspace"
           fi
+          # A per-process address-space cap of 6 GB: a test whose
+          # allocations run away under instrumentation freezes the
+          # runner in swap thrash and kills the agent with every log
+          # (thirteen runs, always near the same minute). Under this
+          # cap the runaway test is the one that dies, the step fails
+          # cleanly, and the artifact carries its name.
+          ulimit -v 6291456
           # shellcheck disable=SC2086
           nice -n 19 timeout -k 60 1200 cargo nextest run $pkgs \
             --no-fail-fast \
