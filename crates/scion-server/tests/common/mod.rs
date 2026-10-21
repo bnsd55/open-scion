@@ -893,9 +893,12 @@ pub(crate) async fn check(
     }
 
     // Every blob that the metadata names is intact, and so is every blob
-    // file: a file reaches its name only whole.
-    let store = Store::open_shared(data).unwrap();
-    let (named, pending) = metadata(&from_store(store.clone()), &mut checked.rows);
+    // file: a file reaches its name only whole. The store is the same
+    // backend the server serves: a SQLite open here would create the
+    // data directory's scion.db beside a Postgres server, and the
+    // restart after the cut would refuse the directory.
+    let store = open_store_shared(data);
+    let (named, pending) = metadata(&store, &mut checked.rows);
     assert_eq!(pending, 0, "every land sent was retried");
     let files = blob_files(data);
     for id in named.into_iter().chain(files) {
