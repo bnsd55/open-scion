@@ -30,6 +30,23 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long `scn` waits to connect.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A client's connection notices a dead peer: the HTTP/2 pings and the
+/// TCP probes run while the connection is idle too, so a server that
+/// died without a FIN or RST (a frozen process, a host gone) ends every
+/// call in about [`scion_proto::runtime::listen::CLIENT_KEEPALIVE_INTERVAL`]
+/// plus its timeout, not at this client's 600 s deadline.
+fn live(endpoint: Endpoint) -> Endpoint {
+    use scion_proto::runtime::listen as keepalive;
+    let (interval, timeout) = keepalive::client_keepalive();
+    endpoint
+        .http2_keep_alive_interval(interval)
+        .keep_alive_timeout(timeout)
+        // An idle channel must notice a dead peer too: the next call
+        // answers at once, not after the call's own deadline.
+        .keep_alive_while_idle(true)
+        .tcp_keepalive(Some(keepalive::client_tcp_keepalive()))
+}
+
 /// Most bytes that the parts of one streamed reply may join to. The server
 /// bounds one part at 1 MiB, but not the whole reply: a directory or a
 /// changeset may be as big as its repo made it. The client joins the parts
@@ -145,7 +162,7 @@ impl Ctx {
             .with_context(|| format!("cannot trust the certificate of {server}"))?;
         // A server at its connection cap leaves a new connection unread, so
         // a call also has a limit here, until its reply starts.
-        let channel = endpoint
+        let channel = live(endpoint)
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(CALL_TIMEOUT)
             .connect()
@@ -179,7 +196,7 @@ impl Ctx {
                 let endpoint = ClientTls::load(ca, None, None)
                     .and_then(|tls| tls.apply_to(objects, endpoint))
                     .with_context(|| format!("cannot trust the certificate of {objects}"))?;
-                let channel = endpoint
+                let channel = live(endpoint)
                     .connect_timeout(CONNECT_TIMEOUT)
                     .timeout(CALL_TIMEOUT)
                     .connect()

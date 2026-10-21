@@ -1,0 +1,93 @@
+//! The first-boot runbook (docs/operations.md, "First boot"): the three
+//! commands of a first start, in order, and what each promises - the
+//! binary creates the data directory and serves, the health service
+//! answers for its services and for liveness, and the first import
+//! makes a repo the client reads.
+
+mod common;
+
+use common::*;
+use std::os::unix::fs::PermissionsExt as _;
+use tonic::transport::Channel;
+use tonic_health::pb::HealthCheckRequest;
+use tonic_health::pb::health_check_response::ServingStatus;
+use tonic_health::pb::health_client::HealthClient;
+
+/// The health service answers `SERVING` for the service name a probe
+/// asks for, and for the empty name.
+async fn health(url: &str, service: &str) -> ServingStatus {
+    let channel = Channel::from_shared(url.to_string())
+        .unwrap()
+        .connect()
+        .await
+        .expect("the server listens");
+    let mut client = HealthClient::new(channel);
+    let reply = client
+        .check(tonic::Request::new(HealthCheckRequest {
+            service: service.to_owned(),
+        }))
+        .await
+        .expect("the health service answers")
+        .into_inner();
+    ServingStatus::try_from(reply.status).expect("a known status")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_first_boot_serves_probes_and_reads_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, log) = (dir.path().join("data"), dir.path().join("server.log"));
+
+    // Command 1: start the server on a directory that does not exist
+    // yet. The first boot creates it, with its files private, and
+    // serves. The token went in a file (the runbook's umask 077 and
+    // printf), not in argv.
+    assert!(!data.exists(), "the first boot creates the directory");
+    let server = Server::start(&data, &log);
+    let mode = std::fs::metadata(common::token_file())
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "the token file is private");
+
+    // Command 2: the readiness probe of the service, and the liveness
+    // probe of the empty name.
+    let named = health(&server.url, "scion.v1.Scion").await;
+    assert_eq!(named, ServingStatus::Serving, "readiness is serving");
+    let empty = health(&server.url, "").await;
+    assert_eq!(empty, ServingStatus::Serving, "liveness is serving");
+
+    // Command 3: the first import answers a repo the client can read.
+    // A fresh server holds no repo yet; the operator's first import
+    // makes one, beside the live server.
+    let git_repo = dir.path().join("git");
+    std::fs::create_dir_all(&git_repo).unwrap();
+    git(&git_repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(git_repo.join("FIRST"), b"first boot\n").unwrap();
+    git(&git_repo, &["add", "FIRST"]);
+    git(&git_repo, &["commit", "-q", "-m", "first\n"]);
+    let out = common::spawn_guard::across_spawn(|| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
+            // `--repo` names the harness's repo (the runbook's
+            // default is `main`).
+            .args([
+                "--data",
+                data.to_str().unwrap(),
+                "import",
+                "--repo",
+                "r",
+                git_repo.to_str().unwrap(),
+            ])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("the import command runs")
+    });
+    assert!(
+        out.status.success(),
+        "the first import failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (_, mut objects) = connect(&server.url).await.unwrap();
+    let _ = resolve_ref(&mut objects, "main")
+        .await
+        .expect("the imported ref reads back");
+}
