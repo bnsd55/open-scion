@@ -433,26 +433,48 @@ mod tests {
     /// The wire pass, B7's property, on every OS: a fold-blind reader
     /// (a case-insensitive disk) must not see two different repos in
     /// one snapshot file, so two names whose file names are equal under
-    /// ASCII case folding must be the same name. Capitals, `%`, `.` and
-    /// non-ASCII bytes are the shapes that could break it.
+    /// ASCII case folding must be one name. The pairs are built, not
+    /// drawn: `b` is `a` with a random case-flip mask over its ASCII
+    /// letters — the only bytes two names of one repo could differ by
+    /// and still fold on a disk. Independent random pairs almost never
+    /// fold, so a random `b` proves nothing; the flip mask finds what
+    /// the fixed table below misses.
     #[test]
     fn two_names_with_one_folded_file_name_are_one_name() {
+        proptest::proptest!(|(name in "[a-zA-Z0-9%._/-\u{e9}\u{301}]{0,12}", mask in "[-]{0,12}")| {
+            // One coin per character of `name`: the mask's `-` at that
+            // position says flip the letter's case, where a flip is the
+            // only difference a disk folds and the name algebra must
+            // survive.
+            let flipped: String = name
+                .chars()
+                .enumerate()
+                .map(|(i, c)| {
+                    let flip = mask.as_bytes().get(i).is_some();
+                    match c {
+                        'a'..='z' if flip => c.to_ascii_uppercase(),
+                        'A'..='Z' if flip => c.to_ascii_lowercase(),
+                        other => other,
+                    }
+                })
+                .collect();
+            let (fa, fb) = (file_name(&name), file_name(&flipped));
+            if fa.eq_ignore_ascii_case(&fb) {
+                assert_eq!(
+                    name, flipped,
+                    "{name:?} and {flipped:?} fold into one file: {fa:?}"
+                );
+            }
+        });
+    }
+
+    /// The fixed shapes the flip mask cannot draw: the escape mark next
+    /// to hex digits, the first-byte `.` rule, and the empty name.
+    #[test]
+    fn the_folded_shapes_of_the_name_table_are_one_name() {
         let candidates = [
-            "main",
-            "MAIN",
-            "Main",
-            "mAiN",
-            "%25",
-            "%2f",
-            "%4D",
-            "%4d",
-            "a.b",
-            "a%2Eb",
-            "caf\u{e9}",
-            "caf\u{301}e",
-            "team/app",
-            "TEAM/APP",
-            "",
+            "main", "MAIN", "Main", "mAiN", "%25", "%2f", "%4D", "%4d", "a.b", "a%2Eb", ".a",
+            "team/app", "TEAM/APP", "",
         ];
         for a in &candidates {
             for b in &candidates {
@@ -464,13 +486,15 @@ mod tests {
         }
     }
 
-    /// The wire pass, B7: on a disk that folds names (case, or Unicode
-    /// normalization), two repos whose names fold write their snapshots
-    /// to one file, and the second write silently replaces the first —
-    /// the first repo's snapshot is gone, and the operator sees no
-    /// refusal. The fix is in `file_name`: the capitals are escaped, so
-    /// the output holds lowercase literal letters only and no fold can
-    /// put two names on one file. Runs where the fold is real.
+    /// The wire pass, B7: on a case-insensitive disk (the macOS
+    /// default), two repos whose names differ only in case write their
+    /// snapshots to one file, and the second write silently replaces
+    /// the first — the first repo's snapshot is gone, and the operator
+    /// sees no refusal. The fix is in `file_name`: the capitals are
+    /// escaped, so the output holds lowercase literal letters only and
+    /// no case fold can put two names on one file (non-ASCII bytes were
+    /// already escaped, so only ASCII case could ever fold). Runs where
+    /// the fold is real.
     #[cfg(target_os = "macos")]
     #[test]
     fn two_repos_that_fold_to_one_name_do_not_overwrite_one_snapshot() {
