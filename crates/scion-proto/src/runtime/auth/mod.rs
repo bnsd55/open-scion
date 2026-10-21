@@ -334,23 +334,32 @@ fn read_checked_file(file: &Path, secret: bool) -> io::Result<Vec<u8>> {
             ),
         ));
     }
-    // The take: one byte past the cap means the file grew after the
-    // fstat, and the read refuses instead of holding what it got.
+    read_bounded(opened, MAX_CHECKED_FILE, || {
+        format!(
+            "{} grew past the {} MiB cap for a checked file while it was read",
+            file.display(),
+            MAX_CHECKED_FILE / (1024 * 1024)
+        )
+    })
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// Reads `reader` whole under `cap`, with no trust in the size anyone
+/// reported: the read itself is bounded at `cap + 1` bytes, and one
+/// byte more than the cap is refused through `too_long` — a reader
+/// whose bytes arrived after the size was taken (an appended file, a
+/// growing sparse file) is refused, not held.
+fn read_bounded<R: std::io::Read>(
+    reader: R,
+    cap: u64,
+    too_long: impl FnOnce() -> String,
+) -> io::Result<Vec<u8>> {
+    use std::io::Read as _;
     let mut bytes = Vec::new();
-    {
-        use std::io::Read as _;
-        let mut bounded = opened.take(MAX_CHECKED_FILE + 1);
-        bounded.read_to_end(&mut bytes)?;
-    }
-    if bytes.len() as u64 > MAX_CHECKED_FILE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "{} grew past the {} MiB cap for a checked file while it was read",
-                file.display(),
-                MAX_CHECKED_FILE / (1024 * 1024)
-            ),
-        ));
+    let mut bounded = reader.take(cap + 1);
+    bounded.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, too_long()));
     }
     Ok(bytes)
 }
@@ -642,68 +651,26 @@ fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 #[cfg(test)]
 mod tests {
 
-    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
-    /// Whether a file that is small at open and grows past the cap before
-    /// the read is refused: the read is bounded by [`Take`], so the answer
-    /// must be yes. The file starts at exactly the cap (the fstat check
-    /// passes) and a hot writer thread appends while the read copies, so
-    /// the growth lands between the fstat and the read — the gap only the
-    /// [`Take`] bound closes. A quiet file at exactly the cap is allowed,
-    /// which pins the boundary the take must keep.
+    /// The bound the checked read puts on the bytes themselves: a
+    /// source whose size said `cap` but that yields `cap + 1` bytes
+    /// when read — a file that grew after the fstat — is refused by
+    /// [`read_bounded`], deterministically, with no thread and no
+    /// timing. A source that yields exactly the cap is read whole.
     #[test]
-    fn a_file_that_grows_past_the_cap_while_it_is_read_is_refused() {
-        let dir = tempfile::tempdir().expect("the temp dir opens");
-        let path = dir.path().join("token");
-        let chunk = std::sync::Arc::new(vec![b'x'; 64 * 1024]);
+    fn a_reader_that_yields_one_byte_past_the_cap_is_refused() {
+        // The size lied: it said 16 bytes, the reader yields 17.
+        let liar = std::io::Cursor::new(vec![b'x'; 17]);
+        let refused = read_bounded(liar, 16, || "the source grew past the cap".to_owned());
+        let why = refused.expect_err("a reader one byte past the cap must be refused");
+        assert!(why.to_string().contains("grew past"), "{why}");
 
-        // The boundary first, quiet: a file at exactly the cap reads
-        // whole, because the take bounds at cap + 1.
-        {
-            std::fs::File::create(&path)
-                .and_then(|file| file.set_len(MAX_CHECKED_FILE))
-                .expect("the file is made and sized");
-        }
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .expect("the mode is set");
-        let quiet = read_secret_file(&path).expect("a file at the cap is allowed");
-        assert_eq!(quiet.len() as u64, MAX_CHECKED_FILE);
-
-        // The growing file, retried a few times: the writer appends in a
-        // hot loop while the read copies a mebibyte of file, so at least
-        // one attempt sees the growth land between the fstat and the
-        // read. Every attempt must be refused: the take holds the cap,
-        // whatever the file did after the fstat.
-        for _ in 0..8 {
-            {
-                std::fs::File::create(&path)
-                    .and_then(|file| file.set_len(MAX_CHECKED_FILE))
-                    .expect("the file is made and sized");
-            }
-            let stop = Arc::new(AtomicBool::new(false));
-            let writer_stop = Arc::clone(&stop);
-            let writer_path = path.clone();
-            let writer_chunk = Arc::clone(&chunk);
-            let writer = std::thread::spawn(move || {
-                let mut file = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&writer_path)
-                    .expect("the appender opens");
-                while !writer_stop.load(Ordering::Relaxed) {
-                    let _ = file.write_all(&writer_chunk);
-                }
-            });
-            let read = read_secret_file(&path);
-            stop.store(true, Ordering::Relaxed);
-            writer.join().expect("the appender stops");
-            let why =
-                read.expect_err("the read held a file that grew past the cap while it was read");
-            let why = format!("{why:?}");
-            assert!(why.contains("cap"), "the refusal must name the cap: {why}");
-        }
+        // The honest edge: exactly the cap bytes, read whole.
+        let honest = std::io::Cursor::new(vec![b'y'; 16]);
+        let bytes = read_bounded(honest, 16, || "never".to_owned())
+            .expect("a source at exactly the cap reads whole");
+        assert_eq!(bytes.len(), 16);
     }
     use std::os::unix::fs::symlink;
 
