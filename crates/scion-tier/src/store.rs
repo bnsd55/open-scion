@@ -1023,8 +1023,92 @@ fn walk_objects(db_path: &Path, objects: &Path, walk: &WalkState) {
         }
     }
     walk.done.store(true, Ordering::Relaxed);
+    #[cfg(test)]
+    walk_barrier(0, db_path);
     tracing::info!(files, bytes, "the walk of the object directories is done");
+    #[cfg(test)]
+    walk_barrier(1, db_path);
+    #[cfg(test)]
+    walk_probe(&db_path.parent().unwrap().join("lock"));
 }
+
+/// The test's barrier in the walk's tail: the test installs one-shot
+/// channel pairs, the walk reports it reached the pair and waits for the
+/// go, so a test holds the walk mid-flight with no timing. An empty list
+/// means no test is driving this walk.
+#[cfg(test)]
+fn walk_barrier(n: u8, mine: &Path) {
+    let mut pairs = lock(&WALK_BLOCK_PAIRS);
+    let at = pairs.iter().position(|(_, path)| path == mine);
+    let Some(at) = at else {
+        return;
+    };
+    let Some((pair, _)) = pairs.remove(at) else {
+        return;
+    };
+    let (tx, rx) = pair;
+    drop(pairs);
+    let _ = tx.send(n);
+    let _ = rx.recv();
+}
+
+/// The test's witness in the walk's tail: the walk polls the store's
+/// directory lock, one millisecond at a time, for two seconds. The lock
+/// goes free only at the end of the store's drop, so on a drop that
+/// joins the walk it can never go free while the walk polls: the probe
+/// times out and the walk ends. A drop that returns first frees the
+/// lock, the walk takes it, and reports the store was dropped under its
+/// feet.
+#[cfg(test)]
+fn walk_probe(lock_path: &Path) {
+    use std::time::{Duration, Instant};
+    let tx = {
+        let mut probe = lock(&WALK_PROBE);
+        match probe.as_mut() {
+            Some((tx, path)) if path == lock_path => tx.clone(),
+            _ => return,
+        }
+    };
+    let _ = tx.send(2);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if let Ok(file) = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            && rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive).is_ok()
+        {
+            let _ = tx.send(3);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Hands the walk's barrier its one-shot pairs, oldest first: the walk
+/// reports at each and waits for the go. A walk with no pairs installed
+/// passes every barrier. The third pair's receiver is unused: its
+/// sender reports the probe.
+#[cfg(test)]
+fn hold_the_walk(
+    path: &Path,
+    pairs: Vec<(std::sync::mpsc::Sender<u8>, std::sync::mpsc::Receiver<()>)>,
+) {
+    *lock(&WALK_BLOCK_PAIRS) = pairs.into_iter().map(|p| (p, path.to_path_buf())).collect();
+}
+
+#[cfg(test)]
+static WALK_BLOCK_PAIRS: std::sync::Mutex<
+    std::collections::VecDeque<(
+        (std::sync::mpsc::Sender<u8>, std::sync::mpsc::Receiver<()>),
+        PathBuf,
+    )>,
+> = std::sync::Mutex::new(std::collections::VecDeque::new());
+
+#[cfg(test)]
+static WALK_PROBE: std::sync::Mutex<Option<(std::sync::mpsc::Sender<u8>, PathBuf)>> =
+    std::sync::Mutex::new(None);
 
 /// A plain `fsync`: data reaches the drive, but on macOS not past its cache
 /// (`File::sync_all` is a full cache flush there). Used for the directories
@@ -1176,6 +1260,10 @@ pub struct DiskStore {
     /// Never read: the lock lasts while the file is open.
     #[allow(dead_code)]
     dir_lock: Option<fs::File>,
+    /// The walk thread, when a walk was owed and the spawn worked: drop
+    /// joins it, so no thread with its own index connection outlives the
+    /// store it walked for.
+    walk_thread: Option<std::thread::JoinHandle<()>>,
     /// Set by a simulated crash: the drop that follows is the death of
     /// the process, not a stop, so it must not commit or adopt. Never
     /// set outside the tests.
@@ -1259,7 +1347,7 @@ impl DiskStore {
             ignore_missing(fs::remove_file(dir.join(OLD_INDEX)))?;
             tracing::info!(objects = disk.objects, bytes = disk.bytes, how);
         }
-        let store = Self {
+        let mut store = Self {
             dir: dir.clone(),
             objects,
             tmp,
@@ -1269,6 +1357,7 @@ impl DiskStore {
             dropped: AtomicU64::default(),
             stray: AtomicBool::new(false),
             dir_lock: Some(lock_file),
+            walk_thread: None,
             #[cfg(test)]
             crashed: false,
         };
@@ -1323,7 +1412,7 @@ impl DiskStore {
 
     /// Spawns the walk of the object directories, which hands the store
     /// every file that has no row.
-    fn spawn_walk(&self) {
+    fn spawn_walk(&mut self) {
         let state = Arc::new(WalkState {
             queue: Mutex::new(std::collections::VecDeque::new()),
             room: Condvar::new(),
@@ -1339,7 +1428,10 @@ impl DiskStore {
             .name("index walk".into())
             .spawn(move || walk_objects(&db_path, &objects, &thread_state));
         match spawned {
-            Ok(_) => *lock(&self.walk) = Some(state),
+            Ok(handle) => {
+                self.walk_thread = Some(handle);
+                *lock(&self.walk) = Some(state);
+            }
             Err(error) => {
                 // No repo on this line: the store sits below the repos, and the
                 // call whose work failed logs the repo and the caller.
@@ -1516,6 +1608,9 @@ impl DiskStore {
             walk.room.notify_all();
         }
         *lock(&self.walk) = None;
+        if let Some(handle) = self.walk_thread.take() {
+            let _ = handle.join();
+        }
         self.dir_lock.take();
         let disk = self.disk.get_mut().unwrap_or_else(PoisonError::into_inner);
         // An in-memory connection takes the index's place, so the real
@@ -1560,6 +1655,15 @@ impl Drop for DiskStore {
         if let Some(walk) = walk.as_ref() {
             walk.stop.store(true, Ordering::Relaxed);
             walk.room.notify_all();
+        }
+        // The walk's thread must not outlive the store: it holds its own
+        // index connection, and the next store may already be open. Join
+        // it before the adopt, so the queue is whole when it is read.
+        // The walk's thread must not outlive the store: it holds its own
+        // index connection, and the next store may already be open. Join
+        // it before the adopt, so the queue is whole when it is read.
+        if let Some(handle) = self.walk_thread.take() {
+            let _ = handle.join();
         }
         let disk = self.disk.get_mut().unwrap_or_else(PoisonError::into_inner);
         Self::adopt_walk(walk.as_ref(), self.limit, &self.objects, disk);
@@ -1717,6 +1821,64 @@ fn lock_dir(dir: &Path) -> io::Result<fs::File> {
 
 #[cfg(test)]
 mod tests {
+    /// Dropping the store must not leave the walk thread behind it: the
+    /// thread holds its own index connection, and the next store of the
+    /// same test may already write beside it. The walk is held at two
+    /// one-shot barriers in its tail, and then it watches the store's
+    /// directory lock itself: the lock goes free only at the end of the
+    /// drop, so on a drop that joins the walk it cannot go free while
+    /// the walk polls. A drop that returns first is seen by the walk,
+    /// which reports the store was dropped under its feet.
+    #[test]
+    fn a_dropped_store_leaves_no_walk_thread_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let (a, frame) = blob(b"aaaa");
+        // The walk must be owed: a clean stop leaves none, so the first
+        // store is crashed, as a killed daemon leaves its store.
+        {
+            let mut store = DiskStore::open(&data, 1 << 20).unwrap();
+            store.put(a, &frame).unwrap();
+            store.crash();
+        }
+        // The walk's two barriers and its probe, installed before the
+        // reopen so only this store's walk stops at them.
+        let (report0, at0) = std::sync::mpsc::channel();
+        let (go0, wait0) = std::sync::mpsc::channel::<()>();
+        let (report1, at1) = std::sync::mpsc::channel();
+        let (go1, wait1) = std::sync::mpsc::channel::<()>();
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        // The walk's hook sees the index path, so the pairs are keyed
+        // on it, not on the directory.
+        let db_path = data.join(INDEX);
+        hold_the_walk(&db_path, vec![(report0, wait0), (report1, wait1)]);
+        *lock(&WALK_PROBE) = Some((probe_tx, data.join("lock")));
+        let store = reopen(&data, 1 << 20);
+        until(|| store.walk_state().is_some_and(|(_, _, done)| done));
+        // The walk is parked at barrier 0; let it reach barrier 1.
+        assert_eq!(at0.recv().unwrap(), 0);
+        let _ = go0.send(());
+        assert_eq!(at1.recv().unwrap(), 1);
+        // Drop the store in its own thread, and let the walk reach the
+        // probe, which watches the directory lock from inside the walk.
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(store);
+            let _ = dropped_tx.send(());
+        });
+        let _ = go1.send(());
+        assert_eq!(probe_rx.recv().unwrap(), 2);
+        // The drop must end only after the walk did: the probe says
+        // whether the lock ever went free while the walk still ran.
+        let seen = probe_rx.recv();
+        assert!(
+            seen == Err(std::sync::mpsc::RecvError),
+            "the store was dropped while the walk thread still ran: {seen:?}"
+        );
+        dropped_rx.recv().unwrap();
+        dropper.join().unwrap();
+    }
+
     use std::time::{Duration, Instant};
 
     use scion_core::{BlobId, Tree};
@@ -1837,7 +1999,7 @@ mod tests {
         }
 
         // A restart finds what is on disk, and empties tmp/.
-        let store = DiskStore::open(&data, limit).unwrap();
+        let store = reopen(&data, limit);
         assert_eq!(store.get(a.0, n).unwrap(), Some(a.1.clone()));
         assert_eq!(store.get(c.0, n).unwrap(), Some(c.1.clone()));
         assert_eq!(store.size(b.0).unwrap(), None);
@@ -1845,7 +2007,7 @@ mod tests {
         drop(store);
 
         // A lower limit drops objects at start.
-        let store = DiskStore::open(&data, n).unwrap();
+        let store = reopen(&data, n);
         assert_eq!(bytes_on_disk(&data), n);
         let kept = [a.0, c.0].map(|key| store.size(key).unwrap());
         assert_eq!(kept.iter().flatten().count(), 1, "{kept:?}");
@@ -1947,7 +2109,7 @@ mod tests {
         .unwrap();
         drop(db);
 
-        let store = DiskStore::open(&data, 1 << 20).unwrap();
+        let store = reopen(&data, 1 << 20);
         assert_eq!(store.size(key).unwrap(), Some(MAX_ENCODED_BYTES + 1));
         let err = store.get(key, MAX_ENCODED_BYTES + 1).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
@@ -2019,7 +2181,7 @@ mod tests {
         // The stop is clean, but the store owes a walk for the file it
         // could not take out.
         drop(store);
-        let store = DiskStore::open(&data, 2 * n).unwrap();
+        let store = reopen(&data, 2 * n);
         until(|| store.walk_state().is_some_and(|(_, _, done)| done));
         store.flush();
         assert_eq!(store.size(a.0).unwrap(), Some(n));
@@ -2045,6 +2207,26 @@ mod tests {
     /// The stored objects, least recently used first.
     fn order(store: &DiskStore) -> Vec<Key> {
         lock(&store.disk).order().unwrap()
+    }
+
+    /// Reopens a store whose lock another store of this test just
+    /// released. After a child process has been spawned in this process,
+    /// a just-closed lock file can refuse `flock(LOCK_EX | LOCK_NB)` for
+    /// a moment on macOS, and never on Linux (#152), so the open is
+    /// polled, one millisecond at a time, for two seconds: the real
+    /// condition, not a sleep in front of it.
+    fn reopen(dir: &Path, limit: usize) -> DiskStore {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match DiskStore::open(dir, limit) {
+                Ok(store) => return store,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "the store never reopened");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => panic!("the store failed to reopen: {e}"),
+            }
+        }
     }
 
     /// Waits until `f` holds, so a test asserts on state, not on timing.
@@ -2086,7 +2268,7 @@ mod tests {
         fs::create_dir_all(stray_path.parent().unwrap()).unwrap();
         fs::write(&stray_path, &stray.1).unwrap();
         {
-            let store = DiskStore::open(&data, 1 << 20).unwrap();
+        let store = reopen(&data, 1 << 20);
             assert_eq!(store.size(a.0).unwrap(), Some(a.1.len()));
             assert_eq!(store.size(stray.0).unwrap(), None);
             assert!(store.walk_state().is_none());
@@ -2096,13 +2278,13 @@ mod tests {
         // never reached a committed batch. The next start walks, and
         // adopts the stray, and nothing else.
         {
-            let store = DiskStore::open(&data, 1 << 20).unwrap();
+        let store = reopen(&data, 1 << 20);
             store.put(a.0, &a.1).unwrap();
             store.crash();
         }
         fs::create_dir_all(stray_path.parent().unwrap()).unwrap();
         fs::write(&stray_path, &stray.1).unwrap();
-        let store = DiskStore::open(&data, 1 << 20).unwrap();
+        let store = reopen(&data, 1 << 20);
         until(|| store.walk_state().is_some_and(|(_, _, done)| done));
         let (found, bytes, _) = store.walk_state().unwrap();
         store.flush();
@@ -2114,7 +2296,7 @@ mod tests {
         drop(store);
         // The next start owes no walk: the walk finished, and the stop was
         // clean.
-        let store = DiskStore::open(&data, 1 << 20).unwrap();
+        let store = reopen(&data, 1 << 20);
         assert!(store.walk_state().is_none());
     }
 
@@ -2137,7 +2319,7 @@ mod tests {
             assert_eq!(store.get(a.0, len).unwrap(), Some(a.1.clone()));
         }
 
-        let store = DiskStore::open(&data, limit).unwrap();
+        let store = reopen(&data, limit);
         assert_eq!(order(&store), [b.0, c.0, a.0]);
         // A fourth object drops `b`, not `a`, the oldest write.
         store.put(d.0, &d.1).unwrap();
@@ -2163,7 +2345,7 @@ mod tests {
         {
             // The crash loses what was not committed: `c` dropped `a` and
             // its put was committed at once; the use of `b` was not.
-            let store = DiskStore::open(&data, limit).unwrap();
+        let store = reopen(&data, limit);
             store.put(c.0, &c.1).unwrap();
             assert!(!store.path(a.0).exists());
             assert_eq!(store.size(b.0).unwrap(), Some(n));
@@ -2172,7 +2354,7 @@ mod tests {
         // The remove of `a` was in the batch that the crash lost, and
         // without it the store is over its limit: the start drops `a`
         // again, whose file the crash had already moved out of its name.
-        let store = DiskStore::open(&data, limit).unwrap();
+        let store = reopen(&data, limit);
         assert_eq!(order(&store), [b.0, c.0]);
         assert_eq!(store.size(a.0).unwrap(), None);
         assert_eq!(
@@ -2212,7 +2394,7 @@ mod tests {
         push_record(&mut rows, c.0, Some(c.1.len()));
         push_record(&mut rows, a.0, Some(a.1.len()));
         put_old_back(&data, &old_index(CLEAN, &rows));
-        let store = DiskStore::open(&data, 1 << 20).unwrap();
+        let store = reopen(&data, 1 << 20);
         // The order of the file is the order of use of the new index.
         assert_eq!(order(&store), [b.0, c.0, a.0]);
         assert!(!data.join(OLD_INDEX).exists());
@@ -2242,7 +2424,7 @@ mod tests {
         assert_eq!(old_state(&data), DIRTY);
 
         // `c` keeps its place from the file; the rest by write time.
-        let store = DiskStore::open(&data, 1 << 20).unwrap();
+        let store = reopen(&data, 1 << 20);
         assert_eq!(order(&store), [c.0, a.0, b.0]);
     }
 
@@ -2279,7 +2461,7 @@ mod tests {
         ] {
             remove_db(&data);
             put_old_back(&data, index);
-            let store = DiskStore::open(&data, 1 << 20).unwrap();
+        let store = reopen(&data, 1 << 20);
             let found = store.size(stray.0).unwrap().is_some();
             assert_eq!(found, scans, "{case}");
             assert_eq!(store.size(b.0).unwrap(), Some(b.1.len()), "{case}");
@@ -2301,7 +2483,7 @@ mod tests {
         // A db that is not a database: the start moves it aside and scans.
         remove_db(&data);
         fs::write(data.join(INDEX), b"not a database at all").unwrap();
-        let store = DiskStore::open(&data, 1 << 20).unwrap();
+        let store = reopen(&data, 1 << 20);
         assert_eq!(store.size(a.0).unwrap(), Some(a.1.len()));
         let n = stray.1.len();
         assert_eq!(store.size(stray.0).unwrap(), Some(n));
@@ -2395,7 +2577,7 @@ mod tests {
         }
         assert_eq!(store.size(b.0).unwrap(), Some(n));
         drop(store);
-        let store = DiskStore::open(&data, 8 * n + n / 2).unwrap();
+        let store = reopen(&data, 8 * n + n / 2);
         assert_eq!(lock(&store.disk).objects, 8);
     }
 
@@ -2416,7 +2598,7 @@ mod tests {
         let limit = 2 * n + n / 2;
         {
             // The crash: a stop never came, so the next start walks.
-            let store = DiskStore::open(&data, limit).unwrap();
+        let store = reopen(&data, limit);
             store.put(a.0, &a.1).unwrap();
             store.put(b.0, &b.1).unwrap();
             // Their last uses are committed, so the files that the walk
@@ -2433,7 +2615,7 @@ mod tests {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, bytes).unwrap();
         }
-        let store = DiskStore::open(&data, limit).unwrap();
+        let store = reopen(&data, limit);
         until(|| store.walk_state().is_some_and(|(_, _, done)| done));
         // The walk adopted the two, and counted their bytes.
         let (found, bytes, _) = store.walk_state().unwrap();
@@ -2459,7 +2641,7 @@ mod tests {
         drop(store);
 
         // And what the walk counted stays counted over a restart.
-        let store = DiskStore::open(&data, limit).unwrap();
+        let store = reopen(&data, limit);
         assert_eq!(usize::try_from(lock(&store.disk).bytes).unwrap(), 2 * n);
         assert_eq!(bytes_on_disk(&data), 2 * n);
     }
@@ -2471,7 +2653,7 @@ mod tests {
         let data = dir.path().join("data");
         let (a, b, c) = (blob(b"aaaa"), blob(b"bbbb"), blob(b"cccc"));
         let n = a.1.len();
-        let store = DiskStore::open(&data, 2 * n).unwrap();
+        let store = reopen(&data, 2 * n);
         store.put(a.0, &a.1).unwrap();
         store.put(b.0, &b.1).unwrap();
 
@@ -2500,7 +2682,7 @@ mod tests {
 
         // The stop was not clean: the store owed a walk, though it could
         // not write the flag that says so.
-        let store = DiskStore::open(&data, 2 * n).unwrap();
+        let store = reopen(&data, 2 * n);
         until(|| store.walk_state().is_some_and(|(_, _, done)| done));
         let (found, bytes, _) = store.walk_state().unwrap();
         store.flush();
@@ -2513,7 +2695,7 @@ mod tests {
         // The walk paid the debt: the next start is clean, and owes no walk.
         // The store is over its limit again, so the least recently used
         // goes: `c`, which the walk brought back last as the oldest.
-        let store = DiskStore::open(&data, 2 * n).unwrap();
+        let store = reopen(&data, 2 * n);
         assert!(store.walk_state().is_none());
         assert_eq!(store.size(c.0).unwrap(), None);
         assert_eq!(store.size(b.0).unwrap(), Some(n));
@@ -2540,7 +2722,7 @@ mod tests {
             if scan {
                 remove_db(&data);
             }
-            let store = DiskStore::open(&data, 1 << 20).unwrap();
+        let store = reopen(&data, 1 << 20);
             assert_eq!(store.size(key).unwrap(), Some(size));
             assert_eq!(store.get(key, size).unwrap(), None);
             assert_eq!(store.size(key).unwrap(), None);
