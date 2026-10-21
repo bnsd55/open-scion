@@ -261,6 +261,19 @@ fn a_disk_out_of_inodes_answers_out_of_space_and_needs_no_repair() {
     assert!(report.is_clean(), "{:?}", report.problems);
 }
 
+/// The client's blob put, the server's own path: `put_blob` records
+/// the `repo_blobs` row that gc's live-set walk reads; a bare
+/// `blobs().put` does not.
+fn seed_client_blob(
+    store: &Backend,
+    repo: scion_server::test_support::meta::RepoId,
+    content: &[u8],
+) -> scion_core::BlobId {
+    let upload = store.blobs().upload().unwrap().append(content).unwrap();
+    scion_server::test_support::write::put_blob(store, repo, upload)
+        .expect("the client's blob put lands")
+}
+
 /// The disk-full runbook (docs/operations.md, "Disk full"), step by
 /// step: the disk fills and refuses, the gc routine frees what nothing
 /// names (a dry run first, then a real one), fsck is clean, and writes
@@ -273,9 +286,11 @@ fn a_disk_full_runbook_gcs_then_writes_resume() {
     let mount = Mount::new("runbook", "8m", "4096");
     let store = open_store(&mount, "first open of the runbook test");
     // The data the operator keeps: one repo whose changeset names one
-    // blob, so the gc routine must keep it and free the rest.
-    let named = store.blobs().put(b"named\n").unwrap();
+    // blob, so the gc routine must keep it and free the rest. The blob
+    // goes up the server's own path: put_blob records the repo_blobs
+    // row the gc's live-set walk reads, as a client's PutBlob would.
     let repo = store.write(|c| c.create_repo("main")).unwrap();
+    let named = seed_client_blob(&store, repo, b"named\n");
     let cs = scion_core::Changeset::new(
         vec![],
         scion_core::IdentityTime::new(
