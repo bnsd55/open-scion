@@ -13,7 +13,6 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::Path;
 
 use scion_core::BlobId;
 use scion_proto::Bytes;
