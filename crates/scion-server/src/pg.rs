@@ -22,9 +22,9 @@
 //!   twice, and the newest land holds the largest one.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -2476,7 +2476,10 @@ impl MetaTx for PgTx<'_> {
         if trees.is_empty() {
             return Ok(());
         }
-        let ids: Vec<Vec<u8>> = trees.iter().map(|(id, _)| id_bytes(id.as_bytes())).collect();
+        let ids: Vec<Vec<u8>> = trees
+            .iter()
+            .map(|(id, _)| id_bytes(id.as_bytes()))
+            .collect();
         let bodies: Vec<Vec<u8>> = trees.iter().map(|(_, body)| body.clone()).collect();
         self.c.execute(
             "INSERT INTO trees (id, body)

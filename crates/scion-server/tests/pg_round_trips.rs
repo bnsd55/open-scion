@@ -14,25 +14,25 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::Duration;
 use std::sync::Arc;
+use std::time::Duration;
 
 use scion_core::{Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_proto::runtime::auth::token_digest;
 use scion_proto::runtime::listen::Limits;
-use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::LandRequest;
+use scion_proto::v1::scion_client::ScionClient;
 use scion_server::test_support::audit::Audit;
+use scion_server::test_support::meta::Meta as _;
 use scion_server::test_support::service;
 use scion_server::test_support::{meta::MetaTx as _, write};
-use scion_server::test_support::meta::Meta as _;
 use scion_server::{Access, Backend, ImportOptions, Keys, Metrics, import_git};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
+use tonic::Request;
 use tonic::metadata::AsciiMetadataValue;
 use tonic::service::interceptor::{InterceptedService, Interceptor};
 use tonic::transport::Channel;
-use tonic::{Request};
 
 const REPO: &str = "r";
 
@@ -129,8 +129,13 @@ fn create_many(store: &Backend, bases: &[ChangesetId], files: &[(&str, &str)]) -
     }
     let cs = Changeset::new(
         bases.to_vec(),
-        IdentityTime::new(b"Ada".to_vec(), b"ada@example.com".to_vec(), 1_700_000_100, 0)
-            .expect("identity fits the format"),
+        IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_100,
+            0,
+        )
+        .expect("identity fits the format"),
         None,
         b"wide\n".to_vec(),
         changes,
@@ -143,7 +148,10 @@ fn create_many(store: &Backend, bases: &[ChangesetId], files: &[(&str, &str)]) -
 /// write check like any client's.
 fn access() -> Access {
     let token = blake3::Hash::from(token_digest("ada")).to_hex().to_string();
-    Access::parse(&format!("token\tada\t{token}\nread\tada\t{REPO}\nwrite\tada\t{REPO}\n")).unwrap()
+    Access::parse(&format!(
+        "token\tada\t{token}\nread\tada\t{REPO}\nwrite\tada\t{REPO}\n"
+    ))
+    .unwrap()
 }
 
 /// The token as the client carries it.
