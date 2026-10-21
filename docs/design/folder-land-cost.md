@@ -1,6 +1,7 @@
 # Design: big folders cost too much per land
 
-**Status: proposal. Nothing in this file is built.** It answers the
+**Status: the read-path fix in section 3 landed in #506; the rest is a
+proposal.** It answers the
 land-cost review finding (a measurement of the bytes one land adds, at
 10, 1,000 and 10,000 entries, per folder and per path history): each
 land rewrites one tree node and one history node per folder on each
@@ -11,7 +12,7 @@ measurement read `history_nodes` 194 MB against `trees` 137 MB.
 Numbers marked **estimate** are back-of-envelope figures, not
 measurements; the tokio numbers are the measurements.
 
-## 1. Which bytes are format, which are ours
+## 1 Which bytes are format, which are ours
 
 The `trees` table (metadata schema 0001) holds one row per tree node:
 `(id, body)`. Two things in that row are frozen by the format:
@@ -43,7 +44,7 @@ The precedent is in-house: path-history nodes (`history_nodes`, migration
 bound, 7 bits), and a land stamps only the chunks on changed paths. The
 root tree is the one place still paying full-folder rewrites.
 
-## 2. The cost, measured from the code
+## 2 The cost, measured from the code
 
 A `TreeV1` entry costs, per entry: name bytes (~10–20), the tag byte, a
 32-byte `BlobId`/`TreeId`, and a `u64be` length — about **64 bytes per
@@ -57,10 +58,10 @@ folder's whole node:
 | 10,000 | 640 KB | 6.4 GB |
 | 100,000 | 6.4 MB | 64 GB |
 
-The same row is also read whole: `tree::lookup` calls `get_tree` at each
-level and clones the full entry map (`tree.rs:119`), so one file read in a
-100,000-entry directory costs ~6.4 MB (estimate) to find one entry.
-Section 3.5 takes that read path on its own.
+The same row is also read whole. Before #506, `tree::lookup` called
+`get_tree` at each level and cloned the full entry map, so one file read
+in a 100,000-entry directory cost ~6.4 MB (estimate) to find one entry.
+Section 3 takes that read path; it landed in #506.
 
 The land's other tree costs the same shape, and more. Each changeset also
 writes one history node per folder on its changed paths. Those nodes
@@ -69,8 +70,7 @@ folders: a folder of under about 1,000 entries (history entries are
 ~64–90 bytes: name, flags, a 32-byte changeset id, a generation, and
 often a 32-byte child id) sits in **one** chunk, and every land rewrites
 that chunk whole. On the tokio store, the measurement read
-`history_nodes` at
-194 MB against `trees` at 137 MB — for typical folders, history is the
+`history_nodes` at 194 MB against `trees` at 137 MB — for typical folders, history is the
 larger half of the per-land cost, not a footnote.
 
 What the two sides cost per land on a folder of n entries (estimate):
@@ -90,22 +90,23 @@ with a path reads the index plus one more chunk, so a scan's row count
 rises with the chunk count. The bound trades land bytes against read
 row counts, not against nothing.
 
-## 3.5 The read path is a separate finding
+## 3 The read path (landed in #506)
 
-`tree::lookup` reads each level's whole node and clones its entire entry
-map to remove one name (`tree.rs:119`): a file read in a 100,000-entry
-directory copies ~6.4 MB (estimate) on every call — CPU and memory on
-the read path, on every read, not only storage. This is separate from
-the land cost and does not need the chunked layout to fix.
+`tree::lookup` used to read each level's whole node and clone its entire
+entry map to remove one name: a file read in a 100,000-entry directory
+copied ~6.4 MB (estimate) on every call — CPU and memory on the read
+path, on every read, not only storage. This was separate from the land
+cost and did not need the chunked layout to fix.
 
-**The cheap fix: binary search in the body, no clone.** `TreeV1` entries
+**The fix that landed: binary search in the body, no clone.** `TreeV1`
+entries
 are sorted by name bytes, and the body's layout is self-describing
 (length-prefixed names, fixed-size ids). A lookup can scan the encoded
 body with a binary search over entry boundaries — or at minimum iterate
 with early exit and stop at the first name above the target — decode one
 entry, and never materialize the map. The change is inside
 `tree::lookup`/`MetaTx::get_tree` plumbing; no format, schema, or
-migration changes.
+migration changes. #506 is that fix on main.
 
 Note what neither fix changes: `TreeV1` is also what clients fetch, so a
 100,000-entry folder is a ~6.4 MB object on the wire whatever the server
@@ -113,7 +114,7 @@ stores. Storage chunking reassembles the same bytes; shrinking the
 wire object means giving clients partial tree reads — format v2
 territory, out of scope here.
 
-## 4. Three options
+## 4 Three options
 
 ### O1 — chunked folder nodes (content-defined chunks)
 
@@ -159,11 +160,10 @@ random hashes do not compress, so the win is names and the `len` fields —
 640 KB → ~430 KB per land: the linear slope survives, just smaller. CPU
 cost is trivial; the change is one row-encoding seam.
 
-## 4. Recommendation and trigger
+## 5 Recommendation and trigger
 
-**Recommendation: O1 when the trigger fires, with O3 stacked on top, and
-the §3.5 lookup fix first.** The lookup fix is days, not weeks, and pays
-on every read today. O1 is the only option that breaks the linear term
+**Recommendation: O1 when the trigger fires, with O3 stacked on top.**
+The §3 lookup fix has landed (#506); it already pays on every read. O1 is the only option that breaks the linear term
 (on both tables — the same chunking applies to root-tree storage and to
 a smaller history bound); it copies the chunking the codebase already
 has for path history; and it also shrinks the read side (`ListDir` on
@@ -185,12 +185,12 @@ but is not a fix.
   every tree and history node, the same bytes as one land per folder
   today.
 
-## 5. What this does not change
+## 6 What this does not change
 
 `TreeV1` bytes, IDs, and every server-side check stay as they are. A
 store migrated to chunks serves the same `TreeV1` bodies;
 `format-v1.md` is untouched. The wire is the one thing no storage change
-touches: clients fetch whole `TreeV1` objects (§3.5), so a 100,000-entry
+touches: clients fetch whole `TreeV1` objects (§3), so a 100,000-entry
 folder is a ~6.4 MB reply whatever the server stores. Smaller wire
 objects for big folders mean partial tree reads for clients — format v2
 territory.
