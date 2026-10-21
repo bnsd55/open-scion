@@ -186,6 +186,21 @@ scion-server --data /srv/scion \
 - One server process serves one database: a second `serve` on the same
   `--postgres-url` fails at its open with "another server holds this
   database". An import does not take that lock and runs beside a server.
+- The server opens one write connection and a pool of 8 read
+  connections, plus the short-lived connections of a migration or an
+  import. Size the database's `max_connections` for all of it: the
+  server's own 9, the operator's tooling beside it (`pg_dump`, `psql`,
+  a metrics scraper), and a margin. A database at its connection cap
+  refuses the server's next connection, and every call that needs one
+  answers `unavailable` until one is free.
+- The one-server rule and the write queue are Postgres advisory locks,
+  visible as `pg_locks` rows of kind `advisory`: the one-server lock
+  and the migration lock are fixed keys of the database, and every
+  write transaction also takes the schema's collector key
+  (`pg_advisory_xact_lock(hashtext(current_schema() || ':gc'))`),
+  which orders it against the collector's sweeps and gives up on that
+  key alone after 60 s. An `advisory` row in `pg_locks` is one of
+  these, held by this server by design, not a stuck client to kill.
 - A write that waits for another writer's lock gives up after 5 s and
   answers unavailable, like the SQLite store past its busy timeout; the
   client retries.
@@ -756,10 +771,6 @@ the process, scraped from there. The names:
 - `scion_pg_collector_key_wait_seconds` — a Postgres write's wait for the
   collector's advisory key; waits that climb toward the key's own 60 s
   bound mean the writer queue does not drain.
-- `scion_pg_pool_wait_seconds` — (Postgres only) how long calls waited for
-  a read connection. A rising tail means the 8 readers are held by long
-  walks; the calls that waited past the pool's bound failed
-  `unavailable`.
 - `scion_pg_pool_wait_seconds` — (Postgres only) how long calls waited for
   a read connection. A read transaction is bounded at 300 s per statement
   and 30 s idle between statements, and a call waits at most 30 s for a
