@@ -1513,9 +1513,21 @@ order is kept: each tier's `--upstream` sets it, and nothing checks it.
 refuses a path that is not a socket file owned by its user or by root, so
 the token never goes to another user's socket. `scn` and the daemon also
 check every directory above the socket and above `<data>`, up to `/`. Each
-must be owned by root or by their user, and must not be writable by group
-or others unless it has the sticky bit (as `/tmp` has). Else another user
-could swap the path after the check. The directory that holds the path is
+must be owned by root or by their user, and must not be writable by others
+unless it has the sticky bit (as `/tmp` has), nor by its group, whatever
+the sticky bit, unless the group holds no account but the directory's
+owner. Else another user could swap the path after the check. That one
+exception, a user private group, is proved on Linux with glibc only, by
+`runtime/auth/accounts.rs`: `/etc/nsswitch.conf` must take `passwd`,
+`group` and `initgroups` from `files`, optionally followed by `systemd`;
+then one snapshot of the account database, read through glibc's NSS
+(`getpwent_r`, `getgrent_r`, `getgrouplist`, in the `ffi` module), must
+show that every account whose primary group it is, every name it lists
+and every account `getgrouplist` puts in it is the owner, and that the
+owner is in it. Any lookup error or record listed twice refuses. On
+macOS, musl and every other target a group-writable path stays refused.
+The proof covers the account database as it is when it runs: it cannot
+see a process that still holds a group its account has since left. The directory that holds the path is
 resolved first, and its resolved directories are checked
 (`scion-proto/src/auth.rs`, `check_ancestors`). Then `scn` connects to,
 and the daemon uses, the resolved path, so a symlink on the way is not

@@ -375,7 +375,10 @@ mod tests {
         let dir = private_dir();
         let path = dir.path().join("r.scnsnap");
         write(&path, "r", &[blob(b"aaaa")]).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        // Others can write it: refused on every system. A 0664 file is the
+        // group proof's to decide (runtime::auth): a group that is its
+        // owner's alone passes.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
         let store = DiskStore::open(&dir.path().join("one"), 1 << 20).unwrap();
         let err = seed(&store, &path).unwrap_err().to_string();
         assert!(err.contains("written by group or others"), "{err}");

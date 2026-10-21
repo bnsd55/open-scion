@@ -308,11 +308,12 @@ nothing past the daemon. The tiers serve only checkouts; the other `scn`
 commands talk to the server. The daemon's data directory must be private to
 your user (mode 0700, not a shared path such as `/tmp`), because its socket
 lives there. Each directory above it must be owned by root or by you, and
-must not be writable by group or others unless it has the sticky bit (as
-`/tmp` has). `scn` checks the same for the socket. The error names the
-directory; `chmod go-w DIR` fixes it. With umask 002 (a private group per
-user), new directories are group-writable, so they are refused until you run
-that. Stop the daemon with Ctrl-C or SIGTERM: it then writes its index, and
+must not be writable by others unless it has the sticky bit (as `/tmp`
+has), nor by its group unless the group is yours alone: on Linux with
+glibc, the private group that Debian, Ubuntu and Fedora give each user
+with umask 002 passes, once the local account files show no other
+account in it. `scn` checks the same for the socket. The error names the
+directory and the `chmod` that fixes it. Stop the daemon with Ctrl-C or SIGTERM: it then writes its index, and
 its next start reads that one file instead of every stored object.
 
 A regional cache can also write snapshots, so that a new node's daemon does
@@ -370,10 +371,12 @@ and leaves signed for each host's name or address.
 
 The server reads the private key only when its owner (or root) alone can
 read it: `chmod 600 server.key`. The certificate and every CA file must
-not be group- or others-writable — a swapped certificate or CA changes
-whom a client trusts or which client certificates the server accepts —
-so `chmod go-w` on them, and check after a copy tool or a umask 002
-session, where a fresh file starts 0664.
+not be writable by another account (a swapped certificate or CA changes
+whom a client trusts or which client certificates the server accepts):
+not by others, and not by a group, unless on Linux with glibc the group
+is the file's owner's alone, as a 0664 file of a umask 002 session in a
+user private group is. `chmod go-w` them otherwise, and check after a
+copy tool.
 
 ```sh
 ./target/release/scion-server --data /tmp/scion serve \

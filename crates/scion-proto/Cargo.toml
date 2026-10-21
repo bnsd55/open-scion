@@ -38,6 +38,11 @@ tonic-prost.workspace = true
 tracing.workspace = true
 zstd.workspace = true
 
+# The proof that a group is its owner's alone reads the account database
+# through glibc's NSS (runtime/auth/ffi.rs); libc binds those calls there.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 rcgen.workspace = true
 tempfile.workspace = true

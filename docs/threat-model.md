@@ -58,7 +58,7 @@ Out of profile. Any of these voids the model:
 | Tokens | The operator's hands, the access file as digests, `SCION_TOKEN` | Constant-time digest compare; never written to a file or a log by `scn` |
 | Ticket keys | `--ticket-key` (seed) and `--ticket-key-old` (public half) | The descriptor checks: a regular file, owner this account or root, a seed mode 0600, a public key no other account can write |
 | TLS keys | `--tls-key`, `--tls-client-key` | The checked descriptor read: no symlink, no other owner, no group or others read |
-| TLS certificates and CAs | `--tls-cert`, `--tls-ca`, `--tls-client-ca` | The checked descriptor read: whole-keeping, no group or others write |
+| TLS certificates and CAs | `--tls-cert`, `--tls-ca`, `--tls-client-ca` | The checked descriptor read: whole-keeping, no write by another account (others, or a group that is not the owner's alone) |
 | Snapshots | The cache's `--snapshot` dir, a daemon's `--seed` file | A full-repo credential: read checks plus `--seed-full-repo` say-so |
 
 ## 3. Actors
@@ -195,8 +195,9 @@ that breaks one is caught.
   `scion-proto/src/runtime/tls.rs::a_client_ca_the_group_or_others_can_write_is_refused`,
   `scion-proto/src/runtime/tls.rs::a_symlinked_certificate_is_refused_with_a_perfect_target`
 - **A seed cannot seed what was not checked.** A snapshot is read
-  through the checked descriptor and streamed; a group-writable or
-  symlinked snapshot is refused, and `--seed-full-repo` must say so.
+  through the checked descriptor and streamed; a snapshot another
+  account can write, or a symlinked one, is refused, and
+  `--seed-full-repo` must say so.
   `scion-tier/src/snapshot.rs::a_group_writable_snapshot_is_refused`,
   `scion-tier/src/snapshot.rs::a_symlinked_snapshot_is_refused`
 - **Two repos whose names differ only by case do not share one

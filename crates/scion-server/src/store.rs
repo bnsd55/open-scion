@@ -35,7 +35,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, ErrorKind, Read, Seek, Write};
 use std::ops::Deref;
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -239,8 +239,10 @@ impl Store {
     }
 
     /// Opens a data directory for a process of build `build` ([`build`]).
-    /// Refuses a data directory that a symlink or a group/others-writable
-    /// mode would make unsafe, before anything opens inside it. The
+    /// Refuses a data directory that a symlink or a mode another account
+    /// can write through would make unsafe, before anything opens inside
+    /// it: others never, its group only when the group is its owner's
+    /// alone (`refuse_writable_dir`, on a descriptor of its own). The
     /// refusal is by kind, not by the link's mode: on macOS lchmod can
     /// give a symlink any mode, so a mode check alone does not catch one,
     /// and a link's target can change behind the checks.
@@ -256,17 +258,7 @@ impl Store {
             )
             .into());
         }
-        if meta.mode() & 0o022 != 0 {
-            return Err(io::Error::new(
-                ErrorKind::PermissionDenied,
-                format!(
-                    "{} can be written by group or others (fix: chmod go-w {})",
-                    dir.display(),
-                    dir.display()
-                ),
-            )
-            .into());
-        }
+        scion_proto::runtime::auth::refuse_writable_dir(dir)?;
         Ok(())
     }
 

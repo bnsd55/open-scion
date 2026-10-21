@@ -33,8 +33,9 @@ SCION_TOKEN=<TOKEN> ./scion-server --data /srv/scion serve
 That is the whole deployment: clients talk to `127.0.0.1:7878` (or `--listen`
 HOST:PORT). The data directory holds every blob and every row, so keep it
 mode 0700 and owned by the user the server runs as: the server refuses one
-that group or others can write, or that sits under a directory another user
-can change. Without `--ticket-key` no object is readable, so a real server
+that another account can write (others, or a group that is not the
+directory's owner's alone, which only Linux with glibc can prove), or that
+sits under a directory another user can change. Without `--ticket-key` no object is readable, so a real server
 adds a ticket key (section 2):
 
 ```sh
@@ -136,9 +137,11 @@ shared path such as `/tmp`); it serves on a 0600 Unix socket in it
 keeps at most `--max-bytes` object bytes (10 GiB) and drops the least
 recently used first. Every
 directory above it must be owned by root or by the user, and not writable by
-group or others unless it has the sticky bit. It refuses anything else, and
-`scn` checks the socket the same way; the error names the directory and
-`chmod go-w DIR` fixes it.
+others unless it has the sticky bit, nor by its group unless the group is
+the user's alone (a user private group, as Debian, Ubuntu and Fedora make
+with umask 002; proved on Linux with glibc only, from local account files).
+It refuses anything else, and `scn` checks the socket the same way; the
+error names the directory and the `chmod` that fixes it.
 
 One token rule the flag list hides: `scn` sends its one `--token` on every
 call, to the server (refs and reads) and to the daemon (objects). So the
@@ -318,10 +321,10 @@ The server reads the private key only when its owner (or root) alone can
 read it, and refuses one that group or others can read at start
 (`chmod 600 KEY`). The certificate and every CA file (`--tls-cert`, the
 CAs of `--tls-ca`, `--tls-client-ca`, `--postgres-ca`) must not be
-group- or others-writable, for a swapped file changes whom a client
-trusts or whose certificates the server accepts: `chmod go-w` them, and
-check after a copy tool or a umask 002 session, where a fresh file
-starts 0664.
+writable by another account, for a swapped file changes whom a client
+trusts or whose certificates the server accepts: not by others, and not
+by a group unless, on Linux with glibc, the group is the file's owner's
+alone. `chmod go-w` them otherwise, and check after a copy tool.
 
 ### In containers
 

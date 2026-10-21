@@ -1101,7 +1101,10 @@ mod key_file_tests {
     #[test]
     fn a_group_writable_public_key_file_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let file = write_key(dir.path(), "old", 0o664, "abcd");
+        // Others can write it: refused on every system. A 0664 file is the
+        // group proof's to decide (runtime::auth): a group that is its
+        // owner's alone passes.
+        let file = write_key(dir.path(), "old", 0o666, "abcd");
         let err = read_hex(&file, false).unwrap_err().to_string();
         assert!(err.contains("written by group or others"), "{err}");
     }

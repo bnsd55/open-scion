@@ -1031,7 +1031,8 @@ user; a user who wants a daemon runs their own. A client sends its token
 to the socket, so it SHOULD check first that the socket file is a socket
 (not a symlink) owned by its own user or by root. It SHOULD also check each
 directory above the socket, up to `/`: owned by root or by its own user,
-and not writable by group or others unless it has the sticky bit. Else
+and not writable by others unless it has the sticky bit, nor by its group
+unless the group holds no account but the directory's owner. Else
 another user could swap the socket after the check. It SHOULD resolve the
 socket's directory before this check and connect to the resolved path, so
 that it follows no symlink after the check. `scn` does all of this, for

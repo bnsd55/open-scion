@@ -2541,6 +2541,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "open-scion-core",
  "prost",
  "prost-types",

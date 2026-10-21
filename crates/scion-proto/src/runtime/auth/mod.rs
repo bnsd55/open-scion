@@ -5,14 +5,18 @@
 //! process makes its own directories private ([`create_private_dir_all`]).
 //! Files that hold secrets, or keys that must stay whole, are read through
 //! one checked descriptor ([`read_secret_file`], [`read_shared_file`]),
-//! whose ACL checks wrap the one `ffi` module.
+//! whose ACL checks wrap the one `ffi` module. A path that its group can
+//! write passes these checks only when, on Linux with glibc, the group is
+//! proved to hold no account but the path's owner (the private
+//! `accounts` module, which reads the account database through `ffi`).
 
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fs, io};
 
-#[cfg(target_os = "macos")]
+mod accounts;
+#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
 mod ffi;
 
 use rustix::fs::OFlags;
@@ -158,17 +162,32 @@ impl Interceptor for Bearer {
 ///
 /// By choice, as OpenSSH's `StrictModes`, a group-writable directory is
 /// refused: the sticky bit excuses a group only when others can write too
-/// (the `/tmp` shape, `01777`). Only the owner and the mode bits are read
-/// on the walk itself, and an ACL that grants what the mode's bits do
-/// not is refused too: on Linux by the POSIX-ACL xattrs, on macOS through
-/// the descriptor's extended ACL (the one `ffi` module the workspace's
-/// lint lets hold it).
+/// (the `/tmp` shape, `01777`). The one exception is a group that holds no
+/// account but the directory's owner, a user private group as Debian,
+/// Ubuntu and Fedora give every account with umask 002: on Linux with
+/// glibc, the `accounts` module proves it from the local account files,
+/// read through NSS, and refuses on any doubt; on every other target the
+/// directory stays refused. Only the owner, the group and the mode bits
+/// are read on the walk itself, and an ACL that grants what the mode's
+/// bits do not is refused too: on Linux by the POSIX-ACL xattrs, on macOS
+/// through the descriptor's extended ACL (the one `ffi` module the
+/// workspace's lint lets hold it).
 ///
 /// # Errors
 ///
 /// [`io::ErrorKind::PermissionDenied`] naming the first directory that breaks
 /// a rule, and why. I/O errors if the directory cannot be resolved.
 pub fn check_ancestors(path: &Path, me: u32) -> io::Result<PathBuf> {
+    check_ancestors_with(path, me, &accounts::owners_alone)
+}
+
+/// Whether a group holds no account but an owner: `Ok`, or why not. The
+/// checks take it as an argument, so the tests give each case its answer.
+type GroupProof<'a> = &'a dyn Fn(u32, u32) -> Result<(), String>;
+
+/// [`check_ancestors`], with `owners_alone` deciding a group-writable
+/// directory.
+fn check_ancestors_with(path: &Path, me: u32, owners_alone: GroupProof<'_>) -> io::Result<PathBuf> {
     // A path that ends in `.` or `..` has no last part: resolve all of it.
     let path = match path.file_name() {
         Some(_) => path.to_owned(),
@@ -187,17 +206,26 @@ pub fn check_ancestors(path: &Path, me: u32) -> io::Result<PathBuf> {
     let parent = fs::canonicalize(parent)?;
     for dir in parent.ancestors() {
         let meta = fs::symlink_metadata(dir)?;
+        // A group that can write the directory can plant and swap its own
+        // entries, and the sticky bit does not stop that: it bounds who may
+        // remove a name, not who may add one. It excuses a group only when
+        // others can write too, the `/tmp` shape, where the others-write
+        // rule below is the real wall. A group that is the owner's alone
+        // holds no one else to plant anything.
+        let group_writes = meta.mode() & 0o020 != 0 && meta.mode() & 0o002 == 0;
+        let not_alone = if group_writes && (meta.uid() == 0 || meta.uid() == me) {
+            owners_alone(meta.gid(), meta.uid()).err()
+        } else {
+            None
+        };
         let (why, fix) = if meta.uid() != 0 && meta.uid() != me {
             let why = format!("is owned by another user (uid {})", meta.uid());
             (why, String::new())
-        } else if meta.mode() & 0o020 != 0 && meta.mode() & 0o002 == 0 {
-            // A group that can write the directory can plant and swap its
-            // own entries, and the sticky bit does not stop that: it
-            // bounds who may remove a name, not who may add one. It
-            // excuses a group only when others can write too, the `/tmp`
-            // shape, where the others-write rule below is the real wall.
-            let why = "can be written by the group, and the sticky bit does not excuse a group"
-                .to_owned();
+        } else if let Some(not_alone) = not_alone {
+            let why = format!(
+                "can be written by group {}, which is not its owner's alone ({not_alone}), and the sticky bit does not excuse a group",
+                meta.gid()
+            );
             (why, format!(" (fix: chmod g-w {})", dir.display()))
         } else if meta.mode() & 0o002 != 0 && meta.mode() & 0o1000 == 0 {
             let why = "can be written by others, and has no sticky bit".to_owned();
@@ -279,10 +307,12 @@ pub(crate) const MAX_CHECKED_FILE: u64 = 1024 * 1024;
 
 /// Reads `file` that is public but must stay whole, such as the public key
 /// that a ticket rotation keeps alive: the same one-descriptor check as
-/// [`read_secret_file`], except the mode rule is write, not read - no group
-/// or others account may be able to write it, because a changed key breaks
-/// every tier that verifies against the old one. Read permission for the
-/// others is fine.
+/// [`read_secret_file`], except the mode rule is write, not read - no
+/// other account may be able to write it, because a changed key breaks
+/// every tier that verifies against the old one: not others, and not its
+/// group unless the group is the file's owner's alone, as
+/// [`check_ancestors`] proves it for a directory, on the same descriptor.
+/// Read permission for the others is fine.
 ///
 /// # Errors
 ///
@@ -411,7 +441,12 @@ pub fn open_checked_file(file: &Path, secret: bool) -> io::Result<std::fs::File>
     })?;
     let opened = fs::File::from(opened);
     let meta = opened.metadata()?;
-    ensure_file_checks(meta.mode(), meta.uid(), me, secret, file)?;
+    let checked = Fstat {
+        mode: meta.mode(),
+        uid: meta.uid(),
+        gid: meta.gid(),
+    };
+    ensure_file_checks(&checked, me, secret, file, &accounts::owners_alone)?;
     // (Linux, macOS) An ACL that grants what the mode's bits do not is
     // one more account that can reach this file: the check runs on the
     // checked descriptor, before the caller reads anything from it.
@@ -574,7 +609,22 @@ fn ancestor_has_hidden_acl(dir: &Path, _mode: u32) -> io::Result<Option<String>>
 const S_IFMT: u32 = 0o170_000;
 const S_IFREG: u32 = 0o100_000;
 
-fn ensure_file_checks(mode: u32, uid: u32, me: u32, secret: bool, file: &Path) -> io::Result<()> {
+/// The fstat fields the descriptor checks read.
+#[derive(Clone, Copy)]
+struct Fstat {
+    mode: u32,
+    uid: u32,
+    gid: u32,
+}
+
+fn ensure_file_checks(
+    stat: &Fstat,
+    me: u32,
+    secret: bool,
+    file: &Path,
+    owners_alone: GroupProof<'_>,
+) -> io::Result<()> {
+    let Fstat { mode, uid, gid } = *stat;
     if mode & S_IFMT != S_IFREG {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -607,7 +657,7 @@ fn ensure_file_checks(mode: u32, uid: u32, me: u32, secret: bool, file: &Path) -
                 ),
             ));
         }
-    } else if bits & 0o022 != 0 {
+    } else if bits & 0o002 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -616,6 +666,82 @@ fn ensure_file_checks(mode: u32, uid: u32, me: u32, secret: bool, file: &Path) -
                 file.display()
             ),
         ));
+    } else if bits & 0o020 != 0
+        && let Err(not_alone) = owners_alone(gid, uid)
+    {
+        return Err(group_write_refused(file, gid, &not_alone));
+    }
+    Ok(())
+}
+
+/// The refusal of a path that a group other than its owner's alone can
+/// write.
+fn group_write_refused(path: &Path, gid: u32, not_alone: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "{} can be written by group {gid}, which is not its owner's alone ({not_alone}) (fix: chmod g-w {})",
+            path.display(),
+            path.display()
+        ),
+    )
+}
+
+/// Refuses the directory `dir` when another account can write it, judged
+/// on a descriptor of its own (opened `O_NOFOLLOW`, so a symlink at `dir`
+/// is refused): others never, and its group only when the group is its
+/// owner's alone, as [`check_ancestors`] proves it. The server runs it on
+/// its data directory, whose blobs and metadata are only as private as
+/// the directory.
+///
+/// # Errors
+///
+/// [`io::ErrorKind::PermissionDenied`] naming who could write `dir` and
+/// the `chmod` that fixes it, or that `dir` is not a directory; I/O
+/// errors if it cannot be opened.
+pub fn refuse_writable_dir(dir: &Path) -> io::Result<()> {
+    refuse_writable_dir_with(dir, &accounts::owners_alone)
+}
+
+/// [`refuse_writable_dir`], with `owners_alone` deciding a group-writable
+/// directory.
+fn refuse_writable_dir_with(dir: &Path, owners_alone: GroupProof<'_>) -> io::Result<()> {
+    let opened = rustix::fs::open(
+        dir,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|why| {
+        if why == rustix::io::Errno::LOOP {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is a symlink (a symlink is refused too)", dir.display()),
+            )
+        } else {
+            why.into()
+        }
+    })?;
+    let meta = fs::File::from(opened).metadata()?;
+    if !meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not a directory", dir.display()),
+        ));
+    }
+    if meta.mode() & 0o002 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} can be written by group or others (fix: chmod go-w {})",
+                dir.display(),
+                dir.display()
+            ),
+        ));
+    }
+    if meta.mode() & 0o020 != 0
+        && let Err(not_alone) = owners_alone(meta.gid(), meta.uid())
+    {
+        return Err(group_write_refused(dir, meta.gid(), &not_alone));
     }
     Ok(())
 }
@@ -795,9 +921,76 @@ mod tests {
         // Others cannot rename or remove what they do not own in it.
         fs::set_permissions(&open, fs::Permissions::from_mode(0o1777)).unwrap();
         check_ancestors(&path, me).unwrap();
-        // Writable by the group only is refused too.
+        // Writable by a group with another account in it is refused too.
         fs::set_permissions(&open, fs::Permissions::from_mode(0o770)).unwrap();
-        check_ancestors(&path, me).unwrap_err();
+        check_ancestors_with(&path, me, &NOT_ALONE).unwrap_err();
+    }
+
+    /// A group proof that answers yes, and one that answers no: each
+    /// case below gets its answer, whatever this system's accounts say.
+    const ALONE: fn(u32, u32) -> Result<(), String> = |_, _| Ok(());
+    const NOT_ALONE: fn(u32, u32) -> Result<(), String> =
+        |_, _| Err("it lists bob (uid 1001)".to_owned());
+
+    /// 0775, Ubuntu's mode for what a user makes: the proof decides.
+    /// 0777: others can write, refused whatever the proof says.
+    #[test]
+    fn a_0775_directory_passes_on_the_proof_and_0777_never() {
+        let (tmp, me) = tempdir();
+        let shared = tmp.path().join("shared");
+        mkdir(&shared, 0o775);
+        let path = shared.join("daemon.sock");
+        let real = fs::canonicalize(&shared).unwrap();
+        assert_eq!(
+            check_ancestors_with(&path, me, &ALONE).unwrap(),
+            real.join("daemon.sock")
+        );
+        let gid = fs::metadata(&shared).unwrap().gid();
+        let err = check_ancestors_with(&path, me, &NOT_ALONE).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        let why = format!(
+            "{} can be written by group {gid}, which is not its owner's alone (it lists bob (uid 1001))",
+            real.display()
+        );
+        assert!(err.to_string().contains(&why), "{err}");
+        assert!(
+            err.to_string()
+                .contains(&format!("(fix: chmod g-w {})", real.display())),
+            "{err}"
+        );
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        let err = check_ancestors_with(&path, me, &ALONE).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("can be written by others, and has no sticky bit"),
+            "{err}"
+        );
+    }
+
+    /// The proof is asked about a group-writable directory only, about its
+    /// own group and owner, and not when another user owns it.
+    #[test]
+    fn the_proof_is_asked_about_the_directory_s_own_group_and_owner() {
+        let (tmp, me) = tempdir();
+        // The temp directory's own mode is the umask's: set it, so only the
+        // directory made below it is group-writable.
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let shared = tmp.path().join("shared");
+        mkdir(&shared, 0o770);
+        let meta = fs::metadata(&shared).unwrap();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let ask = |gid: u32, owner: u32| {
+            asked.borrow_mut().push((gid, owner));
+            Ok(())
+        };
+        check_ancestors_with(&shared.join("x"), me, &ask).unwrap();
+        assert_eq!(*asked.borrow(), [(meta.gid(), meta.uid())]);
+        // Seen by another account, the owner check refuses first.
+        if me != 0 {
+            asked.borrow_mut().clear();
+            check_ancestors_with(&shared.join("x"), me + 1, &ask).unwrap_err();
+            assert!(asked.borrow().is_empty(), "{:?}", asked.borrow());
+        }
     }
 
     /// A group-writable ancestor is refused whatever the sticky bit does:
@@ -810,16 +1003,19 @@ mod tests {
         mkdir(&open, 0o700);
         mkdir(&open.join("private"), 0o700);
         let path = open.join("private/daemon.sock");
-        // 01770 and 02770: sticky, group-writable, others clear.
+        // 01770 and 02770: sticky, group-writable, others clear. Without
+        // the proof the sticky bit excuses nothing; with it they pass, as
+        // 0770 does.
         for mode in [0o1770, 0o2770] {
             fs::set_permissions(&open, fs::Permissions::from_mode(mode)).unwrap();
-            let err = check_ancestors(&path, me).unwrap_err();
+            let err = check_ancestors_with(&path, me, &NOT_ALONE).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
             assert!(
                 err.to_string()
                     .contains("the sticky bit does not excuse a group"),
                 "{err}"
             );
+            check_ancestors_with(&path, me, &ALONE).unwrap();
         }
         // The `/tmp` shape keeps passing: 01777 is sticky, g+w and o+w.
         fs::set_permissions(&open, fs::Permissions::from_mode(0o1777)).unwrap();
@@ -1115,25 +1311,42 @@ mod tests {
         0o100_000 | bits
     }
 
+    /// The descriptor checks of a file of mode `mode`, owner `uid` and
+    /// group 501, read by account `me`, with `owners_alone` as the proof.
+    fn checks(
+        mode: u32,
+        uid: u32,
+        me: u32,
+        secret: bool,
+        owners_alone: GroupProof<'_>,
+    ) -> io::Result<()> {
+        let stat = Fstat {
+            mode,
+            uid,
+            gid: 501,
+        };
+        ensure_file_checks(&stat, me, secret, Path::new("key"), owners_alone)
+    }
+
     #[test]
     fn a_file_owned_by_this_account_or_root_passes_the_descriptor_checks() {
-        ensure_file_checks(file_mode(0o600), 501, 501, true, Path::new("key")).unwrap();
-        ensure_file_checks(file_mode(0o644), 501, 501, false, Path::new("key")).unwrap();
+        checks(file_mode(0o600), 501, 501, true, &NOT_ALONE).unwrap();
+        checks(file_mode(0o644), 501, 501, false, &NOT_ALONE).unwrap();
     }
 
     /// A file owned by root passes: a service manager that holds the keys
     /// at root-owned files is normal.
     #[test]
     fn a_root_owned_file_passes_the_descriptor_checks() {
-        ensure_file_checks(file_mode(0o600), 0, 501, true, Path::new("key")).unwrap();
-        ensure_file_checks(file_mode(0o644), 0, 501, false, Path::new("key")).unwrap();
+        checks(file_mode(0o600), 0, 501, true, &NOT_ALONE).unwrap();
+        checks(file_mode(0o644), 0, 501, false, &NOT_ALONE).unwrap();
     }
 
     /// The owner check is what keeps a secret another account holds -
     /// and can replace at will - out, whatever its mode.
     #[test]
     fn a_file_owned_by_another_account_is_refused() {
-        let err = ensure_file_checks(file_mode(0o644), 502, 501, false, Path::new("key"))
+        let err = checks(file_mode(0o644), 502, 501, false, &ALONE)
             .unwrap_err()
             .to_string();
         assert!(err.contains("owned by another user"), "{err}");
@@ -1141,7 +1354,7 @@ mod tests {
 
     #[test]
     fn a_file_that_is_not_a_file_is_refused() {
-        let err = ensure_file_checks(0o040_700, 501, 501, true, Path::new("key"))
+        let err = checks(0o040_700, 501, 501, true, &ALONE)
             .unwrap_err()
             .to_string();
         assert!(err.contains("is not a file"), "{err}");
@@ -1149,16 +1362,70 @@ mod tests {
 
     #[test]
     fn a_group_readable_secret_is_refused_and_a_group_writable_shared_file_is_refused() {
-        let err = ensure_file_checks(file_mode(0o640), 501, 501, true, Path::new("key"))
+        // A secret stays its owner's to read, whatever the group proof says.
+        let err = checks(file_mode(0o640), 501, 501, true, &ALONE)
             .unwrap_err()
             .to_string();
         assert!(err.contains("read by group or others"), "{err}");
-        let err = ensure_file_checks(file_mode(0o664), 501, 501, false, Path::new("key"))
+        let err = checks(file_mode(0o664), 501, 501, false, &NOT_ALONE)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "key can be written by group 501, which is not its owner's alone (it lists bob (uid 1001)) (fix: chmod g-w key)"
+        );
+        // A 0644 shared file passes: the others may read what is public.
+        checks(file_mode(0o644), 501, 501, false, &NOT_ALONE).unwrap();
+    }
+
+    /// A 0664 shared file, what `ticket-key > old.pub` saves under umask
+    /// 002, passes when its group is its owner's alone; 0666 never does.
+    #[test]
+    fn a_0664_shared_file_passes_on_the_proof_and_0666_never() {
+        checks(file_mode(0o664), 501, 501, false, &ALONE).unwrap();
+        let err = checks(file_mode(0o666), 501, 501, false, &ALONE)
             .unwrap_err()
             .to_string();
         assert!(err.contains("written by group or others"), "{err}");
-        // A 0644 shared file passes: the others may read what is public.
-        ensure_file_checks(file_mode(0o644), 501, 501, false, Path::new("key")).unwrap();
+        // The proof is asked about the file's own group and owner.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let ask = |gid: u32, owner: u32| {
+            asked.borrow_mut().push((gid, owner));
+            Ok(())
+        };
+        checks(file_mode(0o664), 0, 501, false, &ask).unwrap();
+        assert_eq!(*asked.borrow(), [(501, 0)]);
+    }
+
+    /// The data directory, on a descriptor of its own: 0775 on the proof,
+    /// 0777 never, and a symlink or a file refused at the open.
+    #[test]
+    fn a_writable_data_directory_is_refused_on_its_own_descriptor() {
+        let (tmp, _) = tempdir();
+        let data = tmp.path().join("data");
+        mkdir(&data, 0o700);
+        refuse_writable_dir_with(&data, &NOT_ALONE).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o775)).unwrap();
+        refuse_writable_dir_with(&data, &ALONE).unwrap();
+        let err = refuse_writable_dir_with(&data, &NOT_ALONE).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("which is not its owner's alone (it lists bob (uid 1001))"),
+            "{err}"
+        );
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o777)).unwrap();
+        let err = refuse_writable_dir_with(&data, &ALONE).unwrap_err();
+        assert!(
+            err.to_string().contains("written by group or others"),
+            "{err}"
+        );
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&data, tmp.path().join("link")).unwrap();
+        let err = refuse_writable_dir_with(&tmp.path().join("link"), &ALONE).unwrap_err();
+        assert!(err.to_string().contains("is a symlink"), "{err}");
+        fs::write(tmp.path().join("file"), b"").unwrap();
+        let err = refuse_writable_dir_with(&tmp.path().join("file"), &ALONE).unwrap_err();
+        assert!(err.to_string().contains("is not a directory"), "{err}");
     }
 
     /// The whole path of [`read_secret_file`]: a private file reads back

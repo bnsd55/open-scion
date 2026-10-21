@@ -19,7 +19,7 @@ marked supported here.
 
 | Component | OS | Arch | Data filesystem | Postgres | Status | CI job | Why |
 |---|---|---|---|---|---|---|---|
-| scion-server | Linux | x64 | ext4 | — | supported | `test` (ci.yml) | The default runner disk; the whole workspace suite runs on it |
+| scion-server | Linux | x64 | ext4 | — | supported | `test` (ci.yml) | The default runner disk; the whole workspace suite runs on it, and again under umask 002 (`test-umask-002`), the default of a Debian, Ubuntu or Fedora account |
 | scion-server | Linux | x64 | ext4 | 17 | supported | `test-postgres` (ci.yml) | The Postgres-backed suite, native `postgres:17.11` service, plus the takeover drill |
 | scion-server | Linux | x64 | tmpfs | — | supported | `test` (ci.yml) | The `disk_full` step fills a real tmpfs (`SCION_DISK_REQUIRE=1`) |
 | scion-server | Linux | arm64 | ext4 | — | best effort | — | The code has no arch pins, but no native job runs it yet; hosted `ubuntu-24.04-arm` is free for public repos |

@@ -242,7 +242,10 @@ mod tests {
     fn a_certificate_the_group_or_others_can_write_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let (cert, key) = pem_files(&dir);
-        std::fs::set_permissions(&cert, fs::Permissions::from_mode(0o664)).unwrap();
+        // Others can write it: refused on every system. A 0664 file is the
+        // group proof's to decide (runtime::auth): a group that is its
+        // owner's alone passes.
+        std::fs::set_permissions(&cert, fs::Permissions::from_mode(0o666)).unwrap();
         let err = match ServerTls::load(&cert, &key, None) {
             Ok(_) => panic!("a group-writable certificate is accepted"),
             Err(err) => err.to_string(),
