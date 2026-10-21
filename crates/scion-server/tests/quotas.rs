@@ -135,6 +135,7 @@ async fn server_with_tickets(
         access,
         service::ServeOptions {
             data: dir.to_path_buf(),
+            audit: scion_server::test_support::audit::Audit::off(),
             limits: Limits::default(),
             quotas,
             pending_lands: None,
@@ -147,11 +148,7 @@ async fn server_with_tickets(
             stopped.await.ok();
         },
     ));
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(&format!("http://{addr}")).await.unwrap();
     (stop, channel)
 }
 
@@ -587,3 +584,6 @@ async fn a_get_objects_stream_holds_its_principals_slot() {
     .await;
     stop.send(()).ok();
 }
+
+#[path = "common/mod.rs"]
+mod common;

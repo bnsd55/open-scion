@@ -35,6 +35,10 @@ thread_local! {
     pub(crate) static CHANGESET_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "test_support/db.rs"]
+pub(crate) mod test_hooks;
+
 /// The transaction handle of the SQLite [`Store`](crate::store::Store): a
 /// reader, or the write connection inside one transaction. The queries of
 /// the shared tables are its [`MetaTx`] methods.
@@ -126,14 +130,6 @@ pub(crate) fn fill_repo_blobs(c: &Connection) -> Result<(u64, u64)> {
         "schema 4: added each repo's blobs"
     );
     Ok((read, added))
-}
-
-/// The error of a graph walk that reached its bound.
-#[cfg(any(test, feature = "test-hooks"))]
-fn too_deep(max_visits: usize) -> Error {
-    Error::ResourceExhausted(format!(
-        "the history is too deep: the answer needs more than {max_visits} changesets"
-    ))
 }
 
 /// Reads a tree's rows and checks them against its ID.
@@ -413,7 +409,7 @@ impl MetaTx for SqliteTx<'_> {
                 continue;
             }
             if seen.len() > max_visits {
-                return Err(too_deep(max_visits));
+                return Err(test_hooks::too_deep(max_visits));
             }
             stack.extend(self.parents(id, id_gen)?);
         }
@@ -467,6 +463,18 @@ impl MetaTx for SqliteTx<'_> {
             ).map_err(crate::error::from_sqlite)?,
         };
         Ok(changed == 1)
+    }
+
+    fn restore_ref(&mut self, repo: RepoId, name: &str, target: &[u8], version: i64) -> Result<()> {
+        self.0
+            .prepare_cached(
+                "INSERT OR REPLACE INTO refs (repo_id, name, target, version) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .map_err(crate::error::from_sqlite)?
+            .execute(params![repo.0, name, target, version])
+            .map_err(crate::error::from_sqlite)?;
+        Ok(())
     }
 
     /// The stored bytes of a derived value, if computed.
@@ -881,9 +889,11 @@ impl MetaTx for SqliteTx<'_> {
             .transpose()
             .map_err(|e| Error::Corrupt(format!("land {land_id} result: {e}")))?;
         Ok(LandOutcome {
+            moved: false,
             land_id,
             state: LandState::parse(&state)?,
             result,
+            previous: None,
             detail,
             conflict_paths: decode_paths(&paths)
                 .ok_or_else(|| Error::Corrupt(format!("land {land_id} conflict paths")))?,
@@ -903,8 +913,8 @@ impl MetaTx for SqliteTx<'_> {
         let updated = self
             .0
             .prepare_cached(
-                "UPDATE lands SET state = ?3, result_cs = ?4, detail = ?5, conflict_paths = ?6,
-                     finished_at = unixepoch()
+                "UPDATE lands SET state = ?3, result_cs = ?4, detail = ?5,
+                     conflict_paths = ?6, finished_at = unixepoch()
                  WHERE repo_id = ?1 AND land_id = ?2 AND state = 'pending'",
             )
             .map_err(crate::error::from_sqlite)?
@@ -923,9 +933,11 @@ impl MetaTx for SqliteTx<'_> {
             )));
         }
         Ok(LandOutcome {
+            moved: false,
             land_id,
             state,
             result,
+            previous: None,
             detail,
             conflict_paths,
         })
@@ -1052,6 +1064,64 @@ impl MetaTx for SqliteTx<'_> {
             .map_err(crate::error::from_sqlite)?;
         let rows = stmt
             .query_map(params![repo.0], |row| row.get(0))
+            .map_err(crate::error::from_sqlite)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(crate::error::from_sqlite)
+    }
+
+    fn repo_changesets_with_bodies(
+        &mut self,
+        repo: RepoId,
+    ) -> Result<Vec<(Vec<u8>, i64, Vec<u8>)>> {
+        let mut stmt = self
+            .0
+            .prepare_cached(
+                "SELECT c.id, c.gen, c.body FROM repo_changesets r \
+                 JOIN changesets c ON c.id = r.cs WHERE r.repo_id = ?1 ORDER BY c.gen, c.id",
+            )
+            .map_err(crate::error::from_sqlite)?;
+        let rows = stmt
+            .query_map(params![repo.0], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(crate::error::from_sqlite)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(crate::error::from_sqlite)
+    }
+
+    fn list_refs(&mut self, repo: RepoId) -> Result<Vec<(String, Vec<u8>, i64)>> {
+        let mut stmt = self
+            .0
+            .prepare_cached(
+                "SELECT name, target, version FROM refs WHERE repo_id = ?1 ORDER BY name",
+            )
+            .map_err(crate::error::from_sqlite)?;
+        let rows = stmt
+            .query_map(params![repo.0], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(crate::error::from_sqlite)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(crate::error::from_sqlite)
+    }
+
+    fn pending_lands(&mut self, repo: RepoId) -> Result<Vec<crate::meta::PendingLand>> {
+        let mut stmt = self
+            .0
+            .prepare_cached(
+                "SELECT caller, request_key, target_ref, input_cs FROM lands \
+                 WHERE repo_id = ?1 AND state = 'pending' ORDER BY land_id",
+            )
+            .map_err(crate::error::from_sqlite)?;
+        let rows = stmt
+            .query_map(params![repo.0], |row| {
+                Ok(crate::meta::PendingLand {
+                    caller: row.get(0)?,
+                    request_key: row.get(1)?,
+                    target_ref: row.get(2)?,
+                    input_cs: row.get(3)?,
+                })
+            })
             .map_err(crate::error::from_sqlite)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(crate::error::from_sqlite)

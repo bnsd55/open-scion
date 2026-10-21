@@ -19,6 +19,7 @@ use scion_proto::v1::{GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectR
 use scion_server::Keys;
 use scion_server::{Backend, test_support::service};
 use scion_tier::{CACHE_UPSTREAM_TIMEOUT, DAEMON_UPSTREAM_TIMEOUT, DiskStore, MemoryStore, Tier};
+use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
@@ -36,6 +37,8 @@ type Client = ObjectsClient<InterceptedService<Channel, Bearer>>;
 async fn token_client(url: &str) -> Client {
     let channel = Endpoint::from_shared(url.to_owned())
         .unwrap()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
         .connect()
         .await
         .unwrap();
@@ -85,6 +88,7 @@ fn start_stack(
             TOKEN,
             service::ServeOptions {
                 data,
+                audit: scion_server::test_support::audit::Audit::off(),
                 limits: Limits::default(),
                 quotas: scion_server::Quotas::off(),
                 pending_lands: None,

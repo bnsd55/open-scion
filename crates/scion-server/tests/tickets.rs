@@ -80,6 +80,7 @@ async fn server() -> (
         TOKEN,
         service::ServeOptions {
             data: dir.path().to_path_buf(),
+            audit: scion_server::test_support::audit::Audit::off(),
             limits: Limits::default(),
             quotas: scion_server::Quotas::off(),
             pending_lands: None,
@@ -92,11 +93,7 @@ async fn server() -> (
             stopped.await.ok();
         },
     ));
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(&format!("http://{addr}")).await.unwrap();
     (
         ObjectsClient::with_interceptor(channel, Bearer::new(TOKEN).unwrap()),
         keys,
@@ -318,6 +315,7 @@ async fn server_of_readme() -> (
         TOKEN,
         service::ServeOptions {
             data: dir.path().to_path_buf(),
+            audit: scion_server::test_support::audit::Audit::off(),
             limits: Limits::default(),
             quotas: scion_server::Quotas::off(),
             pending_lands: None,
@@ -368,9 +366,7 @@ async fn a_cache_without_a_token_fetches_over_a_ticket() {
 
     // The caller holds the CACHE's token (the tier's own door), but has no
     // token of the SERVER anywhere.
-    let channel = tonic::transport::Channel::from_shared(format!("http://{cache_addr}"))
-        .unwrap()
-        .connect()
+    let channel = common::channel(&format!("http://{cache_addr}"))
         .await
         .unwrap();
     let mut tier = ObjectsClient::with_interceptor(channel, Bearer::new(TOKEN).unwrap());
@@ -384,9 +380,7 @@ async fn a_cache_without_a_token_fetches_over_a_ticket() {
         .await
         .unwrap_err();
     assert_eq!(status.code(), Code::Unimplemented, "{status:?}");
-    let channel = tonic::transport::Channel::from_shared(format!("http://{server_addr}"))
-        .unwrap()
-        .connect()
+    let channel = common::channel(&format!("http://{server_addr}"))
         .await
         .unwrap();
     let mut server = ObjectsClient::with_interceptor(channel, Bearer::new(TOKEN).unwrap());
@@ -560,6 +554,7 @@ async fn tiers() -> (Tiers, tokio::sync::oneshot::Sender<()>, tempfile::TempDir)
         TOKEN,
         service::ServeOptions {
             data: dir.path().to_path_buf(),
+            audit: scion_server::test_support::audit::Audit::off(),
             limits: Limits::default(),
             quotas: scion_server::Quotas::off(),
             pending_lands: None,
@@ -592,9 +587,9 @@ async fn tiers() -> (Tiers, tokio::sync::oneshot::Sender<()>, tempfile::TempDir)
         std::future::pending(),
     ));
 
-    let connect = |url: String| async {
+    let connect = |url: String| async move {
         ObjectsClient::with_interceptor(
-            Channel::from_shared(url).unwrap().connect().await.unwrap(),
+            common::channel(&url).await.unwrap(),
             Bearer::new(TOKEN).unwrap(),
         )
     };

@@ -58,9 +58,11 @@
 //! enabling it in a build is at the user's own risk.
 
 pub(crate) mod access;
+pub(crate) mod audit;
 pub(crate) mod auth;
 pub(crate) mod backend;
 pub use backend::Backend;
+pub mod archive;
 pub(crate) mod blame;
 pub(crate) mod db;
 pub(crate) mod deadline;
@@ -69,6 +71,9 @@ pub(crate) mod error;
 // These two are API, not implementation: a server main runs them by hand,
 // and docs/operations.md documents both. Everything else in the list is
 // an implementation detail of the two binaries, however public it looks.
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "test_support/docs.rs"]
+pub(crate) mod docs_hooks;
 pub mod fsck;
 pub mod gc;
 pub(crate) mod graph;
@@ -106,9 +111,89 @@ pub mod test_support {
     pub mod auth {
         pub use crate::auth::Caller;
     }
+    /// The audit log: a real file, or the off handle, and the fault
+    /// hook that makes the next appends fail.
+    pub mod audit {
+        #[allow(unreachable_pub)]
+        pub use crate::audit::{Audit, Event};
+    }
     /// The blame operation behind the `Blame` RPC, with its limits.
     pub mod blame {
         pub use crate::blame::*;
+    }
+    /// The archive section readers: any bytes in their files end in a
+    /// verdict or a refusal, never a panic. Wrappers, because the readers
+    /// are pub(crate) helpers of the public `verify` and `restore`.
+    pub mod archive {
+        use std::path::Path;
+
+        type Changesets = Vec<(scion_core::ChangesetId, i64, Vec<u8>)>;
+
+        /// Reads the changeset frames of `path`.
+        ///
+        /// # Errors
+        ///
+        /// Why the bytes are not the changesets' length-framed stream.
+        #[allow(unreachable_pub)]
+        pub fn read_changesets(path: &Path) -> crate::error::Result<Changesets> {
+            crate::archive::read_changesets(path)
+        }
+
+        /// Reads the blob members of `path`.
+        ///
+        /// # Errors
+        ///
+        /// Why a line of the file is not a blob id.
+        #[allow(unreachable_pub)]
+        pub fn read_members(path: &Path) -> crate::error::Result<Vec<scion_core::BlobId>> {
+            crate::archive::read_members(path)
+        }
+
+        /// Reads the ref rows of `path`.
+        ///
+        /// # Errors
+        ///
+        /// Why the JSON is not an array of ref rows.
+        #[allow(unreachable_pub)]
+        pub fn read_refs(
+            path: &Path,
+        ) -> crate::error::Result<Vec<(String, scion_core::ChangesetId, i64)>> {
+            crate::archive::read_refs(path)
+        }
+
+        /// The rows, as a count: the land rows name crate-private types,
+        /// and the caller only needs the verdict.
+        ///
+        /// # Errors
+        ///
+        /// Why the JSON is not an array of land rows.
+        #[allow(unreachable_pub)]
+        pub fn read_lands(path: &Path) -> crate::error::Result<usize> {
+            crate::archive::read_lands(path).map(|rows| rows.len())
+        }
+
+        /// The rows, as a count: a provenance row names a type of a
+        /// private dependency, and the caller only needs the verdict.
+        ///
+        /// # Errors
+        ///
+        /// Why the JSON is not an array of provenance rows.
+        #[allow(unreachable_pub)]
+        pub fn read_provenance(path: &Path) -> crate::error::Result<usize> {
+            crate::archive::read_provenance(path).map(|rows| rows.len())
+        }
+
+        /// The manifest, as its top-level fields' count: `serde_json` is
+        /// not a dependency of the fuzz crate, so the value stays inside.
+        ///
+        /// # Errors
+        ///
+        /// Why the file is not a scion archive's manifest.
+        #[allow(unreachable_pub)]
+        pub fn read_manifest(archive: &Path) -> crate::error::Result<usize> {
+            crate::archive::read_manifest(archive)
+                .map(|value| value.as_object().map_or(0, serde_json::Map::len))
+        }
     }
     /// The per-call deadline every long operation stops at.
     pub mod deadline {
@@ -152,7 +237,7 @@ pub mod test_support {
     }
     /// The counters the import tests read between retries.
     pub mod import {
-        pub use crate::import::{BUSY_TRIES, CHECKS};
+        pub use crate::import::{BUSY_TRIES, CHECKS, STRUCTURE_CAPS};
     }
     /// The land operation: its queue, requests and outcomes.
     pub mod land {
@@ -178,6 +263,11 @@ pub mod test_support {
     pub mod store {
         pub use crate::store::*;
     }
+    /// The guide's own commands, so a Proof's test runs the block under
+    /// its runbook's heading instead of retyping it.
+    pub mod docs {
+        pub use crate::docs_hooks::*;
+    }
     /// Tree apply and the per-changeset root tree.
     pub mod tree {
         pub use crate::tree::*;
@@ -202,5 +292,9 @@ pub use import::{ImportOptions, ImportReport, import_git};
 pub use quotas::Quotas;
 pub use scion_proto::runtime::metrics::Metrics;
 pub use service::{ServeOptions, serve};
+// `ServeOptions` is public and holds the audit handle, so the handle is
+// public too; unreachable_pub does not see through the re-export.
+#[allow(unreachable_pub)]
+pub use audit::{Audit, Event};
 pub use tickets::Keys;
 pub use tree::{RootTree, backfill_root_tree};

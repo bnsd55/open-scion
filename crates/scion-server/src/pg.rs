@@ -22,6 +22,8 @@
 //!   twice, and the newest land holds the largest one.
 
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-hooks"))]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
@@ -47,6 +49,10 @@ use crate::land::{
 };
 use crate::meta::{FsckDerivedRow, Meta, MetaTx, RefState, RepoChangeset, RepoId};
 use crate::store::Blobs;
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "test_support/pg.rs"]
+pub(crate) mod test_hooks;
 
 /// The schema version this build makes and reads.
 pub(crate) const PG_SCHEMA_VERSION: u32 = 4;
@@ -117,6 +123,7 @@ impl Fence {
 
 /// Handle to one Postgres database. Cheap to clone.
 #[derive(Clone)]
+
 pub(crate) struct Pg {
     inner: Arc<PgInner>,
 }
@@ -146,7 +153,7 @@ struct PgInner {
     /// The import's test hooks and busy-retry count, as the SQLite store
     /// keeps its own.
     #[cfg(any(test, feature = "test-hooks"))]
-    hooks: crate::store::ImportHooks,
+    hooks: crate::store::test_hooks::ImportHooks,
     /// The operator metrics, set once by the server before it serves: a
     /// commit's wait for the collector's advisory key records how long
     /// it waited. Empty in import, fsck and gc, which export none.
@@ -590,30 +597,6 @@ impl PgClient {
         Self { jobs }
     }
 
-    /// Runs one closure with the client on the worker thread. The sync
-    /// client must never be touched from a tokio thread, which this
-    /// keeps true for the few setup statements a caller needs. Only the
-    /// test schema's preparation calls it.
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn as_raw(&self, f: impl FnOnce(&mut Client) -> Result<()> + Send + 'static) -> Result<()> {
-        let (reply, rx) = std::sync::mpsc::channel();
-        self.jobs
-            .send(Job {
-                sql: String::new(),
-                params: Vec::new(),
-                kind: Kind::Raw,
-                reply,
-                raw: Some(Box::new(f)),
-            })
-            .map_err(|_| Error::Corrupt("the database worker stopped".into()))?;
-        match rx.recv() {
-            Ok(Ok(Reply::Count(_))) => Ok(()),
-            Ok(Ok(_)) => unreachable!("a raw job replies with a count"),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(Error::Corrupt("the database worker stopped".into())),
-        }
-    }
-
     /// Runs one statement and waits for its reply.
     fn ask(&self, sql: &str, params: Vec<Param>, kind: Kind) -> Result<Reply> {
         let (reply, rx) = std::sync::mpsc::channel();
@@ -659,64 +642,6 @@ impl PgClient {
         }
     }
 }
-
-/// Drops the test schemas whose tests ended minutes ago: a test run
-/// leaves them behind, because a server holds its schema while it runs.
-/// One process at a time holds the cleanup lock, so the test binaries
-/// that run in parallel clean nothing under each other's feet. A schema
-/// whose owner still runs is named in `pg_stat_activity` under its
-/// `application_name`, and registered with its start time, so the
-/// schema of a test that just began is never dropped.
-#[cfg(any(test, feature = "test-hooks"))]
-fn drop_stale_schemas(maker: &PgClient) {
-    let got = maker.query_opt("SELECT pg_try_advisory_lock($1)", &[P::i64(CLEAN_LOCK)]);
-    let Ok(got) = got else {
-        // This connection cannot even ask: another open's cleanup runs, or
-        // the database is in trouble. The next open tries again.
-        return;
-    };
-    // The answer is a row that holds the verdict: a `false` row means
-    // another cleanup runs, and this one stands down.
-    if !got.is_some_and(|row| row.get::<_, bool>(0)) {
-        return;
-    }
-    // The registry names every test schema with its start time, in
-    // `public`, spelled in full: the maker's search path is the
-    // database's default, and no test schema holds the table.
-    if let Ok(rows) = maker.query(
-        "SELECT r.schema FROM public.scion_test_schemas AS r
-         JOIN pg_catalog.pg_namespace AS n ON n.nspname = r.schema
-         WHERE r.started < extract(epoch from now())::bigint - 600
-           AND r.schema NOT IN (
-               SELECT application_name FROM pg_catalog.pg_stat_activity
-               WHERE application_name LIKE 'scion_test_%')",
-        &[],
-    ) {
-        for row in rows {
-            let name: String = row.get(0);
-            // Only the names this backend makes: no other schema drops,
-            // whatever a row of the registry names.
-            if !name.starts_with("scion_test_") {
-                continue;
-            }
-            if let Err(why) = maker.batch(&format!(
-                "DROP SCHEMA IF EXISTS {name} CASCADE;
-                 DELETE FROM public.scion_test_schemas WHERE schema = '{name}'"
-            )) {
-                tracing::warn!(schema = %name, error = %why, "cannot drop a stale test schema");
-            }
-        }
-    }
-    // The lock frees when this connection closes: a failed unlock needs
-    // nothing but the drop of the maker.
-    if let Err(why) = maker.query_opt("SELECT pg_advisory_unlock($1)", &[P::i64(CLEAN_LOCK)]) {
-        tracing::warn!(error = %why, "cannot unlock the test-schema cleanup");
-    }
-}
-
-/// The advisory lock of the test-schema cleanup.
-#[cfg(any(test, feature = "test-hooks"))]
-const CLEAN_LOCK: i64 = 0x5343_494F_4E53_5445;
 
 /// The libpq options of every connection of this backend. The commit of
 /// a transaction reaches the drive before it returns, and no statement
@@ -780,44 +705,6 @@ impl Pg {
         marker: Marker,
     ) -> Result<Self> {
         Self::open_in(url, ca, readers, data, None, true, marker)
-    }
-
-    /// [`Pg::open`], in `schema` instead of the database's default one, for
-    /// tests: each data directory gets its own corner of one database. The
-    /// schema is created if missing, and the migrations run in it.
-    ///
-    /// # Errors
-    ///
-    /// As [`Pg::open`].
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn open_test(
-        url: &str,
-        schema: &str,
-        readers: usize,
-        data: &Path,
-        marker: Marker,
-    ) -> Result<Self> {
-        prepare_test_schema(url, schema)?;
-        // The test store is the one server of its schema: it takes the
-        // per-schema one-server lock, and its loss fences the process,
-        // exactly as a serve does on the database key.
-        Self::open_in(url, None, readers, data, Some(schema), true, marker)
-    }
-
-    /// [`Pg::open_test`], as a process that does not land: it makes the
-    /// schema the same way and takes no one-server lock, and its loss
-    /// fences nothing, like a `gc`, `fsck` or `import` beside a live
-    /// server.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn open_test_shared(
-        url: &str,
-        schema: &str,
-        readers: usize,
-        data: &Path,
-        marker: Marker,
-    ) -> Result<Self> {
-        prepare_test_schema(url, schema)?;
-        Self::open_in(url, None, readers, data, Some(schema), false, marker)
     }
 
     /// [`Pg::open`], in the search path of `schema` when it is set.
@@ -928,7 +815,7 @@ impl Pg {
             write_woken: Condvar::new(),
             derive: crate::derived::DeriveFlights::new(crate::store::DERIVE_WALKS_CAP),
             #[cfg(any(test, feature = "test-hooks"))]
-            hooks: crate::store::ImportHooks::default(),
+            hooks: crate::store::test_hooks::ImportHooks::default(),
             metrics: std::sync::OnceLock::new(),
         });
         // The probe of a server that lost its lock: once a minute the
@@ -1022,6 +909,7 @@ impl Pg {
         let (mut writer, _waiting) = self.lock_writer();
         let mut pg = PgTx {
             c: &mut writer,
+            gen_cache: std::collections::HashMap::new(),
             ended: true,
         };
         f(&mut pg)
@@ -1173,13 +1061,6 @@ impl Pg {
         &self.inner.derive
     }
 
-    /// The import's test hooks and busy-retry count.
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[must_use]
-    pub(crate) fn hooks(&self) -> &crate::store::ImportHooks {
-        &self.inner.hooks
-    }
-
     /// How many writers wait for the write client right now.
     #[cfg(test)]
     #[must_use]
@@ -1254,6 +1135,12 @@ impl Drop for PgWriteWaiter<'_> {
 #[allow(unreachable_pub)]
 pub struct PgTx<'a> {
     c: &'a mut PgClient,
+    /// The generations this transaction has already read. A changeset's
+    /// generation is fixed at insert and never updated, so one read per
+    /// transaction is one round trip saved for every later read of the
+    /// same changeset - the derived walks and the land ask for the same
+    /// few ids again and again.
+    gen_cache: std::collections::HashMap<(i64, Vec<u8>), i64>,
     /// The transaction was ended by `commit` or `rollback`; a drop then
     /// leaves the client alone.
     ended: bool,
@@ -1263,7 +1150,11 @@ impl<'a> PgTx<'a> {
     /// Begins one transaction on the client.
     fn begin(c: &'a mut PgClient) -> Result<PgTx<'a>> {
         c.execute("BEGIN", &[])?;
-        Ok(Self { c, ended: false })
+        Ok(Self {
+            c,
+            gen_cache: std::collections::HashMap::new(),
+            ended: false,
+        })
     }
 
     /// Begins one read-only transaction at repeatable read: every
@@ -1291,7 +1182,11 @@ impl<'a> PgTx<'a> {
         // drops this `PgTx`, and its Drop rolls the transaction back, so
         // the pooled client never stays inside one whose statements no
         // longer run.
-        let tx = Self { c, ended: false };
+        let tx = Self {
+            c,
+            gen_cache: std::collections::HashMap::new(),
+            ended: false,
+        };
         tx.c.execute(
             &format!("SET LOCAL statement_timeout = {}", statement.as_millis()),
             &[],
@@ -1311,6 +1206,7 @@ impl<'a> PgTx<'a> {
     pub(crate) fn reborrow(&mut self) -> PgTx<'_> {
         PgTx {
             c: self.c,
+            gen_cache: std::collections::HashMap::new(),
             ended: true,
         }
     }
@@ -1520,8 +1416,55 @@ fn run_with_retry(
     run_statement(client, job)
 }
 
+/// The statements this process has run against Postgres since the last
+/// reset. A test hook: the land round-trip guard reads the delta around
+/// one land and fails the run when it grows past the budget. The count
+/// lives on the worker thread's side, so the read crosses no lock; the
+/// guard's binary runs one measuring test, so a process-wide total is
+/// one land's count.
+#[cfg(any(test, feature = "test-hooks"))]
+static TEST_STATEMENTS: AtomicU64 = AtomicU64::new(0);
+
+/// The SQL of the statements run since the last reset, for a test that
+/// wants the kinds and not just the count.
+#[cfg(any(test, feature = "test-hooks"))]
+static TEST_STATEMENT_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The SQL of the statements run since the last reset.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn test_statement_log() -> Vec<String> {
+    TEST_STATEMENT_LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// The statement count of this process since the last reset.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn test_statement_count() -> u64 {
+    TEST_STATEMENTS.load(Ordering::Relaxed)
+}
+
+/// Sets the statement count back to zero.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn test_reset_statement_count() {
+    TEST_STATEMENTS.store(0, Ordering::Relaxed);
+    TEST_STATEMENT_LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
 /// Runs one statement of a job on the client.
 fn run_statement(client: &mut Client, job: &Job) -> Result<Reply> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    {
+        TEST_STATEMENTS.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut log) = TEST_STATEMENT_LOG.try_lock() {
+            let sql: String = job.sql.chars().take(90).collect();
+            log.push(sql.replace('\n', " "));
+        }
+    }
     let refs = as_refs(&job.params);
     match job.kind {
         Kind::Batch => client.batch_execute(&job.sql).map(|(): ()| Reply::Count(0)),
@@ -1659,12 +1602,6 @@ fn server_lock_raw(client: &mut Client, key: i64) -> bool {
         .is_ok_and(|row| row.is_some_and(|row| row.get::<_, bool>(0)))
 }
 
-/// A plain connection. Only the test schema's preparation calls it.
-#[cfg(any(test, feature = "test-hooks"))]
-fn connect(url: &str, ca: Option<&Path>) -> Result<PgClient> {
-    connect_with(url, ca, "", None)
-}
-
 /// Connects one client of `url`, with libpq `options` added. The connect
 /// runs on a plain thread: `postgres` drives its own runtime, which must
 /// not start inside the server's tokio one.
@@ -1675,6 +1612,14 @@ fn connect_with(
     schema: Option<&str>,
 ) -> Result<PgClient> {
     spawn_client(url, ca, options, schema, None, None)
+}
+
+/// Undoes the identity a failed restore's open minted in the database:
+/// a fresh store names no store, and the next open mints again. The
+/// tables the migration made stay (they are empty, and the next open's
+/// migration is idempotent); only the name goes.
+pub(crate) fn reset_identity(url: &str, ca: Option<&Path>) -> Result<()> {
+    connect_with(url, ca, "", None)?.batch("DELETE FROM store_uuid WHERE one = 1")
 }
 
 /// [`connect_with`], as the one server process of the database: the
@@ -1797,16 +1742,27 @@ fn connect_on(url: &str, ca: Option<&Path>, options: &str) -> Result<Client> {
 /// the importer retries a batch on it, and the gRPC status becomes
 /// UNAVAILABLE. The rest keep the engine's error as the source.
 fn map_pg_error(e: postgres::Error) -> Error {
+    let code = e
+        .code()
+        .map(postgres::error::SqlState::code)
+        .map(str::to_owned);
+    pg_error_of(code.as_deref(), e)
+}
+
+/// The mapping on one SQLSTATE, split from [`map_pg_error`] so a unit
+/// test can hand it a code: the `postgres` crate's error type cannot be
+/// built with a chosen one.
+fn pg_error_of(code: Option<&str>, e: postgres::Error) -> Error {
     // A connection the database dropped is as retryable as a busy one.
     if e.is_closed() {
         return Error::Storage(Storage::busy(e));
     }
-    match e.code() {
+    match code {
         // Deadlock, serialization failure, an administrative shutdown, a
         // database that starts up, a lock another writer holds.
         Some(code)
-            if matches!(code.code(), "40P01" | "40001" | "57P01" | "57P03" | "55P03")
-                || code.code().starts_with("08") =>
+            if matches!(code, "40P01" | "40001" | "57P01" | "57P03" | "55P03")
+                || code.starts_with("08") =>
         {
             tracing::warn!("the database is busy: {e}");
             Error::Storage(Storage::busy(e))
@@ -1814,18 +1770,28 @@ fn map_pg_error(e: postgres::Error) -> Error {
         // The lock or the statement waited past its clock, as a SQLite
         // write does past its busy timeout: the caller has been at it
         // too long, and the client retries past its own deadline.
-        Some(code) if code.code() == "57014" => {
+        Some("57014") => {
             tracing::warn!("the database gave the statement up: {e}");
             Error::DeadlineExceeded("the database kept the caller waiting".to_owned())
         }
         // A violation the code handles (a duplicate key, a check, a
         // foreign key) is one answer among many: it logs quietly.
-        Some(code) if code.code().starts_with("23") => {
+        Some(code) if code.starts_with("23") => {
             tracing::debug!("the database refused a statement: {e}");
             Error::Storage(Storage::internal(e))
         }
         // Out of space: the same shortage, wherever the metadata lives.
-        Some(code) if code.code() == "53100" => {
+        // 53100 is the database's one disk-full code - errcode_for_file_access
+        // maps ENOSPC to it for every file, temp files included (elog.c).
+        // The other codes of the same classes stay internal on purpose:
+        // 53200 is out of MEMORY (the fixed reply would name a disk and
+        // lie), 53000 is the class's catch-all (too vague to promise a
+        // disk answer), 53400 is a configured cap - temp_file_limit, or
+        // the replication slots - the same refusal every time, so a
+        // retry-later reply tells the client to retry what cannot
+        // succeed - and 58030 is an io_error - a failing device is the
+        // EIO row's internal, not a space shortage.
+        Some("53100") => {
             tracing::error!("the server is out of disk space: {e}");
             Error::Storage(Storage::disk_full(e))
         }
@@ -1921,6 +1887,14 @@ fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
              ({PG_SCHEMA_VERSION}); run this build's older server, or upgrade it"
         )));
     }
+    if version == PG_SCHEMA_VERSION {
+        return Ok(());
+    }
+    tracing::info!(
+        from_version = version,
+        to_version = PG_SCHEMA_VERSION,
+        "migrating the metadata schema"
+    );
     for (n, sql) in PG_MIGRATIONS.iter().enumerate() {
         let n = u32::try_from(n + 1).expect("a schema version fits in a u32");
         if n <= version {
@@ -1929,6 +1903,7 @@ fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
         // One transaction per migration, with its version bump: a
         // migration that fails rolls its own statements back, and the
         // versions before it stand.
+        let step = std::time::Instant::now();
         let mut tx = PgTx::begin(client)?;
         tx.c.batch(&format!(
             "{sql}\nINSERT INTO schema_migrations (version, name) \
@@ -1936,7 +1911,18 @@ fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
             i64::from(n)
         ))?;
         tx.commit()?;
+        tracing::info!(
+            from_version = n - 1,
+            to_version = n,
+            elapsed_ms = u64::try_from(step.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "the metadata schema migrated one step"
+        );
     }
+    tracing::info!(
+        from_version = version,
+        to_version = PG_SCHEMA_VERSION,
+        "the metadata migration is done"
+    );
     Ok(())
 }
 
@@ -1955,14 +1941,6 @@ fn load_tree(c: &PgClient, id: TreeId) -> Result<(Tree, Vec<u8>)> {
         return Err(Error::Corrupt(format!("tree {id} does not match its ID")));
     }
     Ok((tree, body))
-}
-
-/// The error of a graph walk that reached its bound.
-#[cfg(any(test, feature = "test-hooks"))]
-fn too_deep(max_visits: usize) -> Error {
-    Error::ResourceExhausted(format!(
-        "the history is too deep: the answer needs more than {max_visits} changesets"
-    ))
 }
 
 fn to_id(bytes: &[u8]) -> Result<ChangesetId> {
@@ -2015,8 +1993,33 @@ impl MetaTx for PgTx<'_> {
         // write, on both backends.
         let (body, id) = cs.encode_with_id();
         let mut parent_gen = 0;
-        for parent in cs.parents() {
-            parent_gen = parent_gen.max(self.generation(repo, *parent)?);
+        let parents: Vec<Vec<u8>> = cs
+            .parents()
+            .iter()
+            .map(|parent| id_bytes(parent.as_bytes()))
+            .collect();
+        if !parents.is_empty() {
+            // One round trip for every parent's generation, however many
+            // parents a merge has.
+            let rows = self.c.query(
+                "SELECT id, gen FROM changesets JOIN repo_changesets ON cs = id
+                 WHERE repo_id = $1 AND id = ANY($2)",
+                &[P::i64(repo.0), P::bytea_array(parents.clone())],
+            )?;
+            let gens: std::collections::HashMap<Vec<u8>, i64> = rows
+                .into_iter()
+                .map(|row| (row.get::<_, Vec<u8>>(0), row.get::<_, i64>(1)))
+                .collect();
+            for (parent, key) in cs.parents().iter().zip(&parents) {
+                // A repeated parent reads the same row twice; `get`, not
+                // `remove`, so parents [X, X] store like they did when
+                // each parent was its own statement.
+                let parent_gen_i = *gens
+                    .get(key)
+                    .ok_or_else(|| Error::NotFound(format!("changeset {parent}")))?;
+                parent_gen = parent_gen.max(parent_gen_i);
+                self.gen_cache.insert((repo.0, key.clone()), parent_gen_i);
+            }
         }
         self.c.execute(
             "INSERT INTO changesets (id, gen, body) VALUES ($1, $2, $3)
@@ -2027,14 +2030,17 @@ impl MetaTx for PgTx<'_> {
                 P::bytes(&body),
             ],
         )?;
-        for (n, parent) in (0_i64..).zip(cs.parents()) {
+        // Every parent as one statement, however many a merge has: the
+        // row number is the parent's place in the array.
+        if !parents.is_empty() {
             self.c.execute(
-                "INSERT INTO changeset_parents (cs, n, parent) VALUES ($1, $2, $3)
+                "INSERT INTO changeset_parents (cs, n, parent)
+                 SELECT $1, ord, parent
+                 FROM unnest($2::bytea[]) WITH ORDINALITY AS parents(parent, ord)
                  ON CONFLICT (cs, n) DO NOTHING",
                 &[
                     P::bytes(&id_bytes(id.as_bytes())),
-                    P::i64(n),
-                    P::bytes(&id_bytes(parent.as_bytes())),
+                    P::bytea_array(parents.clone()),
                 ],
             )?;
         }
@@ -2055,6 +2061,22 @@ impl MetaTx for PgTx<'_> {
             &[P::i64(repo.0), P::bytes(&id_bytes(blob.as_bytes()))],
         )?;
         Ok(added == 1)
+    }
+
+    /// Adds every blob as one statement, however many the changeset
+    /// puts.
+    fn add_repo_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<()> {
+        if blobs.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<Vec<u8>> = blobs.iter().map(|blob| id_bytes(blob.as_bytes())).collect();
+        self.c.execute(
+            "INSERT INTO repo_blobs (repo_id, blob)
+             SELECT $1, x FROM unnest($2::bytea[]) AS x
+             ON CONFLICT (repo_id, blob) DO NOTHING",
+            &[P::i64(repo.0), P::bytea_array(ids)],
+        )?;
+        Ok(())
     }
 
     /// Whether `repo` may name `blob`.
@@ -2111,14 +2133,23 @@ impl MetaTx for PgTx<'_> {
     ///
     /// [`Error::NotFound`] if `repo` does not have it.
     fn generation(&mut self, repo: RepoId, id: ChangesetId) -> Result<i64> {
-        self.c
+        let key = (repo.0, id_bytes(id.as_bytes()));
+        if let Some(cached) = self.gen_cache.get(&key) {
+            return Ok(*cached);
+        }
+        let found = self
+            .c
             .query_opt(
                 "SELECT gen FROM changesets JOIN repo_changesets ON cs = id
                  WHERE repo_id = $1 AND id = $2",
-                &[P::i64(repo.0), P::bytes(&id_bytes(id.as_bytes()))],
+                &[P::i64(repo.0), P::bytes(&key.1)],
             )?
             .map(|row| row.get::<_, i64>(0))
-            .ok_or_else(|| Error::NotFound(format!("changeset {id}")))
+            .ok_or_else(|| Error::NotFound(format!("changeset {id}")));
+        if let Ok(found_gen) = &found {
+            self.gen_cache.insert(key, *found_gen);
+        }
+        found
     }
 
     /// The generation of a changeset, in any repo. For derived data.
@@ -2202,7 +2233,7 @@ impl MetaTx for PgTx<'_> {
                 continue;
             }
             if seen.len() > max_visits {
-                return Err(too_deep(max_visits));
+                return Err(test_hooks::too_deep(max_visits));
             }
             stack.extend(self.parents(id, id_gen)?);
         }
@@ -2263,6 +2294,20 @@ impl MetaTx for PgTx<'_> {
             )?,
         };
         Ok(changed == 1)
+    }
+
+    fn restore_ref(&mut self, repo: RepoId, name: &str, target: &[u8], version: i64) -> Result<()> {
+        self.c.execute(
+            "INSERT INTO refs (repo_id, name, target, version) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (repo_id, name) DO UPDATE SET target = $3, version = $4",
+            &[
+                P::i64(repo.0),
+                P::text(name),
+                P::bytes(target),
+                P::i64(version),
+            ],
+        )?;
+        Ok(())
     }
 
     /// The stored bytes of a derived value, if computed.
@@ -2466,6 +2511,26 @@ impl MetaTx for PgTx<'_> {
         Ok(id)
     }
 
+    /// Stores pre-encoded trees, whose ids are their content hashes, as
+    /// one statement however many the chain built.
+    fn put_trees(&mut self, trees: &[(TreeId, Vec<u8>)]) -> Result<()> {
+        if trees.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<Vec<u8>> = trees
+            .iter()
+            .map(|(id, _)| id_bytes(id.as_bytes()))
+            .collect();
+        let bodies: Vec<Vec<u8>> = trees.iter().map(|(_, body)| body.clone()).collect();
+        self.c.execute(
+            "INSERT INTO trees (id, body)
+             SELECT * FROM unnest($1::bytea[], $2::bytea[])
+             ON CONFLICT (id) DO NOTHING",
+            &[P::bytea_array(ids), P::bytea_array(bodies)],
+        )?;
+        Ok(())
+    }
+
     /// Reads a tree and checks it against its ID.
     ///
     /// # Errors
@@ -2667,9 +2732,11 @@ impl MetaTx for PgTx<'_> {
             .transpose()
             .map_err(|e| Error::Corrupt(format!("land {land_id} result: {e}")))?;
         Ok(LandOutcome {
+            moved: false,
             land_id,
             state: LandState::parse(&state)?,
             result,
+            previous: None,
             detail,
             conflict_paths: decode_paths(&paths)
                 .ok_or_else(|| Error::Corrupt(format!("land {land_id} conflict paths")))?,
@@ -2687,8 +2754,8 @@ impl MetaTx for PgTx<'_> {
         conflict_paths: Vec<RepoPath>,
     ) -> Result<LandOutcome> {
         let updated = self.c.execute(
-            "UPDATE lands SET state = $3, result_cs = $4, detail = $5, conflict_paths = $6,
-                 finished_at = now_epoch()
+            "UPDATE lands SET state = $3, result_cs = $4, detail = $5,
+                 conflict_paths = $6, finished_at = now_epoch()
              WHERE repo_id = $1 AND land_id = $2 AND state = 'pending'",
             &[
                 P::i64(repo.0),
@@ -2705,9 +2772,11 @@ impl MetaTx for PgTx<'_> {
             )));
         }
         Ok(LandOutcome {
+            moved: false,
             land_id,
             state,
             result,
+            previous: None,
             detail,
             conflict_paths,
         })
@@ -2825,6 +2894,49 @@ impl MetaTx for PgTx<'_> {
             &[P::i64(repo.0)],
         )?;
         Ok(rows.iter().map(|row| row.get(0)).collect())
+    }
+
+    fn repo_changesets_with_bodies(
+        &mut self,
+        repo: RepoId,
+    ) -> Result<Vec<(Vec<u8>, i64, Vec<u8>)>> {
+        let rows = self.c.query(
+            "SELECT c.id, c.gen, c.body FROM repo_changesets r \
+             JOIN changesets c ON c.id = r.cs WHERE r.repo_id = $1 ORDER BY c.gen, c.id",
+            &[P::i64(repo.0)],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect())
+    }
+
+    fn list_refs(&mut self, repo: RepoId) -> Result<Vec<(String, Vec<u8>, i64)>> {
+        let rows = self.c.query(
+            "SELECT name, target, version FROM refs WHERE repo_id = $1 ORDER BY name",
+            &[P::i64(repo.0)],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect())
+    }
+
+    fn pending_lands(&mut self, repo: RepoId) -> Result<Vec<crate::meta::PendingLand>> {
+        let rows = self.c.query(
+            "SELECT caller, request_key, target_ref, input_cs FROM lands \
+             WHERE repo_id = $1 AND state = 'pending' ORDER BY land_id",
+            &[P::i64(repo.0)],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| crate::meta::PendingLand {
+                caller: row.get(0),
+                request_key: row.get(1),
+                target_ref: row.get(2),
+                input_cs: row.get(3),
+            })
+            .collect())
     }
 
     /// The body of changeset `cs`, or `None` when it is not stored.
@@ -3062,43 +3174,6 @@ impl Meta for Pg {
     }
 }
 
-/// Makes the test schema, and registers it, before any connection
-/// narrows its search path to it. One maker at a time: two concurrent
-/// `CREATE TABLE IF NOT EXISTS` of the registry race on the type
-/// catalog, and the loser dies.
-#[cfg(any(test, feature = "test-hooks"))]
-fn prepare_test_schema(url: &str, schema: &str) -> Result<()> {
-    let preparer = connect(url, None)?;
-    preparer.as_raw({
-        let name = schema.to_owned();
-        move |client| {
-            client
-                .batch_execute(&format!("SET application_name TO '{name}'"))
-                .map_err(map_pg_error)
-        }
-    })?;
-    drop_stale_schemas(&preparer);
-    preparer.as_raw({
-        let name = schema.to_owned();
-        move |client| {
-            client
-                .batch_execute(&format!(
-                    "SELECT pg_advisory_xact_lock({CLEAN_LOCK});
-                         CREATE SCHEMA IF NOT EXISTS {name};
-                         CREATE TABLE IF NOT EXISTS public.scion_test_schemas (
-                             schema  TEXT PRIMARY KEY,
-                             started BIGINT NOT NULL
-                         );
-                         INSERT INTO public.scion_test_schemas (schema, started)
-                         VALUES ('{name}', extract(epoch from now())::bigint)
-                         ON CONFLICT (schema) DO UPDATE SET started = excluded.started"
-                ))
-                .map_err(map_pg_error)
-        }
-    })?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Client, NoTls, P, merged_options};
@@ -3143,9 +3218,9 @@ mod tests {
         if !crate::Backend::test_is_postgres() {
             return;
         }
-        let url = crate::backend::test_url().unwrap();
+        let url = crate::backend::test_hooks::test_url().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let schema = crate::backend::test_schema(dir.path());
+        let schema = crate::backend::test_hooks::test_schema(dir.path());
         // The blob files, made by this build's writer and copied into the
         // old store's object folder: blob files carry no schema.
         let (blob_a, blob_b) = {
@@ -3289,9 +3364,9 @@ mod tests {
         if !crate::Backend::test_is_postgres() {
             return;
         }
-        let url = crate::backend::test_url().unwrap();
+        let url = crate::backend::test_hooks::test_url().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let schema = crate::backend::test_schema(dir.path());
+        let schema = crate::backend::test_hooks::test_schema(dir.path());
         let metrics = std::sync::Arc::new(crate::metrics::Metrics::default());
         let pg = Pg::open_test(
             &url,
@@ -3714,5 +3789,55 @@ mod pool_tests {
             .filter(|out| matches!(out, Err(Error::ResourceExhausted(_))))
             .count();
         assert_eq!((recorded, refused), (1, 1), "{results:?}");
+    }
+
+    /// The out-of-space SQLSTATEs of the Postgres docs' class 53 and 58:
+    /// which map to the fixed `ResourceExhausted` shortage and which
+    /// stay internal, and that the decision is the same for every code.
+    #[test]
+    fn the_disk_full_sqlstates_answer_the_fixed_shortage() {
+        use super::pg_error_of;
+        use crate::{Error, StorageClass};
+        // A source of the right type with no SQLSTATE of its own: a
+        // connect to port 1, which every kernel refuses. The mapping
+        // runs on the SQLSTATE the test hands it, not on this source.
+        let source = || match Client::connect("postgres://127.0.0.1:1/x", NoTls) {
+            Ok(_) => panic!("a connect to port 1 is refused"),
+            Err(refused) => refused,
+        };
+        let full = |code: &str| {
+            let error = pg_error_of(Some(code), source());
+            (
+                matches!(&error, Error::Storage(s) if s.class() == StorageClass::DiskFull),
+                tonic::Status::from(error),
+            )
+        };
+        // 53100: the database's one disk-full code, for every file kind
+        // (elog.c maps ENOSPC to it). The client sees the fixed
+        // retry-later reply.
+        {
+            let (full, status) = full("53100");
+            assert!(full, "53100 must map to the disk-full storage class");
+            assert_eq!(status.code(), tonic::Code::ResourceExhausted, "53100");
+            assert_eq!(
+                status.message(),
+                "the server is out of disk space; retry later",
+                "53100"
+            );
+        }
+        // The codes of the same classes that are NOT a disk shortage
+        // stay internal, on purpose: 53200 is out of memory, 53000 is
+        // the class's catch-all, 53400 is a configured cap (a
+        // temp_file_limit or the replication slots - the same refusal
+        // every time, so a retry-later reply would tell the client to
+        // retry what cannot succeed), and 58030 is an io_error (a
+        // failing device is the EIO row's internal, not a space
+        // shortage). Pinning them keeps a later "helpful" widening from
+        // answering a memory error with a disk reply.
+        for code in ["53200", "53000", "53400", "58030"] {
+            let (full, status) = full(code);
+            assert!(!full, "{code} must not map to the disk-full class");
+            assert_eq!(status.code(), tonic::Code::Internal, "{code}");
+        }
     }
 }

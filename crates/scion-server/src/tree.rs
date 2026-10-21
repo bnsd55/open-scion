@@ -108,7 +108,10 @@ pub fn apply(
             root.put(c, path, &parts(path), 0, entry)?;
         }
     }
-    root.store(c)
+    let mut rows = Vec::new();
+    let tree = root.store(&mut rows)?;
+    c.put_trees(&rows)?;
+    Ok(tree)
 }
 
 /// Finds the entry at `path` under `root`.
@@ -122,7 +125,10 @@ pub fn lookup(c: &mut dyn MetaTx, root: TreeId, path: &RepoPath) -> Result<Optio
         let Entry::Dir(id) = entry else {
             return Ok(None);
         };
-        match c.get_tree(id)?.entries().clone().remove(&name) {
+        // One entry, straight from the stored bytes: no whole-node
+        // decode, no entry-map clone. A big directory costs what the
+        // one entry costs, not the whole folder.
+        match c.lookup_tree_entry(id, name.as_bytes())? {
             Some(next) => entry = next,
             None => return Ok(None),
         }
@@ -265,9 +271,12 @@ pub fn store_changeset(
         .transpose()?;
     let tree = apply(c, base, cs.changes(), lens)?;
     let id = c.insert_changeset(repo, cs)?;
-    for (_, blob) in db::puts(cs) {
-        c.add_repo_blob(repo, blob)?;
-    }
+    // One round trip for every blob the changeset puts, however many
+    // paths name the same one.
+    let mut puts: Vec<BlobId> = db::puts(cs).map(|(_, blob)| blob).collect();
+    puts.sort();
+    puts.dedup();
+    c.add_repo_blobs(repo, &puts)?;
     derived::put::<RootTree>(c, id, &tree)?;
     derived::remove_old::<RootTree>(c)?;
     derived::on_write::<CommitGraph>(c, id, cs, lens)?;
@@ -377,7 +386,7 @@ impl Dir {
     // 500 KB for 10,000 names of 12 bytes. Upgrade: directories cut into
     // chunks, a new tree format, so a write stores only the chunks it changes
     // (https://github.com/bnsd55/openscion/issues/114).
-    fn store(self, c: &mut dyn MetaTx) -> Result<TreeId> {
+    fn store(self, rows: &mut Vec<(TreeId, Vec<u8>)>) -> Result<TreeId> {
         match self {
             Self::Stored(id) => Ok(id),
             Self::Loaded(entries) => {
@@ -385,12 +394,17 @@ impl Dir {
                 for (name, node) in entries {
                     let entry = match node {
                         Node::File(file) => Entry::File(file),
-                        Node::Dir(dir) => Entry::Dir(dir.store(c)?),
+                        Node::Dir(dir) => Entry::Dir(dir.store(rows)?),
                     };
                     loaded.insert(name, entry);
                 }
                 let tree = Tree::new(loaded).expect("loaded entries fit the format");
-                c.put_tree(&tree)
+                // The id is the body's hash, so the chain can be built
+                // before anything is stored, and the whole chain lands as
+                // one batch of rows.
+                let (body, id) = tree.encode_with_id();
+                rows.push((id, body));
+                Ok(id)
             }
         }
     }
@@ -404,7 +418,6 @@ mod tests {
     use crate::meta::Meta as _;
     use crate::store::Store;
     use scion_core::{BlobId, Changeset, IdentityTime};
-
     /// `(path, Some(content))` puts a regular file; `(path, None)` deletes.
     type Edits<'a> = &'a [(&'a str, Option<&'a str>)];
 
@@ -471,6 +484,93 @@ mod tests {
             );
             assert_eq!(lookup(c, t2, &path("a/b"))?, None);
             assert_eq!(lookup(c, t2, &path("e/x"))?, None, "a file has no children");
+            Ok(())
+        });
+    }
+
+    /// The names one level holds, plus the names that must miss: before
+    /// the first, between two, after the last. Present names carry the
+    /// entry the full decode's map holds for them.
+    fn level_checks(tree: &Tree) -> Vec<(Vec<u8>, bool, Option<Entry>)> {
+        let names: Vec<Vec<u8>> = tree
+            .entries()
+            .keys()
+            .map(|n| n.as_bytes().to_vec())
+            .collect();
+        let mut checks = Vec::new();
+        checks.push((vec![0], false, None));
+        for (i, name) in names.iter().enumerate() {
+            let entry = tree
+                .entries()
+                .get(&PathElem::new(name.clone()).unwrap())
+                .copied();
+            checks.push((name.clone(), true, entry));
+            if i + 1 < names.len() {
+                let mut between = name.clone();
+                between.push(0);
+                between.extend_from_slice(b"mid");
+                checks.push((between, false, None));
+            }
+        }
+        if names.len() >= 2 {
+            // A name that sorts between the two last entries: the scan
+            // must stop near the end, not walk to the last byte.
+            let mut before_last = names[names.len() - 2].clone();
+            before_last.extend_from_slice(b"a0");
+            checks.push((before_last, false, None));
+            let last = &names[names.len() - 1];
+            checks.push((
+                last.clone(),
+                true,
+                tree.entries()
+                    .get(&PathElem::new(last.clone()).unwrap())
+                    .copied(),
+            ));
+        }
+        checks.push((b"zzzz-after-the-last".to_vec(), false, None));
+        checks
+    }
+
+    #[test]
+    fn lookup_tree_entry_answers_what_the_full_decode_answers() {
+        with_db(|c| {
+            let t = apply(
+                c,
+                None,
+                &changes(&[
+                    ("a", Some("1")),
+                    ("aB/c", Some("2")),
+                    ("b/one", Some("3")),
+                    ("b/two", Some("4")),
+                    ("b/three", Some("5")),
+                    ("deep/x/y", Some("6")),
+                    ("\u{3bb}/\u{3b1}", Some("7")),
+                    ("\u{3bb}/\u{3c9}", Some("8")),
+                ]),
+                &mut lens_none(),
+            )?;
+            // Every directory level of the tree, with its id.
+            let mut dirs = vec![t];
+            for p in ["aB", "b", "deep", "deep/x", "\u{3bb}"] {
+                match lookup(c, t, &path(p))? {
+                    Some(Entry::Dir(id)) => dirs.push(id),
+                    other => panic!("{p} is not a dir: {other:?}"),
+                }
+            }
+            for dir in dirs {
+                let tree = c.get_tree(dir)?;
+                for (name, present, expected) in level_checks(&tree) {
+                    let found = c.lookup_tree_entry(dir, &name)?;
+                    if present {
+                        assert_eq!(
+                            found, expected,
+                            "the scan's answer differs from the full decode for {name:?}"
+                        );
+                    } else {
+                        assert!(found.is_none(), "name {name:?} is present but must miss");
+                    }
+                }
+            }
             Ok(())
         });
     }
