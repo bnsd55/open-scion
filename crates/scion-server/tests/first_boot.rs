@@ -43,8 +43,10 @@ async fn a_first_boot_serves_probes_and_reads_back() {
     // printf), not in argv.
     assert!(!data.exists(), "the first boot creates the directory");
     let server = Server::start(&data, &log);
-    let token_file = log.with_file_name("scion-token");
-    let mode = std::fs::metadata(&token_file).unwrap().permissions().mode();
+    let mode = std::fs::metadata(common::token_file())
+        .unwrap()
+        .permissions()
+        .mode();
     assert_eq!(mode & 0o777, 0o600, "the token file is private");
 
     // Command 2: the readiness probe of the service, and the liveness

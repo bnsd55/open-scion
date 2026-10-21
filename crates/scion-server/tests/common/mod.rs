@@ -78,6 +78,14 @@ pub(crate) struct Server {
     pub url: String,
 }
 
+/// The token file of this test process: one per process, in the temp
+/// dir the ancestor walk accepts, private to the owner.
+pub(crate) fn token_file() -> &'static std::path::PathBuf {
+    use std::sync::OnceLock;
+    static FILE: OnceLock<std::path::PathBuf> = OnceLock::new();
+    FILE.get_or_init(|| std::env::temp_dir().join(format!("scion-token-{}", std::process::id())))
+}
+
 impl Server {
     /// The server process's id, for a test that must tell the server's
     /// files from another process's.
@@ -125,8 +133,14 @@ impl Server {
             .open(log)
             .unwrap();
         // The token rides in a 0600 file, the runbook's way: argv is
-        // readable by every user of the machine.
-        let token_file = log.with_file_name("scion-token");
+        // readable by every user of the machine. The file lives in the
+        // temp dir every test's own tempdir sits in - the directories the
+        // ancestor walk already accepts - not next to a log that CI may
+        // place under the work dir, whose ancestors carry a default ACL
+        // the walk refuses. The rename is atomic, so a server that reads
+        // while a sibling test rewrites sees whole bytes.
+        let token_file = token_file();
+        let tmp = token_file.with_extension("tmp");
         {
             use std::os::unix::fs::OpenOptionsExt as _;
             fs::OpenOptions::new()
@@ -134,11 +148,12 @@ impl Server {
                 .write(true)
                 .truncate(true)
                 .mode(0o600)
-                .open(&token_file)
+                .open(&tmp)
                 .unwrap()
                 .write_all(TOKEN.as_bytes())
                 .unwrap();
         }
+        fs::rename(&tmp, &token_file).unwrap();
         // The child shares a flock until it execs (see `spawn_guard`): the
         // read side keeps this spawn out of a lock-release window of
         // another test.
