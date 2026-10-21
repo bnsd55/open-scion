@@ -461,13 +461,23 @@ fn a_pg_replay_that_dies_halfway_leaves_the_database_empty() {
     );
     // The database came out as it went in: no row the replay wrote,
     // and no identity — the next open mints again, so the retry is
-    // refused by nothing.
+    // refused by nothing. The replay may die before its schema
+    // migration lands, so a table that does not exist counts as
+    // empty; a table that exists must hold no rows, so a partial
+    // schema with rows still fails.
     let mut check = postgres::Client::connect(&url, postgres::NoTls).unwrap();
     for table in ["repos", "changesets", "refs", "store_uuid"] {
-        let rows: i64 = check
-            .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+        let there: Option<String> = check
+            .query_one(&format!("SELECT to_regclass('public.{table}')::text"), &[])
             .unwrap()
             .get(0);
+        let rows: i64 = match there {
+            None => 0,
+            Some(_) => check
+                .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+                .unwrap()
+                .get(0),
+        };
         assert_eq!(rows, 0, "{table} must be empty after a failed restore");
     }
     drop(check);
