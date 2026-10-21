@@ -98,15 +98,16 @@ copied ~6.4 MB (estimate) on every call — CPU and memory on the read
 path, on every read, not only storage. This was separate from the land
 cost and did not need the chunked layout to fix.
 
-**The fix that landed: binary search in the body, no clone.** `TreeV1`
-entries
-are sorted by name bytes, and the body's layout is self-describing
-(length-prefixed names, fixed-size ids). A lookup can scan the encoded
-body with a binary search over entry boundaries — or at minimum iterate
-with early exit and stop at the first name above the target — decode one
-entry, and never materialize the map. The change is inside
-`tree::lookup`/`MetaTx::get_tree` plumbing; no format, schema, or
-migration changes. #506 is that fix on main.
+**The fix that landed: a scan of the encoded body that stops at the
+name, decodes one entry, and never builds the entry map
+(`Tree::find_entry`, #506).** `TreeV1` entries are sorted by name
+bytes, and the body's layout is self-describing (length-prefixed
+names, fixed-size ids), so the scan reads entries in order and stops
+at the first name equal to or past the target. A binary search is not
+possible on this body: the entries have variable length and there is
+no offset table. The scan lives in scion-core's `codec.rs`
+(`Tree::find_entry`), called from `tree::lookup`; no format, schema,
+or migration changes.
 
 Note what neither fix changes: `TreeV1` is also what clients fetch, so a
 100,000-entry folder is a ~6.4 MB object on the wire whatever the server
