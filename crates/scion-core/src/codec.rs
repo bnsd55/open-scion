@@ -1,5 +1,6 @@
 //! v1 encoder and strict decoder. See `docs/format-v1.md`.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -286,6 +287,90 @@ impl Tree {
     /// As [`Tree::decode`].
     pub fn decode_with_id(bytes: &[u8]) -> Result<(Self, TreeId), DecodeError> {
         Ok((Self::decode(bytes)?, TreeId::hash(bytes)))
+    }
+
+    /// Finds one entry in a tree's encoded `TreeV1` bytes without decoding
+    /// the whole node.
+    ///
+    /// The scan is linear with an early exit, not a binary search: entries
+    /// are variable-length, so the format gives no random access to the
+    /// i-th one — a binary search would need an offset table the format
+    /// does not have. The walk reads the framing only (lengths and tag
+    /// skips), compares the sorted names, and stops at the first name at
+    /// or past the one it looks for, so a miss costs about what a hit
+    /// costs unless the name sorts past the last entry. It never builds
+    /// the entry map a full decode makes.
+    ///
+    /// The bytes must be the canonical encoding: the stored body is
+    /// checked against its ID before this runs, and this still refuses
+    /// what the decoder refuses up to the point it stops reading. It
+    /// stops at the name it finds — the tail is not checked. That is
+    /// sound: a stored body was checked when it was written and its ID
+    /// is the hash of its whole bytes, and fsck re-checks the store.
+    /// This is a reader, not a validator.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError`] unless `bytes` is the canonical encoding of some
+    /// tree, up to the read stopping point.
+    pub fn find_entry(body: &[u8], name: &[u8]) -> Result<Option<Entry>, DecodeError> {
+        let mut r = Reader(body);
+        r.version()?;
+        let count = r.u32()?;
+        let mut prev: Option<&[u8]> = None;
+        for _ in 0..count {
+            let entry_name = r.bytes()?;
+            PathElem::new(entry_name).map_err(DecodeError::BadPath)?;
+            if let Some(prev) = prev
+                && entry_name <= prev
+            {
+                return Err(DecodeError::Unsorted);
+            }
+            prev = Some(entry_name);
+            match entry_name.cmp(name) {
+                Ordering::Less => {}
+                Ordering::Equal => {
+                    let tag = r.u8()?;
+                    return Ok(Some(match tag {
+                        TAG_DIR => Entry::Dir(TreeId::from_bytes(r.array()?)),
+                        TAG_REGULAR | TAG_SYMLINK => Entry::File(FileEntry {
+                            state: r.file(tag)?,
+                            len: u64::from_be_bytes(r.array()?),
+                        }),
+                        _ => Entry::File(FileEntry {
+                            state: r.file(tag)?,
+                            len: 0,
+                        }),
+                    }));
+                }
+                Ordering::Greater => return Ok(None),
+            }
+            match r.u8()? {
+                TAG_DIR => {
+                    r.array::<32>()?;
+                }
+                TAG_REGULAR => {
+                    r.array::<32>()?;
+                    r.u8()?;
+                    r.array::<8>()?;
+                }
+                TAG_SYMLINK => {
+                    r.array::<32>()?;
+                    r.array::<8>()?;
+                }
+                TAG_GITLINK => match r.u8()? {
+                    GIT_SHA1 => {
+                        r.array::<20>()?;
+                    }
+                    GIT_SHA256 => {
+                        r.array::<32>()?;
+                    }
+                    algo => return Err(DecodeError::BadGitAlgo(algo)),
+                },
+                tag => return Err(DecodeError::BadTag(tag)),
+            }
+        }
+        Ok(None)
     }
 
     /// The content address of this tree.

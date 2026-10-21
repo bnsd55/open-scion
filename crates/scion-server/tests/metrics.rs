@@ -113,6 +113,7 @@ async fn setup() -> (
         TOKEN,
         service::ServeOptions {
             data: dir.path().to_path_buf(),
+            audit: scion_server::test_support::audit::Audit::off(),
             limits: Limits::default(),
             quotas: scion_server::Quotas::off(),
             pending_lands: None,
@@ -125,11 +126,7 @@ async fn setup() -> (
             stopped.await.ok();
         },
     ));
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(&format!("http://{addr}")).await.unwrap();
     let client = ScionClient::with_interceptor(channel, Bearer::new(TOKEN).unwrap());
     (dir, stop, store, metrics, client, root, addr)
 }
@@ -233,11 +230,7 @@ async fn a_refused_call_counts_its_code() {
     let (_dir, _stop, _store, metrics, _client, root, addr) = setup().await;
 
     // A client with the wrong token is refused before any handler runs.
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(&format!("http://{addr}")).await.unwrap();
     let mut stranger = ScionClient::with_interceptor(channel, Bearer::new("wrong").unwrap());
     let status = stranger
         .create_changeset(CreateChangesetRequest {
@@ -345,3 +338,6 @@ async fn a_read_file_counts_its_bytes_and_a_stopped_call_counts_as_cancelled() {
 // of it can fail for a real reason (mutation-checked). The locks for a
 // cancelled call are the unit tests of `deadline::check` and the graph
 // walks, and the land tests that read a pending row and its retry.
+
+#[path = "common/mod.rs"]
+mod common;

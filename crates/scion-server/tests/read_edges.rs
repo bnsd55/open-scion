@@ -109,6 +109,7 @@ async fn serve(store: &Backend, dir: &std::path::Path) -> (Stop, Scion) {
         access,
         service::ServeOptions {
             data: dir.to_path_buf(),
+            audit: scion_server::test_support::audit::Audit::off(),
             limits: Limits::default(),
             quotas: scion_server::Quotas::off(),
             pending_lands: None,
@@ -121,11 +122,7 @@ async fn serve(store: &Backend, dir: &std::path::Path) -> (Stop, Scion) {
             stopped.await.ok();
         },
     ));
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(&format!("http://{addr}")).await.unwrap();
     let client = ScionClient::with_interceptor(channel, Bearer(Some(TOKEN.to_string())));
     (stop, client)
 }
@@ -314,3 +311,6 @@ async fn a_file_of_zero_one_part_and_one_part_plus_one_byte() {
     assert_eq!(parts, 2, "one byte over the part size");
     assert_eq!(content, over, "the parts together are the content");
 }
+
+#[path = "common/mod.rs"]
+mod common;
