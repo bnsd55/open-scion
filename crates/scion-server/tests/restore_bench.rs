@@ -127,8 +127,8 @@ fn a_restore_of_a_stated_store_takes_a_stated_time() {
         .filter_map(|p| fs::metadata(p).ok())
         .map(|m| m.len())
         .sum();
-    let raw_mib = blob_bytes as f64 / (1024.0 * 1024.0);
-    let disk_mib = on_disk as f64 / (1024.0 * 1024.0);
+    let raw_mib = f64::from(u32::try_from(blob_bytes).unwrap_or(u32::MAX)) / (1024.0 * 1024.0);
+    let disk_mib = f64::from(u32::try_from(on_disk).unwrap_or(u32::MAX)) / (1024.0 * 1024.0);
     println!(
         "restore: {:.1} s (build {:.1} s) for {REPOS} repos, {changesets} changesets, \
          {blob_bytes} raw blob bytes ({raw_mib:.0} MiB) in files of about {FILE_BYTES} bytes;          {on_disk} bytes ({disk_mib:.0} MiB) on disk after the restore",
@@ -138,7 +138,7 @@ fn a_restore_of_a_stated_store_takes_a_stated_time() {
     println!(
         "restore rate: {:.0} MiB/s on disk, {:.0} changesets/s (ubuntu-24.04, one sample, fsync included)",
         disk_mib / restore.as_secs_f64().max(0.001),
-        changesets as f64 / restore.as_secs_f64().max(0.001),
+        f64::from(changesets as u16) / restore.as_secs_f64().max(0.001),
     );
     assert!(
         restore.as_secs() < RESTORE_BOUND_SECS,
@@ -152,7 +152,7 @@ fn fsync_tree(root: &Path) {
     let mut dirs = Vec::new();
     for entry in walk(root) {
         if entry.is_dir() {
-            dirs.push(entry.to_path_buf());
+            dirs.push(entry);
         } else {
             let _ = fs::File::open(&entry).and_then(|f| f.sync_all());
         }
@@ -170,7 +170,7 @@ fn fsync_dir(dir: &Path) {
 /// Every path under `root`, files and directories, depth first.
 fn walk(root: &Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
+    let mut stack = vec![root.to_owned()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
@@ -209,7 +209,7 @@ fn chain_changeset(name: &str, step: u16, blob: BlobId, parent: Option<Changeset
 
 /// Every file under `from`, copied to the same path under `to`.
 fn copy_tree(from: &Path, to: &Path) {
-    let mut stack = vec![from.to_path_buf()];
+    let mut stack = vec![from.to_owned()];
     while let Some(d) = stack.pop() {
         for entry in fs::read_dir(&d).unwrap() {
             let entry = entry.unwrap().path();
