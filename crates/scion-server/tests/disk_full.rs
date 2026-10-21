@@ -439,12 +439,47 @@ fn sqlstate(e: &Error) -> Option<String> {
     }
 }
 
+/// The bytes free on the database's data directory: the tmpfs's size
+/// minus what the default tablespace holds. The run prints it at each
+/// phase, so one run shows the whole picture.
+fn free_bytes(client: &mut postgres::Client) -> i64 {
+    let used: i64 = client
+        .query_one("SELECT pg_tablespace_size('pg_default')", &[])
+        .expect("the tablespace size answers")
+        .get(0);
+    let total: i64 = std::env::var("SCION_PG_TMPFS_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .expect("SCION_PG_TMPFS_BYTES names the tmpfs");
+    total - used
+}
+
 /// The database's data directory, as the database names it.
 fn data_dir(client: &mut postgres::Client) -> String {
     client
         .query_one("SHOW data_directory", &[])
         .expect("the data directory answers")
         .get::<_, String>(0)
+}
+
+/// Fills the margin table to `total` bytes, the room the store's open
+/// and first lands will spend later. Its files unlink at the DROP, so
+/// freeing it needs no vacuum's luck about where the dead pages sit.
+fn fill_margin(client: &mut postgres::Client, chunk_len: usize, total: usize) {
+    client
+        .batch_execute("CREATE TABLE IF NOT EXISTS diskfull_filler.margin (chunk bytea)")
+        .expect("the margin table is created");
+    let chunk = vec![b'm'; chunk_len];
+    let mut put = 0usize;
+    while put < total {
+        client
+            .execute("INSERT INTO diskfull_filler.margin VALUES ($1)", &[&chunk])
+            .expect("the margin's insert lands");
+        put += chunk_len;
+    }
+    client
+        .batch_execute("CHECKPOINT")
+        .expect("the margin's checkpoint runs");
 }
 
 /// Fills the database with `chunk`-sized rows from its own connection
@@ -542,6 +577,11 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
 
     // The fill: the database's own disk fills until an insert meets the
     // wall - no ceiling, the wall is the evidence.
+    println!(
+        "phase: before the fill, {} bytes free",
+        free_bytes(&mut client)
+    );
+    fill_margin(&mut client, 4 * 1024 * 1024, 64 * 1024 * 1024);
     let mut landed = 0usize;
     let filled_by = fill(&mut client, 4 * 1024 * 1024);
     match &filled_by {
@@ -551,21 +591,25 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
         Some(e) => panic!("the fill failed with something else: {e:?}"),
         None => {}
     }
+    println!(
+        "phase: the wall closed, {} bytes free",
+        free_bytes(&mut client)
+    );
 
-    // The fill ended at the wall. Free a margin, and VACUUM it through:
-    // a DELETE alone leaves the dead pages in the filler table's own
-    // free map, which no other table's extend can take (run 4's
-    // evidence - the open still met the wall through 16 deleted
-    // chunks). The VACUUM returns the pages to the database, the WAL
-    // rides its own disk, and the store's open and lands spend the
-    // freed pages until the wall closes again.
+    // The fill ended at the wall. Free the margin: the DROP unlinks
+    // the margin table's files at commit, so the room returns to the
+    // filesystem with nothing left to luck - a VACUUM only truncates a
+    // table's empty tail, so where the deleted rows sat would decide
+    // (run 4's evidence: the open met the wall through 16 deleted
+    // chunks). The store's open and lands spend the freed room until
+    // the wall closes again.
     client
-        .batch_execute(
-            "DELETE FROM diskfull_filler.filler WHERE ctid IN \
-             (SELECT ctid FROM diskfull_filler.filler LIMIT 16);
-             VACUUM diskfull_filler.filler;",
-        )
-        .expect("a margin frees");
+        .batch_execute("DROP TABLE diskfull_filler.margin;")
+        .expect("the margin frees");
+    println!(
+        "phase: the margin dropped, {} bytes free",
+        free_bytes(&mut client)
+    );
 
     // The proving write: lands a client would run, through the store's
     // own write path, until the wall stops one of them.
