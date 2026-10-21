@@ -464,7 +464,7 @@ impl PgClient {
                 // reconnect. A lock the database does not give back fails
                 // every statement that follows: another server process may
                 // hold it, and this one must not land beside it.
-                let mut setup = Setup::new(conn.schema.as_deref(), conn.lock_key, &mut client);
+                let mut setup = Setup::new(conn.schema.as_deref(), conn.exclusive, &mut client);
                 // BEGIN opens one; COMMIT and ROLLBACK end it. A
                 // transaction a reconnect lost fails every statement until
                 // its rollback: on the new connection, autocommit would
@@ -537,7 +537,7 @@ impl PgClient {
                     // some while after the connection did. One retry a
                     // job, so the recovery needs no process restart.
                     if !setup.ok() {
-                        setup = Setup::new(conn.schema.as_deref(), conn.lock_key, &mut client);
+                        setup = Setup::new(conn.schema.as_deref(), conn.exclusive, &mut client);
                     }
                     if !setup.ok() {
                         if ever_held && matches!(setup.outcome, SetupOutcome::LockRefused) {
@@ -779,13 +779,11 @@ impl Pg {
         data: &Path,
         marker: Marker,
     ) -> Result<Self> {
-        // The schema a URL names is real for an exclusive open too: the
-        // tests ride one database with one schema per data directory, and
-        // each directory's server is the one server OF ITS SCHEMA, not of
-        // the whole database. Without this, parallel servers of distinct
-        // schemas would fence each other on the database-wide key.
-        let schema = schema_of_url(url);
-        Self::open_in(url, ca, readers, data, schema.as_deref(), true, marker)
+        // The schema the URL rides is the connection's own business: the
+        // setup asks the database `current_schema()` and locks that, so
+        // parallel servers of distinct schemas do not fence each other,
+        // and a plain URL fences the whole default schema.
+        Self::open_in(url, ca, readers, data, None, true, marker)
     }
 
     /// [`Pg::open`], in `schema` instead of the database's default one, for
@@ -839,22 +837,12 @@ impl Pg {
     ) -> Result<Self> {
         let options = base_options();
         let fence = Arc::new(Fence::new());
-        // The one-server lock of the database, or of one test schema: a
-        // key per schema, so parallel tests do not block each other.
-        let lock_key = if exclusive {
-            Some(schema.map_or(SERVER_LOCK, schema_lock_key))
-        } else {
-            None
-        };
+        // The one-server lock of the schema the connection lands in: the
+        // setup asks the database `current_schema()` and locks that, so a
+        // plain URL and one that rides `--search_path=public` take the
+        // same lock, and schemas ride separately. A reader takes none.
         let mut writer = if exclusive {
-            connect_exclusive(
-                url,
-                ca,
-                &options,
-                schema,
-                lock_key.expect("an exclusive open names a lock"),
-                Arc::clone(&fence),
-            )?
+            connect_exclusive(url, ca, &options, schema, Arc::clone(&fence))?
         } else {
             connect_with(url, ca, &options, schema)?
         };
@@ -1405,20 +1393,20 @@ enum SetupOutcome {
 
 struct Setup {
     schema: Option<String>,
-    /// The advisory lock this session takes, if any: the one-server lock
-    /// of a database, or of one test schema. None for a client that
-    /// takes no lock (a reader, an import).
-    lock_key: Option<i64>,
+    /// Whether this session takes the one-server lock of the schema it
+    /// lands in (an exclusive writer; None-equivalent for a reader, an
+    /// import).
+    exclusive: bool,
     outcome: SetupOutcome,
 }
 
 impl Setup {
     /// Applies the setup to a fresh client. A failed setup leaves the
     /// statements failed until a reconnect applies it again.
-    fn new(schema: Option<&str>, lock_key: Option<i64>, client: &mut Client) -> Self {
+    fn new(schema: Option<&str>, exclusive: bool, client: &mut Client) -> Self {
         let mut setup = Self {
             schema: schema.map(str::to_owned),
-            lock_key,
+            exclusive,
             outcome: SetupOutcome::Unreachable,
         };
         setup.outcome = setup.apply(client);
@@ -1447,11 +1435,23 @@ impl Setup {
                 return SetupOutcome::Unreachable;
             }
         }
-        if let Some(key) = self.lock_key
-            && !server_lock_raw(client, key)
-        {
-            // The database answered: another session holds the lock.
-            return SetupOutcome::LockRefused;
+        if self.exclusive {
+            // What the connection actually writes into, whatever the URL
+            // spelled: a plain URL and one that rides
+            // `--search_path=public` land in the same schema and must
+            // fence each other, and schemas ride separately.
+            let Ok(row) = client.query_one("SELECT current_schema()::text", &[]) else {
+                return SetupOutcome::Unreachable;
+            };
+            // A search_path whose members all miss answers NULL: the
+            // connection would create nothing, and no lock names it.
+            let Some(current) = row.get::<_, Option<String>>(0) else {
+                return SetupOutcome::Unreachable;
+            };
+            if !server_lock_raw(client, schema_lock_key(&current)) {
+                // The database answered: another session holds the lock.
+                return SetupOutcome::LockRefused;
+            }
         }
         SetupOutcome::Applied
     }
@@ -1571,7 +1571,7 @@ fn lost_message(setup_held: bool) -> &'static str {
 fn reconnect(client: &mut Client, conn: &Conn) -> Result<Setup> {
     let fresh = connect_on(&conn.url, conn.ca.as_deref(), &conn.options)?;
     *client = fresh;
-    Ok(Setup::new(conn.schema.as_deref(), conn.lock_key, client))
+    Ok(Setup::new(conn.schema.as_deref(), conn.exclusive, client))
 }
 
 /// Whether the worker's client is inside the transaction a `BEGIN`
@@ -1622,9 +1622,9 @@ struct Conn {
     options: String,
     /// The schema a reconnect narrows itself to again.
     schema: Option<String>,
-    /// The advisory lock this session re-takes after every reconnect,
-    /// if any.
-    lock_key: Option<i64>,
+    /// Whether this session re-takes the one-server lock after every
+    /// reconnect (an exclusive writer; a reader takes none).
+    exclusive: bool,
 }
 
 /// What a worker needs to run, and to connect again when its client dies.
@@ -1680,7 +1680,7 @@ fn connect_with(
     options: &str,
     schema: Option<&str>,
 ) -> Result<PgClient> {
-    spawn_client(url, ca, options, schema, None, None)
+    spawn_client(url, ca, options, schema, false, None)
 }
 
 /// [`connect_with`], as the one server process of the database: the
@@ -1692,26 +1692,26 @@ fn connect_exclusive(
     ca: Option<&Path>,
     options: &str,
     schema: Option<&str>,
-    lock_key: i64,
     fence: Arc<Fence>,
 ) -> Result<PgClient> {
     // Whether the lock was given is decided at the spawn: one probe job
     // brings a refusal here, to the open, so an operator whose second
     // server starts against a taken database sees it now, and not in the
     // errors of the first call a client makes.
-    let client = spawn_client(url, ca, options, schema, Some(lock_key), Some(fence))?;
+    let client = spawn_client(url, ca, options, schema, true, Some(fence))?;
     client.query_opt("SELECT 1", &[])?;
     Ok(client)
 }
 
-/// Puts one client on its worker thread. A `lock_key` is re-taken after
-/// every reconnect, and its loss trips the fence.
+/// Puts one client on its worker thread. An exclusive client re-takes
+/// the one-server lock after every reconnect, and its loss trips the
+/// fence.
 fn spawn_client(
     url: &str,
     ca: Option<&Path>,
     options: &str,
     schema: Option<&str>,
-    lock_key: Option<i64>,
+    exclusive: bool,
     fence: Option<Arc<Fence>>,
 ) -> Result<PgClient> {
     let client =
@@ -1725,7 +1725,7 @@ fn spawn_client(
             ca: ca.map(Path::to_path_buf),
             options: options.to_owned(),
             schema: schema.map(str::to_owned),
-            lock_key,
+            exclusive,
         },
         fence,
     }))
@@ -1740,22 +1740,6 @@ fn merged_options(from_url: Option<&str>, own: &str) -> String {
         Some(from_url) if !from_url.is_empty() => format!("{from_url} {own}"),
         _ => own.to_owned(),
     }
-}
-
-/// The schema the URL's own `options` name, if it names one: the tests
-/// ride `options=--search_path%3D<schema>`, and every connection of the
-/// open, exclusive or not, resolves its unqualified names inside it. A
-/// URL without the option names no schema, and a bare `--search_path=`
-/// (libpq's other spellings) is not this backend's ride, so it names
-/// none either.
-fn schema_of_url(url: &str) -> Option<String> {
-    let config: postgres::Config = url.parse().ok()?;
-    config
-        .get_options()
-        .iter()
-        .find_map(|option| option.strip_prefix("--search_path="))
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
 }
 
 /// [`connect_with`]'s work: parse, then connect.
@@ -3135,7 +3119,7 @@ fn prepare_test_schema(url: &str, schema: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Client, NoTls, P, merged_options, schema_of_url};
+    use super::{Client, NoTls, P, merged_options};
     use crate::backend::old_store;
     use crate::pg::Pg;
     use std::sync::Arc;
@@ -3147,30 +3131,6 @@ mod tests {
         assert_eq!(
             merged_options(Some("--search_path=scion_test_1"), OWN),
             format!("--search_path=scion_test_1 {OWN}")
-        );
-    }
-
-    #[test]
-    fn a_url_that_rides_a_schema_names_it_and_a_plain_one_names_none() {
-        // The ride the tests use: URL-encoded `options`, one schema.
-        assert_eq!(
-            schema_of_url(
-                "postgres://postgres:scion@localhost:5432/scion?options=--search_path%3Dscion_test_ab"
-            )
-            .as_deref(),
-            Some("scion_test_ab")
-        );
-        // A production URL names no schema and keeps the database lock.
-        assert_eq!(
-            schema_of_url("postgres://postgres:scion@localhost:5432/scion"),
-            None
-        );
-        // An option of another kind is not a ride.
-        assert_eq!(
-            schema_of_url(
-                "postgres://postgres:scion@localhost:5432/scion?options=-cstatement_timeout%3D1s"
-            ),
-            None
         );
     }
 

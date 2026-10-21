@@ -443,3 +443,124 @@ fn a_fsck_of_a_postgres_backed_store_finds_missing_blob_files() {
         report.problems
     );
 }
+
+/// One throwaway database per test, so the lock scope of a production
+/// open is checked on a real open without touching the shared test
+/// database's default schema.
+struct Throwaway {
+    url: String,
+    name: String,
+}
+
+impl Throwaway {
+    /// One throwaway database per test, named after the test, so
+    /// parallel tests of this file do not drop each other's database.
+    fn new(who: &str) -> Self {
+        let base = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+        // The name carries the test, so parallel tests of this file do
+        // not drop each other's database.
+        let name = format!("scion_test_lockcheck_{}_{}", who, std::process::id());
+        let mut admin = postgres::Client::connect(&base, postgres::NoTls).unwrap();
+        admin
+            .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+            .unwrap();
+        admin
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .unwrap();
+        let cut = base.rfind('/').expect("the test URL names a database");
+        Self {
+            url: format!("{}/{}", &base[..cut], name),
+            name,
+        }
+    }
+
+    /// The URL of this database, riding `schema` when one is given.
+    fn url_riding(&self, schema: Option<&str>) -> String {
+        match schema {
+            Some(schema) => format!("{}?options=--search_path%3D{schema}", self.url),
+            None => self.url.clone(),
+        }
+    }
+}
+
+impl Drop for Throwaway {
+    fn drop(&mut self) {
+        let base = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+        let Ok(mut admin) = postgres::Client::connect(&base, postgres::NoTls) else {
+            return;
+        };
+        let _ = admin.batch_execute(&format!(
+            "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+            self.name
+        ));
+    }
+}
+
+/// The one-server lock keys on the schema the connection lands in, not
+/// on the words of the URL: a plain URL and one that rides
+/// `--search_path=public` land in the same schema of one database, so
+/// the second open is refused, however differently the two URLs spell
+/// where they go. A production behavior change: a URL that names its own
+/// schema fences one schema, not the whole database.
+#[test]
+fn a_plain_url_and_one_that_rides_public_fence_each_other() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let db = Throwaway::new("fence");
+    let dir_a = tempfile::tempdir().unwrap();
+    let _a = Backend::open(dir_a.path(), Some(&db.url), None).expect("the plain URL opens");
+    let dir_b = tempfile::tempdir().unwrap();
+    let Err(error) = Backend::open(dir_b.path(), Some(&db.url_riding(Some("public"))), None) else {
+        panic!("the second open of one schema is refused");
+    };
+    assert!(
+        error.to_string().contains("another server holds"),
+        "{error}"
+    );
+}
+
+/// Two URLs that ride different schemas of one database open side by
+/// side: each fences its own schema, which is what lets the parallel
+/// tests of one database each hold one server.
+#[test]
+fn two_urls_that_ride_different_schemas_open_side_by_side() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let db = Throwaway::new("side_by_side");
+    let mut admin = postgres::Client::connect(&db.url, postgres::NoTls).unwrap();
+    admin
+        .batch_execute("CREATE SCHEMA scion_test_lock_one; CREATE SCHEMA scion_test_lock_two;")
+        .unwrap();
+    let dir_a = tempfile::tempdir().unwrap();
+    let a = Backend::open(
+        dir_a.path(),
+        Some(&db.url_riding(Some("scion_test_lock_one"))),
+        None,
+    )
+    .expect("the first schema opens");
+    let dir_b = tempfile::tempdir().unwrap();
+    let b = Backend::open(
+        dir_b.path(),
+        Some(&db.url_riding(Some("scion_test_lock_two"))),
+        None,
+    )
+    .expect("the second schema opens beside it");
+    // Each store keeps its rows in its own schema: one repo apiece, and
+    // the other schema's table stays empty.
+    a.write(|c| c.create_repo("one").map(|_| ())).unwrap();
+    b.write(|c| c.create_repo("two").map(|_| ())).unwrap();
+    for (schema, name) in [
+        ("scion_test_lock_one", "one"),
+        ("scion_test_lock_two", "two"),
+    ] {
+        let rows = admin
+            .query(
+                &format!("SELECT name FROM {schema}.repos WHERE name = '{name}'"),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{schema} holds {name}");
+    }
+}
