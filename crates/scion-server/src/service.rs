@@ -503,10 +503,16 @@ impl ScionService {
         }
         self.audit_result(request_id, principal, "land", "ok", fields)
             .await;
-        if let Some(landed) = outcome.result {
-            // The move itself: which principal moved which ref from
-            // what to what. The land's intent line made the evidence
-            // first; this line is the move's record.
+        // A replay of a landed request reports the first move's
+        // outcome and moved nothing itself: the move's line exists
+        // from the call that made it.
+        // A replay of a landed request reports the first move's
+        // outcome and moved nothing itself: the move's line exists
+        // from the call that made it. The move's own line: which
+        // principal moved which ref from what to what. The land's
+        // intent line made the evidence first; this line is the
+        // move's record.
+        if let (true, Some(landed)) = (outcome.moved, outcome.result) {
             self.audit_result(
                 request_id,
                 principal,
@@ -1442,14 +1448,10 @@ impl Scion for ScionService {
         // nothing.
         let (lands, access) = (Arc::clone(&self.lands), Arc::clone(&self.access));
         let (repo, target_ref) = (req.repo.clone(), req.target_ref.clone());
-        let (repo_for_job, target_ref_for_job) = (req.repo.clone(), req.target_ref.clone());
         // The land's own result comes back inside an Ok, so this handler,
         // not the worker, builds the reply's Status: a land that ends in
         // an error moves the land counter, by the code of the reply the
-        // caller saw. The ref's current target reads inside the same
-        // task as the land: the audit's ref line needs it, and a task
-        // of its own would race a caller that cancels between it and
-        // the land.
+        // caller saw.
         let ran = self
             .worker
             .run(move |store| {
@@ -1458,16 +1460,13 @@ impl Scion for ScionService {
                 // before the land records anything, also on a retry.
                 let cs = read::get_changeset(&store, &req.repo, req.changeset)?;
                 access.check_write(&caller, &req.repo, cs.changes().keys())?;
-                let old = store
-                    .resolve_ref(&repo_for_job, &target_ref_for_job)
-                    .ok()
-                    .map(|id| hex_id(id.as_bytes()));
-                Ok((old, lands.land(&store, &caller, &req)))
+                Ok(lands.land(&store, &caller, &req))
             })
             .await;
         match ran {
-            Ok((old, Ok(outcome))) => self
-                .land_recorded(
+            Ok(Ok(outcome)) => {
+                let old = outcome.previous.map(|id| hex_id(id.as_bytes()));
+                self.land_recorded(
                     &request_id,
                     &principal,
                     &repo,
@@ -1476,8 +1475,9 @@ impl Scion for ScionService {
                     outcome,
                 )
                 .await
-                .map(|outcome| Response::new(land_response(outcome))),
-            Ok((_, Err(e))) => {
+                .map(|outcome| Response::new(land_response(outcome)))
+            }
+            Ok(Err(e)) => {
                 let status = Status::from(e);
                 self.metrics.land(code_label(status.code()));
                 self.audit_result(

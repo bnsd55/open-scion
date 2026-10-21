@@ -53,7 +53,7 @@ use crate::store::Blobs;
 pub(crate) mod test_hooks;
 
 /// The schema version this build makes and reads.
-pub(crate) const PG_SCHEMA_VERSION: u32 = 4;
+pub(crate) const PG_SCHEMA_VERSION: u32 = 5;
 
 /// How long a call may wait for a Postgres reader before the server
 /// answers [`Error::Unavailable`]. Well below the 600 s call deadline:
@@ -83,6 +83,7 @@ const PG_MIGRATIONS: [&str; PG_SCHEMA_VERSION as usize] = [
     include_str!("../migrations/postgres/0002_view_roots.sql"),
     include_str!("../migrations/postgres/0003_view_trees.sql"),
     include_str!("../migrations/postgres/0004_store_uuid.sql"),
+    include_str!("../migrations/postgres/0005_land_previous.sql"),
 ];
 
 /// The fence of a process that lost the one-server lock. The worker of
@@ -2539,25 +2540,30 @@ impl MetaTx for PgTx<'_> {
         let row = self
             .c
             .query_opt(
-                "SELECT state, result_cs, detail, conflict_paths FROM lands
+                "SELECT state, result_cs, previous_cs, detail, conflict_paths FROM lands
                  WHERE repo_id = $1 AND land_id = $2 AND caller = $3",
                 &[P::i64(repo.0), P::i64(land_id), P::text(&caller.0)],
             )?
             .ok_or_else(|| Error::NotFound(format!("land {land_id}")))?;
         let state: String = row.get(0);
         let result: Option<Vec<u8>> = row.get(1);
-        let detail: String = row.get(2);
-        let paths: Vec<u8> = row.get(3);
+        let previous: Option<Vec<u8>> = row.get(2);
+        let detail: String = row.get(3);
+        let paths: Vec<u8> = row.get(4);
         let result = result
             .map(|bytes| ChangesetId::try_from(bytes.as_slice()))
             .transpose()
             .map_err(|e| Error::Corrupt(format!("land {land_id} result: {e}")))?;
+        let previous = previous
+            .map(|bytes| ChangesetId::try_from(bytes.as_slice()))
+            .transpose()
+            .map_err(|e| Error::Corrupt(format!("land {land_id} previous: {e}")))?;
         Ok(LandOutcome {
             moved: false,
             land_id,
             state: LandState::parse(&state)?,
             result,
-            previous: None,
+            previous,
             detail,
             conflict_paths: decode_paths(&paths)
                 .ok_or_else(|| Error::Corrupt(format!("land {land_id} conflict paths")))?,
@@ -2571,18 +2577,20 @@ impl MetaTx for PgTx<'_> {
         land_id: i64,
         state: LandState,
         result: Option<ChangesetId>,
+        previous: Option<ChangesetId>,
         detail: String,
         conflict_paths: Vec<RepoPath>,
     ) -> Result<LandOutcome> {
         let updated = self.c.execute(
-            "UPDATE lands SET state = $3, result_cs = $4, detail = $5,
-                 conflict_paths = $6, finished_at = now_epoch()
+            "UPDATE lands SET state = $3, result_cs = $4, previous_cs = $5, detail = $6,
+                 conflict_paths = $7, finished_at = now_epoch()
              WHERE repo_id = $1 AND land_id = $2 AND state = 'pending'",
             &[
                 P::i64(repo.0),
                 P::i64(land_id),
                 P::text(state.as_str()),
                 P::opt_bytes(result.as_ref().map(|id| id_bytes(id.as_bytes()))),
+                P::opt_bytes(previous.as_ref().map(|id| id_bytes(id.as_bytes()))),
                 P::text(&detail),
                 P::bytes(&encode_paths(&conflict_paths)),
             ],
@@ -2593,11 +2601,11 @@ impl MetaTx for PgTx<'_> {
             )));
         }
         Ok(LandOutcome {
-            moved: false,
+            moved: state == LandState::Landed,
             land_id,
             state,
             result,
-            previous: None,
+            previous,
             detail,
             conflict_paths,
         })

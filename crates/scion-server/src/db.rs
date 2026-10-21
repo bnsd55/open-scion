@@ -866,18 +866,19 @@ impl MetaTx for SqliteTx<'_> {
 
     /// A land that `caller` started in `repo`.
     fn land_outcome(&mut self, repo: RepoId, caller: &Caller, land_id: i64) -> Result<LandOutcome> {
-        let (state, result, detail, paths) = self
+        let (state, result, previous, detail, paths) = self
             .0
             .query_row(
-                "SELECT state, result_cs, detail, conflict_paths FROM lands
+                "SELECT state, result_cs, previous_cs, detail, conflict_paths FROM lands
                  WHERE repo_id = ?1 AND land_id = ?2 AND caller = ?3",
                 params![repo.0, land_id, caller.0],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<Vec<u8>>>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
                     ))
                 },
             )
@@ -888,12 +889,16 @@ impl MetaTx for SqliteTx<'_> {
             .map(|bytes| ChangesetId::try_from(bytes.as_slice()))
             .transpose()
             .map_err(|e| Error::Corrupt(format!("land {land_id} result: {e}")))?;
+        let previous = previous
+            .map(|bytes| ChangesetId::try_from(bytes.as_slice()))
+            .transpose()
+            .map_err(|e| Error::Corrupt(format!("land {land_id} previous: {e}")))?;
         Ok(LandOutcome {
             moved: false,
             land_id,
             state: LandState::parse(&state)?,
             result,
-            previous: None,
+            previous,
             detail,
             conflict_paths: decode_paths(&paths)
                 .ok_or_else(|| Error::Corrupt(format!("land {land_id} conflict paths")))?,
@@ -907,14 +912,15 @@ impl MetaTx for SqliteTx<'_> {
         land_id: i64,
         state: LandState,
         result: Option<ChangesetId>,
+        previous: Option<ChangesetId>,
         detail: String,
         conflict_paths: Vec<RepoPath>,
     ) -> Result<LandOutcome> {
         let updated = self
             .0
             .prepare_cached(
-                "UPDATE lands SET state = ?3, result_cs = ?4, detail = ?5,
-                     conflict_paths = ?6, finished_at = unixepoch()
+                "UPDATE lands SET state = ?3, result_cs = ?4, previous_cs = ?5, detail = ?6,
+                     conflict_paths = ?7, finished_at = unixepoch()
                  WHERE repo_id = ?1 AND land_id = ?2 AND state = 'pending'",
             )
             .map_err(crate::error::from_sqlite)?
@@ -923,6 +929,7 @@ impl MetaTx for SqliteTx<'_> {
                 land_id,
                 state.as_str(),
                 result.as_ref().map(ChangesetId::as_bytes),
+                previous.as_ref().map(ChangesetId::as_bytes),
                 detail,
                 encode_paths(&conflict_paths)
             ])
@@ -933,11 +940,11 @@ impl MetaTx for SqliteTx<'_> {
             )));
         }
         Ok(LandOutcome {
-            moved: false,
+            moved: state == LandState::Landed,
             land_id,
             state,
             result,
-            previous: None,
+            previous,
             detail,
             conflict_paths,
         })
