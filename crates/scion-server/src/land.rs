@@ -569,7 +569,13 @@ fn finish(
     loop {
         // The outcome check rides the plan's read transaction: one read
         // answers both "already settled by a twin call" and "what the
-        // land must do now".
+        // land must do now". On SQLite that read is one snapshot; on
+        // Postgres `read_unflushed` runs its statements in autocommit,
+        // so the outcome row and the plan's reads can see different
+        // states. A twin call that settles between them is still
+        // stopped at `set_land_state`'s pending guard, which answers
+        // "no longer pending" instead of moving the ref twice - the
+        // guard is the backstop there, not the shared read.
         let planned = store.read_unflushed(|c| {
             let row = c.land_outcome(repo, caller, land_id)?;
             if row.state != LandState::Pending {

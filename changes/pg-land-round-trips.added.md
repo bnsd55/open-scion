@@ -34,4 +34,8 @@ answers both whether a twin call settled the land and what the land
 must do now, where the loop read them in two steps before. The counts
 do not move (the loop's read ran without transaction boilerplate
 already); what moves is that the plan can no longer run for a land
-that a twin call has settled.
+that a twin call has settled. On SQLite that read is one snapshot; on
+Postgres it runs in autocommit statements, so the two reads can see
+different states - a settle that lands between them is stopped at
+`set_land_state`'s pending guard ("no longer pending"), which is the
+backstop there.
