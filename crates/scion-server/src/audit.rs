@@ -395,28 +395,44 @@ impl AuditedAuth {
     pub(crate) fn new(inner: scion_proto::runtime::auth::Auth, meter: Arc<Meter>) -> Self {
         Self { inner, meter }
     }
-
-    fn peer_of(request: &tonic::Request<()>) -> String {
-        // The connection's handle is the only peer a call still has
-        // below the router: the connect info of the request.
-        request
-            .extensions()
-            .get::<scion_proto::runtime::listen::Stalled>()
-            .and_then(scion_proto::runtime::listen::Stalled::peer)
-            .map(|addr| addr.to_string())
-            .unwrap_or_default()
-    }
 }
 
 impl tonic::service::Interceptor for AuditedAuth {
     fn call(&mut self, request: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-        let peer = Self::peer_of(&request);
+        let key = request
+            .extensions()
+            .get::<scion_proto::runtime::listen::Stalled>()
+            .and_then(scion_proto::runtime::listen::Stalled::peer)
+            .map(|addr| meter_key(&addr))
+            .unwrap_or_default();
         match self.inner.call(request) {
             Err(status) => {
-                self.meter.count(&peer);
+                self.meter.count(&key);
                 Err(status)
             }
             ok => ok,
+        }
+    }
+}
+
+/// The unit the refusal meter keys by: the address, not the socket.
+/// One machine can open a thousand connections from a thousand ports,
+/// and each port would fill the peer cap for free and bury every real
+/// stranger in the shared bucket. An IPv4 address is the unit; an
+/// IPv6 address keys by its /64 prefix, the smallest block the
+/// internet routes to one site, so the many addresses of one machine
+/// cannot crowd one key either. A call whose peer is unknown (a Unix
+/// socket) shares one bucket.
+#[allow(unreachable_pub)]
+pub fn meter_key(addr: &std::net::SocketAddr) -> String {
+    match addr {
+        std::net::SocketAddr::V4(v4) => v4.ip().to_string(),
+        std::net::SocketAddr::V6(v6) => {
+            let segments = v6.ip().segments();
+            format!(
+                "{:x}:{:x}:{:x}:{:x}::/64",
+                segments[0], segments[1], segments[2], segments[3]
+            )
         }
     }
 }
@@ -497,10 +513,12 @@ mod tests {
         let path = dir.path().join("audit.log");
         let audit = Audit::open(&path).unwrap();
         let meter = Arc::new(Meter::default());
+        let first = "127.0.0.1:1".parse().unwrap();
+        let second = "127.0.0.2:2".parse().unwrap();
         for _ in 0..500 {
-            meter.count("127.0.0.1:1");
+            meter.count(&meter_key(&first));
         }
-        meter.count("127.0.0.1:2");
+        meter.count(&meter_key(&second));
         meter.flush(&audit).await;
         let lines = read_lines(&path);
         assert_eq!(lines.len(), 2);
@@ -519,13 +537,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_address_rotating_ports_does_not_bury_a_stranger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let audit = Audit::open(&path).unwrap();
+        let meter = Arc::new(Meter::default());
+        // One machine, 1024 connections, a port of its own for each.
+        for port in 0..1024 {
+            let addr = format!("203.0.113.7:{port}").parse().unwrap();
+            meter.count(&meter_key(&addr));
+        }
+        // A real stranger on its own address.
+        let stranger = "198.51.100.9:443".parse().unwrap();
+        meter.count(&meter_key(&stranger));
+        meter.flush(&audit).await;
+        let lines = read_lines(&path);
+        let by_peer: std::collections::HashMap<&str, u64> = lines
+            .iter()
+            .map(|line| {
+                (
+                    line["peer"].as_str().unwrap(),
+                    line["count"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            by_peer.get("198.51.100.9"),
+            Some(&1),
+            "the stranger keeps its own counted line"
+        );
+        assert_eq!(by_peer.get("203.0.113.7"), Some(&1024));
+    }
+
+    #[tokio::test]
+    async fn an_ipv6_machine_keys_by_its_prefix64() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let audit = Audit::open(&path).unwrap();
+        let meter = Arc::new(Meter::default());
+        let first = "[2001:db8:aaaa:bbbb:1:2:3:4]:1".parse().unwrap();
+        let second = "[2001:db8:aaaa:bbbb:5:6:7:8]:2".parse().unwrap();
+        meter.count(&meter_key(&first));
+        meter.count(&meter_key(&second));
+        meter.flush(&audit).await;
+        let lines = read_lines(&path);
+        assert_eq!(lines.len(), 1, "one /64 is one peer");
+        assert_eq!(lines[0]["peer"], "2001:db8:aaaa:bbbb::/64");
+        assert_eq!(lines[0]["count"], 2);
+    }
+
+    #[tokio::test]
     async fn strangers_past_the_peer_cap_share_one_bucket() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.log");
         let audit = Audit::open(&path).unwrap();
         let meter = Arc::new(Meter::default());
         for i in 0..(METER_PEERS_CAP + 10) {
-            meter.count(&format!("peer-{i}"));
+            let addr = format!("10.{}.{}.1:1", i / 256, i % 256).parse().unwrap();
+            meter.count(&meter_key(&addr));
         }
         meter.flush(&audit).await;
         let lines = read_lines(&path);

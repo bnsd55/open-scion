@@ -158,7 +158,7 @@ async fn refused_authentication_is_one_counted_line_per_peer_and_names_no_token(
 
     // The stop flushes the meter's counts before the server ends.
     stop.send(()).unwrap();
-    wait_for_lines(&audit_path, 3).await;
+    wait_for_lines(&audit_path, 2).await;
 
     let lines = read_lines(&audit_path);
     assert_eq!(lines[0]["event"], "admin");
@@ -166,13 +166,12 @@ async fn refused_authentication_is_one_counted_line_per_peer_and_names_no_token(
         .iter()
         .filter(|line| line["event"] == "auth" && line["outcome"] == "refused")
         .collect();
-    assert_eq!(refusals.len(), 2, "one line per peer, not per call");
-    let mut counts: Vec<u64> = refusals
-        .iter()
-        .map(|line| line["count"].as_u64().unwrap())
-        .collect();
-    counts.sort_unstable();
-    assert_eq!(counts, vec![20, 20], "every refusal is counted");
+    // Both connections come from this test process, so one address:
+    // one counted line, with every refusal on it. One line per peer,
+    // never per call, and a port rotation cannot bury anyone.
+    assert_eq!(refusals.len(), 1, "one line per address, not per call");
+    assert_eq!(refusals[0]["count"], 40, "every refusal is counted");
+    assert_eq!(refusals[0]["peer"], "127.0.0.1");
     let bytes = std::fs::read(&audit_path).unwrap();
     let text = String::from_utf8(bytes).unwrap();
     assert!(!text.contains(wrong), "the refused token never appears");
