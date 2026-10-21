@@ -22,7 +22,9 @@
 //!   twice, and the newest land holds the largest one.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(test, feature = "test-hooks"))]
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -1963,13 +1965,16 @@ impl MetaTx for PgTx<'_> {
                  WHERE repo_id = $1 AND id = ANY($2)",
                 &[P::i64(repo.0), P::bytea_array(parents.clone())],
             )?;
-            let mut gens: std::collections::HashMap<Vec<u8>, i64> = rows
+            let gens: std::collections::HashMap<Vec<u8>, i64> = rows
                 .into_iter()
                 .map(|row| (row.get::<_, Vec<u8>>(0), row.get::<_, i64>(1)))
                 .collect();
             for (parent, key) in cs.parents().iter().zip(&parents) {
-                let parent_gen_i = gens
-                    .remove(key)
+                // A repeated parent reads the same row twice; `get`, not
+                // `remove`, so parents [X, X] store like they did when
+                // each parent was its own statement.
+                let parent_gen_i = *gens
+                    .get(key)
                     .ok_or_else(|| Error::NotFound(format!("changeset {parent}")))?;
                 parent_gen = parent_gen.max(parent_gen_i);
                 self.gen_cache.insert((repo.0, key.clone()), parent_gen_i);
@@ -1984,14 +1989,17 @@ impl MetaTx for PgTx<'_> {
                 P::bytes(&body),
             ],
         )?;
-        for (n, parent) in (0_i64..).zip(cs.parents()) {
+        // Every parent as one statement, however many a merge has: the
+        // row number is the parent's place in the array.
+        if !parents.is_empty() {
             self.c.execute(
-                "INSERT INTO changeset_parents (cs, n, parent) VALUES ($1, $2, $3)
+                "INSERT INTO changeset_parents (cs, n, parent)
+                 SELECT $1, ord, parent
+                 FROM unnest($2::bytea[]) WITH ORDINALITY AS parents(parent, ord)
                  ON CONFLICT (cs, n) DO NOTHING",
                 &[
                     P::bytes(&id_bytes(id.as_bytes())),
-                    P::i64(n),
-                    P::bytes(&id_bytes(parent.as_bytes())),
+                    P::bytea_array(parents.clone()),
                 ],
             )?;
         }
@@ -2012,6 +2020,22 @@ impl MetaTx for PgTx<'_> {
             &[P::i64(repo.0), P::bytes(&id_bytes(blob.as_bytes()))],
         )?;
         Ok(added == 1)
+    }
+
+    /// Adds every blob as one statement, however many the changeset
+    /// puts.
+    fn add_repo_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<()> {
+        if blobs.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<Vec<u8>> = blobs.iter().map(|blob| id_bytes(blob.as_bytes())).collect();
+        self.c.execute(
+            "INSERT INTO repo_blobs (repo_id, blob)
+             SELECT $1, x FROM unnest($2::bytea[]) AS x
+             ON CONFLICT (repo_id, blob) DO NOTHING",
+            &[P::i64(repo.0), P::bytea_array(ids)],
+        )?;
+        Ok(())
     }
 
     /// Whether `repo` may name `blob`.
@@ -2444,6 +2468,23 @@ impl MetaTx for PgTx<'_> {
             &[P::bytes(&id_bytes(id.as_bytes())), P::bytes(&body)],
         )?;
         Ok(id)
+    }
+
+    /// Stores pre-encoded trees, whose ids are their content hashes, as
+    /// one statement however many the chain built.
+    fn put_trees(&mut self, trees: &[(TreeId, Vec<u8>)]) -> Result<()> {
+        if trees.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<Vec<u8>> = trees.iter().map(|(id, _)| id_bytes(id.as_bytes())).collect();
+        let bodies: Vec<Vec<u8>> = trees.iter().map(|(_, body)| body.clone()).collect();
+        self.c.execute(
+            "INSERT INTO trees (id, body)
+             SELECT * FROM unnest($1::bytea[], $2::bytea[])
+             ON CONFLICT (id) DO NOTHING",
+            &[P::bytea_array(ids), P::bytea_array(bodies)],
+        )?;
+        Ok(())
     }
 
     /// Reads a tree and checks it against its ID.

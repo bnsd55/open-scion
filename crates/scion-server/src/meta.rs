@@ -37,7 +37,7 @@ use gix::ObjectId;
 
 use crate::auth::Caller;
 use crate::db::SqliteTx;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::history::NodeId;
 use crate::land::{LandOutcome, LandRequest, LandState};
 use crate::store::Store;
@@ -222,6 +222,25 @@ pub trait MetaTx {
     /// Stores a tree. Safe to repeat.
     fn put_tree(&mut self, tree: &Tree) -> Result<TreeId>;
 
+    /// Stores pre-encoded trees, whose ids are their content hashes. Safe
+    /// to repeat. The batch is one round trip per table on Postgres,
+    /// however deep the tree chain was; a store that has no batch form
+    /// stores the rows one by one. No id may differ from its body's
+    /// hash: the callers take each id from `encode_with_id`.
+    fn put_trees(&mut self, trees: &[(TreeId, Vec<u8>)]) -> Result<()> {
+        for (id, body) in trees {
+            let (tree, body_id) = Tree::decode_with_id(body)
+                .map_err(|e| Error::Corrupt(format!("tree {id}: {e}")))?;
+            if body_id != *id {
+                return Err(Error::Corrupt(format!(
+                    "tree {id} does not match its body's id {body_id}"
+                )));
+            }
+            self.put_tree(&tree)?;
+        }
+        Ok(())
+    }
+
     /// Reads a tree, and checks it against its ID.
     fn get_tree(&mut self, id: TreeId) -> Result<Tree>;
 
@@ -233,6 +252,17 @@ pub trait MetaTx {
 
     /// Adds a blob to the blobs that `repo` may name. `Ok(true)` if new.
     fn add_repo_blob(&mut self, repo: RepoId, blob: BlobId) -> Result<bool>;
+
+    /// Adds every blob to the blobs that `repo` may name. The batch is
+    /// one round trip on Postgres, however many blobs the changeset
+    /// puts; a store that has no batch form adds them one by one. Each
+    /// blob that is already there stays as it is.
+    fn add_repo_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<()> {
+        for blob in blobs {
+            self.add_repo_blob(repo, *blob)?;
+        }
+        Ok(())
+    }
 
     /// Inserts a land, or finds the land for the same request key. Returns
     /// the repo and the land's outcome, pending or final. `pending_limit`

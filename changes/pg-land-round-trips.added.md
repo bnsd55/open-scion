@@ -17,5 +17,14 @@ generation is fixed at insert and never updated, so the derived walks
 and the land that ask for the same few ids again get them from the
 transaction's own cache, and a merge reads every parent's generation
 in one statement instead of one per parent. The guard's limits fell
-from 51 to 48 and from 56 to 55 with this change, and each further
-step of the plan lowers them again.
+from 51 to 48 and from 56 to 55 with this change.
+
+The multi-row writes went the same way: the trees a change builds land
+as one statement per table instead of one per row, and so do the blobs
+a changeset puts and the rows of its parents - the work that scales
+with the change's width. A third guard case pins that: a land of 50
+files ran 106 statements before the batch and 56 after.
+
+A repeated parent now stores the same way on both backends (the
+batched read had diverged from the per-row loop on Postgres), and a
+test holds the two backends to the same answer.

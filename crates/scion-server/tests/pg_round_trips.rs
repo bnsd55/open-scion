@@ -30,7 +30,7 @@ use scion_server::{Access, Backend, ImportOptions, Keys, Metrics, import_git};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tonic::metadata::AsciiMetadataValue;
-use tonic::service::interceptor::Interceptor;
+use tonic::service::interceptor::{InterceptedService, Interceptor};
 use tonic::transport::Channel;
 use tonic::{Request};
 
@@ -47,6 +47,11 @@ const BUDGET: u64 = 48;
 /// The same for a land whose base is no longer the ref's head, so the
 /// land must rebase: the slow case under contention.
 const REBASE_BUDGET: u64 = 55;
+
+/// The same for a wide land: a merge of two parents that puts 50 files.
+/// The multi-row writes batch what scales with the changeset's width:
+/// one statement per table instead of one per row.
+const WIDE_BUDGET: u64 = 56;
 
 /// A one-commit git repository, imported on `main`.
 fn git_seed() -> (TempDir, ChangesetId) {
@@ -103,20 +108,32 @@ fn open_store(dir: &Path) -> Backend {
 
 /// One created changeset on top of `base`.
 fn create(store: &Backend, base: ChangesetId, path: &str) -> ChangesetId {
+    create_many(store, &[base], &[(path, "one")])
+}
+
+/// One created changeset over `bases`, one file per (path, content).
+fn create_many(store: &Backend, bases: &[ChangesetId], files: &[(&str, &str)]) -> ChangesetId {
     let repo = store.read(|c| c.repo_id(REPO)).unwrap();
-    let upload = store.blobs().upload().unwrap();
-    let upload = upload.append(path.as_bytes()).unwrap();
-    let file = FileState::Regular {
-        content: write::put_blob(store, repo, upload).unwrap(),
-        executable: false,
-    };
+    let mut changes = BTreeMap::new();
+    for (path, content) in files {
+        let upload = store.blobs().upload().unwrap();
+        let upload = upload.append(content.as_bytes()).unwrap();
+        let file = FileState::Regular {
+            content: write::put_blob(store, repo, upload).unwrap(),
+            executable: false,
+        };
+        changes.insert(
+            RepoPath::new(path.as_bytes()).expect("a plain path"),
+            Some(file),
+        );
+    }
     let cs = Changeset::new(
-        vec![base],
+        bases.to_vec(),
         IdentityTime::new(b"Ada".to_vec(), b"ada@example.com".to_vec(), 1_700_000_100, 0)
             .expect("identity fits the format"),
         None,
-        path.as_bytes().to_vec(),
-        BTreeMap::from([(RepoPath::new(path).expect("a plain path"), Some(file))]),
+        b"wide\n".to_vec(),
+        changes,
     )
     .expect("changeset fits the format");
     write::create_changeset(store, REPO, &cs.encode()).unwrap()
@@ -144,6 +161,7 @@ fn bearer() -> impl Interceptor {
 #[tokio::test(flavor = "multi_thread")]
 async fn one_land_stays_under_the_round_trip_budget() {
     if !Backend::test_is_postgres() {
+        println!("skipping: Postgres only");
         return;
     }
     let (dir, tip) = git_seed();
@@ -153,18 +171,71 @@ async fn one_land_stays_under_the_round_trip_budget() {
     // slow case under contention).
     let cs = create(&store, tip, "landed.txt");
     let cs2 = create(&store, tip, "rebased.txt");
+    // The stop sender keeps the server up; hold it through the test.
+    let (_stop, mut client) = serve(&dir, &store).await;
 
-    // The real server handler: one `service::serve` on the store, one
-    // gRPC client, and the land goes through the same code a client's
-    // land rides.
+    // The fast land.
+    let statements = land_through(&mut client, cs).await;
+    println!("one land through the server ran {statements} statements");
+    for sql in Backend::test_statement_log() {
+        println!("  {sql}");
+    }
+    assert!(
+        statements <= BUDGET,
+        "one land through the server ran {statements} statements, above the budget {BUDGET}"
+    );
+
+    // The rebase land: main moved since cs2's base, so the land must
+    // rebase - the slow case under contention.
+    let rebased = land_through(&mut client, cs2).await;
+    println!("one rebase land through the server ran {rebased} statements");
+    assert!(
+        rebased <= REBASE_BUDGET,
+        "one rebase land through the server ran {rebased} statements, above the budget {REBASE_BUDGET}"
+    );
+
+    // The wide land: 50 files in one changeset, so the per-row writes
+    // have rows to batch. (A client changeset carries exactly one
+    // parent; merges come from git import, whose statements the import
+    // path batches separately.)
+    let files: Vec<(String, String)> = (0..50)
+        .map(|i| (format!("wide/{i}.txt"), format!("file {i}\n")))
+        .collect();
+    let wide = create_many(
+        &store,
+        &[cs],
+        &files
+            .iter()
+            .map(|(p, c)| (p.as_str(), c.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let wide_statements = land_through(&mut client, wide).await;
+    println!("one wide land through the server ran {wide_statements} statements");
+    assert!(
+        wide_statements <= WIDE_BUDGET,
+        "one wide land through the server ran {wide_statements} statements, above the budget {WIDE_BUDGET}"
+    );
+}
+
+/// The real server handler: one `service::serve` on the store, one gRPC
+/// client, and every land below goes through the same code a client's
+/// land rides. Waits for the startup stale-land sweep, which is the only
+/// database-speaking background task the server runs; the next sweep is
+/// an hour away, and no other spawned task speaks SQL.
+async fn serve(
+    dir: &TempDir,
+    store: &Backend,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    ScionClient<InterceptedService<Channel, impl Interceptor>>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop_tx, stopped) = tokio::sync::oneshot::channel::<()>();
-    let access = access();
     tokio::spawn(service::serve(
         store.clone(),
         listener,
-        access,
+        access(),
         service::ServeOptions {
             data: dir.path().to_path_buf(),
             audit: Audit::off(),
@@ -186,14 +257,7 @@ async fn one_land_stays_under_the_round_trip_budget() {
         .connect()
         .await
         .unwrap();
-    let mut client = ScionClient::with_interceptor(channel, bearer());
-
-    // The server's first stale-land sweep is the only database-speaking
-    // background task it runs; the counted window waits for that pass,
-    // and the next one is an hour away. No other spawned task of the
-    // server speaks SQL in the window: metrics, audit, and the
-    // free-space poll touch no database, and the land call is the only
-    // client.
+    let client = ScionClient::with_interceptor(channel, bearer());
     let waited = tokio::time::timeout(Duration::from_secs(10), async {
         while !Backend::test_first_sweep_done() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -201,7 +265,15 @@ async fn one_land_stays_under_the_round_trip_budget() {
     })
     .await;
     assert!(waited.is_ok(), "the startup sweep never finished");
+    (stop_tx, client)
+}
 
+/// One land through the server, counted: resets the statement counter,
+/// lands `cs` on `main`, and returns the statements the land ran.
+async fn land_through(
+    client: &mut ScionClient<InterceptedService<Channel, impl Interceptor>>,
+    cs: ChangesetId,
+) -> u64 {
     Backend::test_reset_statement_count();
     let reply = client
         .land(LandRequest {
@@ -214,38 +286,5 @@ async fn one_land_stays_under_the_round_trip_budget() {
         .expect("the land lands")
         .into_inner();
     assert_eq!(reply.state(), scion_proto::v1::LandState::Landed);
-
-    let statements = Backend::test_statement_count();
-    println!("one land through the server ran {statements} statements");
-    for sql in Backend::test_statement_log() {
-        println!("  {sql}");
-    }
-    assert!(
-        statements <= BUDGET,
-        "one land through the server ran {statements} statements, above the budget {BUDGET}"
-    );
-
-    // The rebase land: main moved since cs2's base, so the land must
-    // rebase - the slow case under contention.
-    Backend::test_reset_statement_count();
-    let reply = client
-        .land(LandRequest {
-            repo: REPO.into(),
-            changeset_id: cs2.as_bytes().to_vec(),
-            target_ref: "main".into(),
-            request_key: cs2.to_string(),
-        })
-        .await
-        .expect("the land lands")
-        .into_inner();
-    drop(client);
-    drop(stop_tx);
-    assert_eq!(reply.state(), scion_proto::v1::LandState::Landed);
-
-    let rebased = Backend::test_statement_count();
-    println!("one rebase land through the server ran {rebased} statements");
-    assert!(
-        rebased <= REBASE_BUDGET,
-        "one rebase land through the server ran {rebased} statements, above the budget {REBASE_BUDGET}"
-    );
+    Backend::test_statement_count()
 }
