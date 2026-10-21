@@ -1440,88 +1440,33 @@ impl Scion for ScionService {
         // The ref's current target, so the audit's ref line can name
         // what it moved from. A ref that does not exist yet moves from
         // nothing.
-        let old = self
-            .worker
-            .run({
-                let repo = req.repo.clone();
-                let target_ref = req.target_ref.clone();
-                move |store| {
-                    Ok(store
-                        .resolve_ref(&repo, &target_ref)
-                        .ok()
-                        .map(|id| hex_id(id.as_bytes())))
-                }
-            })
-            .await
-            .ok()
-            .flatten();
         let (lands, access) = (Arc::clone(&self.lands), Arc::clone(&self.access));
         let (repo, target_ref) = (req.repo.clone(), req.target_ref.clone());
+        let (repo_for_job, target_ref_for_job) = (req.repo.clone(), req.target_ref.clone());
         // The land's own result comes back inside an Ok, so this handler,
         // not the worker, builds the reply's Status: a land that ends in
         // an error moves the land counter, by the code of the reply the
-        // caller saw.
+        // caller saw. The ref's current target reads inside the same
+        // task as the land: the audit's ref line needs it, and a task
+        // of its own would race a caller that cancels between it and
+        // the land.
         let ran = self
             .worker
             .run(move |store| {
                 // A rebase keeps the changes, so these are the paths that the
                 // land changes, on any ref of the repo. Checked on every call,
                 // before the land records anything, also on a retry.
-                // A rebase keeps the changes, so these are the paths that the
-                // land changes, on any ref of the repo. Checked on every call,
-                // before the land records anything, also on a retry. The
-                // outer Result is the checks and the worker's own failures;
-                // the inner one is the land's own verdict, whose code the
-                // reply names.
-                let outcome = (|| {
-                    let cs = read::get_changeset(&store, &req.repo, req.changeset)?;
-                    access.check_write(&caller, &req.repo, cs.changes().keys())?;
-                    Ok(lands.land(&store, &caller, &req).map_err(Status::from))
-                })();
-                // The job that changed the state writes the state change's
-                // own lines, after the commit and outside the write
-                // transaction: the evidence does not depend on the call
-                // that asked for the land living on. The worker's own
-                // failures (a panic, a shutdown) built no land outcome,
-                // and the worker logged them.
-                match &outcome {
-                    Ok(Ok(outcome)) => {
-                        for line in Self::land_result_lines(
-                            &job_request_id,
-                            &job_principal,
-                            &job_repo,
-                            &job_ref,
-                            outcome,
-                        ) {
-                            Self::audit_result_blocking(&audit, &line);
-                        }
-                    }
-                    Ok(Err(status)) => {
-                        Self::audit_result_blocking(
-                            &audit,
-                            &crate::audit::Event::new(
-                                "land",
-                                "failed",
-                                json_fields(
-                                    &job_request_id,
-                                    &job_principal,
-                                    &serde_json::json!({
-                                        "rpc": "Land",
-                                        "repo": job_repo,
-                                        "ref": job_ref,
-                                        "why": code_label(status.code()),
-                                    }),
-                                ),
-                            ),
-                        );
-                    }
-                    Err(_) => {}
-                }
-                outcome
+                let cs = read::get_changeset(&store, &req.repo, req.changeset)?;
+                access.check_write(&caller, &req.repo, cs.changes().keys())?;
+                let old = store
+                    .resolve_ref(&repo_for_job, &target_ref_for_job)
+                    .ok()
+                    .map(|id| hex_id(id.as_bytes()));
+                Ok((old, lands.land(&store, &caller, &req)))
             })
             .await;
-        match outcome {
-            Ok(Ok(outcome)) => self
+        match ran {
+            Ok((old, Ok(outcome))) => self
                 .land_recorded(
                     &request_id,
                     &principal,
@@ -1532,7 +1477,7 @@ impl Scion for ScionService {
                 )
                 .await
                 .map(|outcome| Response::new(land_response(outcome))),
-            Ok(Err(e)) => {
+            Ok((_, Err(e))) => {
                 let status = Status::from(e);
                 self.metrics.land(code_label(status.code()));
                 self.audit_result(
