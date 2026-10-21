@@ -43,6 +43,11 @@ jobs:
         run: scripts/check-changelog.sh
       - name: the changelog merge script does what it says
         run: scripts/test-merge-changelog.sh
+      # A workflow that cannot parse fails here, on the PR that carries
+      # it, not main's next push-triggered run (#416, #419). The
+      # actionlint release is pinned by version and sha256.
+      - name: the workflows parse (actionlint)
+        run: scripts/lint-workflows.sh
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
