@@ -207,11 +207,17 @@ async fn a_second_signal_ends_the_drain_of_an_open_call() {
         .expect("the named watch stays open through the drain")
         .expect("a status update");
     assert_eq!(update.status(), ServingStatus::NotServing);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(
-        server.child.try_wait().unwrap().is_none(),
-        "the drain ended while the watch was open"
-    );
+    // The drain must hold while the watch is open: a negative cannot be
+    // polled for once, so it is asserted across a window. A slow machine
+    // only widens the check, and a broken drain fails inside it.
+    let give_up = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < give_up {
+        assert!(
+            server.child.try_wait().unwrap().is_none(),
+            "the drain ended while the watch was open"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     // The second signal cuts the drain: the process ends promptly, with a
     // non-zero exit code, and the log names the cut.

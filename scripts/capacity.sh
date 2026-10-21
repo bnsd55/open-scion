@@ -48,10 +48,12 @@ READ_SECONDS=${READ_SECONDS:-90}
 CELL_WARM_SECONDS=${CELL_WARM_SECONDS:-60}
 CAPACITY_MACHINE=${CAPACITY_MACHINE:-unknown runner}
 RUN_URL=${RUN_URL:-}
-PGFLAGS=()
-if [ -n "${SCION_PG_URL:-}" ]; then
-  PGFLAGS=(--postgres-url "$SCION_PG_URL")
-fi
+# The Postgres cells take their URL from the env, not the command line:
+# the env is quiet (main.rs's postgres_url_of), and it reaches every
+# scion-server this script starts through common.sh's start_scion too.
+# Empty means sqlite, and an empty value is filtered, so one export
+# serves both backends.
+export SCION_POSTGRES_URL=${SCION_PG_URL:-}
 
 # classifies LOG: the soak's accepted failures. A cell whose clients
 # failed with anything else is past the edge; the run stops there.
@@ -111,7 +113,7 @@ for backend in sqlite postgres; do
   rm -rf "$WORK/server"
   note "importing for $backend"
   /usr/bin/time -p "$BIN/scion-server" --data "$WORK/server" import \
-    "${PGFLAGS[@]+"${PGFLAGS[@]}"}" --rev main "$WORK/src.git" \
+    --rev main "$WORK/src.git" \
     > "$WORK/import-$backend.out" 2> "$WORK/import-$backend.log" || {
     tail -n 20 "$WORK/import-$backend.log" >&2
     die "the $backend import failed"
