@@ -312,14 +312,24 @@ stop_one() {
   comm=$(sed -n 's/^comm=//p' "$f")
   rm -f "$f" "$1/$2.log.pid"
   [ -n "$pid" ] || return 0
-  # The pidfile's job must still be the one it recorded: a pid the
-  # system has since given to another program is left alone.
-  have=$(ps -o comm= -p "$pid" 2> /dev/null)
-  case "$have" in
-    "") return 0 ;;
-    *"$comm") ;;
-    *) return 0 ;;
-  esac
+  # The group is the identity, not a name: a live group holds the
+  # recorded id, so it is ours whatever program it runs now. Without a
+  # live group, a live pid whose program is not the recorded one is
+  # skipped, with a line: silence here is how a skipped cleanup hides.
+  if [ -n "$pgid" ] && kill -0 "-$pgid" 2> /dev/null; then
+    :
+  elif ! kill -0 "$pid" 2> /dev/null; then
+    return 0
+  else
+    have=$(ps -o comm= -p "$pid" 2> /dev/null)
+    case "$have" in
+      *"$comm") ;;
+      *)
+        note "skipped $name: pid $pid runs '$have', not the recorded '$comm'"
+        return 0
+        ;;
+    esac
+  fi
   kill -TERM "-$pgid" 2> /dev/null || kill -TERM "$pid" 2> /dev/null || true
   n=0
   while kill -0 "$pid" 2> /dev/null && [ "$n" -lt 100 ]; do

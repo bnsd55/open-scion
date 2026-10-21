@@ -130,13 +130,15 @@ import_dataset() {
 # interrupt or timeout leaves no server behind it. (The orphans that
 # ran for hours were servers with no one left to stop them.)
 start() {
-  local name=$1 ready=$2 tries=300 pid
+  local name=$1 ready=$2 tries=300 pid job
   shift 2
   mkdir -p "$WORK/owned"
-  # perl puts the job in its own process group, records the group's id
-  # itself (the shell's $! may be a subshell, not the job), and execs
-  # /usr/bin/time; the whole tree — time and the server — shares that
-  # one group, whose id is the recorded pid.
+  # The layout: the job ($!, a child of this shell) runs
+  # /usr/bin/time; time forks the wrapper perl, which puts itself in a
+  # group of its own — the group id is the wrapper's pid — and execs
+  # the program. The group holds the program alone; time stays in this
+  # shell's group, which is why stop waits on the job: it is what
+  # makes time's report land in the log before stop returns.
   OWNED_INFO="$WORK/.owned.$name" OWNED_CMD="$*" \
     /usr/bin/time -p perl -e '
       use POSIX qw(setpgid);
@@ -158,10 +160,10 @@ start() {
   # recorded is recorded as the shell saw it; the readiness loop below
   # fails the start either way.
   if [ -s "$WORK/.owned.$name" ]; then
-    { cat "$WORK/.owned.$name"; echo "comm=time"; echo "prog=$(basename "$1")"; echo "cmd=$*"; } \
+    { cat "$WORK/.owned.$name"; echo "job=$job"; echo "cmd=$*"; } \
       > "$WORK/owned/$name"
   else
-    { echo "pid=$job"; echo "pgid="; echo "comm=time"; echo "prog=$(basename "$1")"; echo "cmd=$*"; } \
+    { echo "pid=$job"; echo "pgid="; echo "job=$job"; echo "cmd=$*"; } \
       > "$WORK/owned/$name"
   fi
   rm -f "$WORK/.owned.$name"
@@ -216,31 +218,35 @@ owned_cleanup() {
   done
 }
 
-# owned_stop_one PIDFILE: the one process one pidfile names. It kills
-# only after the job is still the one the file recorded — a pid the
-# system has since given to another program is left alone.
+# owned_stop_one PIDFILE: the one process one pidfile names. The group
+# is the identity, not a name: a live group holds the recorded id, and
+# the system does not hand out a pid that is still a live group's id,
+# so a recorded group with members is ours whatever program it runs —
+# a wrapper that execed another program is still ours to stop. A
+# record with no group (a function loop) falls back to the pid, and a
+# live pid whose program is not the recorded one is skipped, with a
+# line saying so: silence here is how a skipped cleanup hides.
 owned_stop_one() {
-  local f=$1 pid pgid comm prog have
+  local f=$1 pid pgid job have
   pid=$(sed -n 's/^pid=//p' "$f")
   pgid=$(sed -n 's/^pgid=//p' "$f")
-  comm=$(sed -n 's/^comm=//p' "$f")
-  prog=$(sed -n 's/^prog=//p' "$f")
+  job=$(sed -n 's/^job=//p' "$f")
   [ -n "$pid" ] || { rm -f "$f"; return 0; }
-  have=$(ps -o comm= -p "$pid" 2> /dev/null)
-  # The job is still ours when its program name matches: exactly, or
-  # with the path ps prints on a platform whose time(1) execs the
-  # command. Anything else is a pid the system gave away since.
-  case "$have" in
-    "") ;;
-    *"$comm"|*"/$prog"|"$prog") ;;
-    *)
-      rm -f "$f"
-      return 0
-      ;;
-  esac
-  owned_kill "$pid" "$pgid"
+  if [ -n "$pgid" ] && kill -0 "-$pgid" 2> /dev/null; then
+    owned_kill "$pid" "$pgid"
+  elif kill -0 "$pid" 2> /dev/null; then
+    have=$(ps -o comm= -p "$pid" 2> /dev/null)
+    case "$have" in
+      *bash)
+        owned_kill "$pid" ""
+        ;;
+      *)
+        echo "owned: skipped $f: pid $pid runs '$have', not what the record names" >&2
+        ;;
+    esac
+  fi
   rm -f "$f"
-  wait "$pid" 2> /dev/null || true
+  wait "$job" 2> /dev/null || true
 }
 
 # loop_bg NAME FUNC ARGS...: runs FUNC in the background as one the

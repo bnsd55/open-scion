@@ -1,0 +1,7 @@
+#!/bin/bash
+# The stand-in for a long-running server in the owned-process test: it
+# prints the serving line the start helper waits for, then sleeps, so
+# the test needs no build. A wrapper (env, a shim) execing this runs in
+# the same process group, which is the point of the wrapper case.
+echo "serving listen=127.0.0.1:0"
+sleep 300

@@ -1,10 +1,8 @@
 #!/bin/bash
-# The proof of the owned-process rules (scripts/common.sh): a script
-# that starts a server and then dies by error leaves no process behind,
-# and the process runs in a group of its own, recorded with the command
-# that started it. The child here starts one server, prints what it
-# recorded, waits for the word, and dies by error; this script then
-# checks that nothing is left and that the record said what it should.
+# The proof of the owned-process rules (scripts/common.sh), against a
+# stand-in server that needs no build: the recorded job runs in a group
+# of its own; then the script dies by error, the way a red CI step
+# does, and the parent checks what it left behind.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/common.sh"
@@ -15,22 +13,15 @@ fail() {
 }
 
 make_work test-owned
+standin="$here/test-owned-standin"
 
-BIN="$here/../target/release"
-[ -x "$BIN/scion-server" ] || BIN="$here/../target/debug"
-[ -x "$BIN/scion-server" ] || {
-  note "building a debug scion-server for the owned-process test"
-  cargo build --quiet -p open-scion-server --bin scion-server || fail "the build failed"
-  BIN="$here/../target/debug"
-}
-
-# One server, started the owned way. Its record goes to the parent's
-# file; then the script dies by error, the way a red CI step does.
-record=$1
-start server serving "$BIN/scion-server" --data "$WORK/server" serve \
-  --listen "127.0.0.1:$((21000 + $$ % 20000))"
-cp "$WORK/owned/server" "$record"
+# Case 1: the plain job. Its record goes to the file the parent names;
+# then the script dies by error, the way a red CI step does.
+start server serving "$standin"
+pid=$(sed -n 's/^pid=//p' "$WORK/owned/server")
 pgid=$(sed -n 's/^pgid=//p' "$WORK/owned/server")
+[ -n "$pid" ] && [ -n "$pgid" ] || fail "the record is incomplete"
 [ "$pgid" != "$(ps -o pgid= -p $$ | tr -d ' ')" ] \
   || fail "the server shares this script's process group"
+cp "$WORK/owned/server" "$1"
 exit 1
