@@ -155,8 +155,9 @@ pub struct LandOutcome {
     /// The rebased changeset, when landed.
     pub result: Option<ChangesetId>,
     /// The ref's target the land's move replaced, when landed: the head
-    /// the land rebased onto, recorded with the move under the ref's
-    /// lock. A replay reports the first move's value.
+    /// the land rebased onto, set where the move happens, under the
+    /// ref's lock, and not stored. A replay has none: the move's head
+    /// lives in the land line of the call that made the move.
     pub previous: Option<ChangesetId>,
     /// Whether this call's own settle moved the ref. A replay of an
     /// already-landed request reports the first move's outcome, and
@@ -653,30 +654,14 @@ fn settle(
         Plan::Reject(detail) => {
             return store
                 .commit(|c| {
-                    c.set_land_state(
-                        repo,
-                        land_id,
-                        LandState::Rejected,
-                        None,
-                        None,
-                        detail,
-                        vec![],
-                    )
+                    c.set_land_state(repo, land_id, LandState::Rejected, None, detail, vec![])
                 })
                 .map(Finished::Outcome);
         }
         Plan::Conflict(detail, paths) => {
             return store
                 .commit(|c| {
-                    c.set_land_state(
-                        repo,
-                        land_id,
-                        LandState::Conflict,
-                        None,
-                        None,
-                        detail,
-                        paths,
-                    )
+                    c.set_land_state(repo, land_id, LandState::Conflict, None, detail, paths)
                 })
                 .map(Finished::Outcome);
         }
@@ -697,18 +682,20 @@ fn settle(
             )));
         }
         let generation = c.generation(repo, id)?;
-        let outcome = c.set_land_state(
+        let mut outcome = c.set_land_state(
             repo,
             land_id,
             LandState::Landed,
             Some(id),
-            // The move's CAS pins the version the plan read, so
-            // `head.target` is the target this move replaced: the
-            // audit's old value, read under the ref's lock.
-            Some(head.target),
             String::new(),
             vec![],
         )?;
+        // The move's CAS pins the version the plan read, so
+        // `head.target` is the target this move replaced: the audit's
+        // old value, set here where the move happens, under the ref's
+        // lock, and not stored.
+        outcome.moved = true;
+        outcome.previous = Some(head.target);
         Ok((outcome, generation))
     });
     match landed {
@@ -726,15 +713,7 @@ fn settle(
             let detail = format!("does not apply to {target:?}: {e}");
             store
                 .commit(|c| {
-                    c.set_land_state(
-                        repo,
-                        land_id,
-                        LandState::Conflict,
-                        None,
-                        None,
-                        detail,
-                        vec![],
-                    )
+                    c.set_land_state(repo, land_id, LandState::Conflict, None, detail, vec![])
                 })
                 .map(Finished::Outcome)
         }
@@ -1297,24 +1276,10 @@ mod tests {
     }
 
     /// The stored fields of an outcome: a replay returns the first
-    /// call's outcome, except `moved`, which says whether the call
-    /// itself moved the ref.
-    fn stored(
-        out: &LandOutcome,
-    ) -> (
-        i64,
-        LandState,
-        Option<ChangesetId>,
-        Option<ChangesetId>,
-        String,
-    ) {
-        (
-            out.land_id,
-            out.state,
-            out.result,
-            out.previous,
-            out.detail.clone(),
-        )
+    /// call's outcome. `moved` and `previous` are set in memory by the
+    /// call that moved the ref, and a replay has none.
+    fn stored(out: &LandOutcome) -> (i64, LandState, Option<ChangesetId>, String) {
+        (out.land_id, out.state, out.result, out.detail.clone())
     }
 
     fn caller() -> Caller {
