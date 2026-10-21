@@ -6,7 +6,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write as _;
+use std::io::{self, Write as _};
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use gix::ObjectId;
@@ -94,10 +95,25 @@ pub fn export(
     let mut total_refs = 0_u64;
     let mut total_lands = 0_u64;
     let mut total_members = 0_u64;
+    // The archive's root: made recursively, as before — the operator
+    // names a path whose parents may not exist, and the fold risk this
+    // module guards is between REPO names, not in the operator's own
+    // path. Each section directory below is a NON-recursive create, so
+    // a fold on the disk is an error, not a silent reuse of another
+    // repo's directory.
+    make_dir(out)?;
+    let repos_dir = out.join("repos");
+    fs::DirBuilder::new()
+        .create(&repos_dir)
+        .map_err(|error| Error::Corrupt(format!("cannot make {}: {error}", repos_dir.display())))?;
+    // The section directories this export made, by their (device,
+    // inode): on a disk that folds names, two repos' directories can be
+    // one directory, and the disk is the only judge of that.
+    let mut made: HashMap<(u64, u64), String> = HashMap::new();
     for name in &names {
         let section = snapshot_section(store, name)?;
 
-        let report = write_section(data, out, &section)?;
+        let report = write_section(data, out, &section, &mut made)?;
         total_changesets += report.changesets;
         total_refs += report.refs;
         total_lands += report.lands;
@@ -147,7 +163,13 @@ pub fn verify(archive: &Path) -> Result<Vec<String>> {
     // The manifest is data from a file: a name twice means the reader
     // and the restore would both walk the repo twice, and the restore
     // would replay two stores into one. Name it before anything else.
+    // And on a disk that folds names, two names can be one directory:
+    // the disk's own (device, inode) is the judge, not our fold. The
+    // section of a folded pair is one directory read twice, and the
+    // restore would replay one repo's data under both names.
     let mut seen_names = HashSet::new();
+    let mut seen_dirs: HashMap<(u64, u64), String> = HashMap::new();
+    let mut sections = Vec::new();
     for name in &names {
         if !seen_names.insert(name) {
             damages.push(format!(
@@ -155,6 +177,16 @@ pub fn verify(archive: &Path) -> Result<Vec<String>> {
             ));
             continue;
         }
+        // The disk, not a fold table, judges whether two names are one
+        // directory: a symlink stands in for another section, and a
+        // folded pair is one directory read twice.
+        let dir = archive.join("repos").join(name);
+        match check_section_dir(&dir, name, &mut seen_dirs) {
+            Ok(()) => sections.push(name.clone()),
+            Err(damage) => damages.push(damage),
+        }
+    }
+    for name in &sections {
         let dir = archive.join("repos").join(name);
         let changesets = read_changesets(&dir.join("changesets.bin"))?;
         let members = read_members(&dir.join("members.txt"))?;
@@ -247,6 +279,38 @@ pub fn verify(archive: &Path) -> Result<Vec<String>> {
         }
     }
     Ok(damages)
+}
+
+/// Checks that the section directory of `name` is a plain directory,
+/// and that the disk does not fold it onto a directory another name
+/// already claimed. One damage per failure, naming both names on a
+/// fold.
+fn check_section_dir(
+    dir: &Path,
+    name: &str,
+    seen_dirs: &mut HashMap<(u64, u64), String>,
+) -> Result<(), String> {
+    let section = match fs::symlink_metadata(dir) {
+        Ok(section) => section,
+        Err(error) => {
+            return Err(format!(
+                "the manifest names repo {name}, whose section cannot be read: {error}"
+            ));
+        }
+    };
+    if section.file_type().is_symlink() || !section.is_dir() {
+        return Err(format!(
+            "the section of repo {name} is not a plain directory"
+        ));
+    }
+    let identity = (section.dev(), section.ino());
+    if let Some(other) = seen_dirs.get(&identity) {
+        return Err(format!(
+            "the repos {other} and {name} fold to one directory on this disk"
+        ));
+    }
+    seen_dirs.insert(identity, name.to_owned());
+    Ok(())
 }
 
 /// Replays an archive into an empty store: the blob bytes go through the
@@ -564,9 +628,35 @@ struct RepoReport {
 }
 
 /// Writes the files of one repo section, and copies its blob files.
-fn write_section(data: &Path, out: &Path, section: &RepoSection) -> Result<RepoReport> {
+fn write_section(
+    data: &Path,
+    out: &Path,
+    section: &RepoSection,
+    made: &mut HashMap<(u64, u64), String>,
+) -> Result<RepoReport> {
     let dir = out.join("repos").join(&section.name);
-    make_dir(&dir)?;
+    // One non-recursive create per section: on a disk that folds names
+    // (case, Unicode normalization) a second repo whose name folds into
+    // an earlier one's lands in the SAME directory, and its files
+    // overwrite the first's — the archive would be corrupt at write
+    // time, silently. AlreadyExists is the fold, and the export names
+    // both names and stops.
+    if let Err(error) = fs::DirBuilder::new().create(&dir) {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            let partner = same_directory(made, &dir, &section.name)?;
+            return Err(Error::Corrupt(format!(
+                "the repos {partner} and {} fold to one directory on this disk; \
+                 export to a case-sensitive disk",
+                section.name
+            )));
+        }
+        return Err(Error::Corrupt(format!(
+            "cannot make {}: {error}",
+            dir.display()
+        )));
+    }
+    let identity = directory_identity(&dir)?;
+    made.insert(identity, section.name.clone());
     write_changesets(&dir.join("changesets.bin"), &section.changesets)?;
     let refs_json: Vec<serde_json::Value> = section
         .refs
@@ -904,6 +994,24 @@ fn snapshot_instant() -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// The (device, inode) of a directory: the disk's own answer to whether
+/// two names name one directory.
+fn directory_identity(dir: &Path) -> Result<(u64, u64)> {
+    let meta = fs::symlink_metadata(dir)
+        .map_err(|error| Error::Corrupt(format!("cannot read {}: {error}", dir.display())))?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+/// The name already recorded for the directory `dir` now stands for, if
+/// one is: the fold partner that the export refuses to overwrite.
+fn same_directory(made: &HashMap<(u64, u64), String>, dir: &Path, name: &str) -> Result<String> {
+    let identity = directory_identity(dir)?;
+    Ok(made
+        .get(&identity)
+        .cloned()
+        .unwrap_or_else(|| name.to_owned()))
 }
 
 fn make_dir(dir: &Path) -> Result<()> {
