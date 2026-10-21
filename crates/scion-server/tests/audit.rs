@@ -7,6 +7,7 @@ use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::ResolveRefRequest;
 use scion_proto::v1::scion_client::ScionClient;
 
+use scion_core::ChangesetId;
 use scion_server::test_support::audit::{Audit, Event};
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::service;
@@ -787,8 +788,7 @@ async fn a_land_whose_call_is_cut_still_writes_its_result_and_ref_lines() {
     // the land's plan checks it between steps (land.rs), so on a slower
     // backend the land may stop as cancelled — still pending, still
     // resumable — instead of landing. Either way the job wrote the
-    // evidence. A moved ref comes only with an ok line, and then the
-    // ref line agrees with it.
+    // evidence.
     let lines = read_lines(&audit_path);
     assert!(
         lines.len() > lines_before,
@@ -808,34 +808,51 @@ async fn a_land_whose_call_is_cut_still_writes_its_result_and_ref_lines() {
             )
         });
     if land_line["outcome"] == "ok" {
-        assert_eq!(
-            land_line["new"],
-            serde_json::Value::String(store.resolve_ref(REPO, "main").unwrap().to_string()),
-            "the land's result names the head it moved to"
-        );
-        let ref_line = refs_needed(&lines, "t-cut");
-        assert_eq!(
-            ref_line["old"],
-            serde_json::Value::String(root.to_string()),
-            "the move names the head it replaced"
-        );
-        assert_eq!(
-            ref_line["new"], land_line["new"],
-            "the ref line and the land line name the same new head"
-        );
+        assert_landed_lines(&store, &lines, land_line, root);
     } else {
-        assert_eq!(
-            land_line["why"], "cancelled",
-            "a cut call's land fails only by its own cancellation"
-        );
-        assert_eq!(
-            store.resolve_ref(REPO, "main").unwrap(),
-            root,
-            "a cancelled land moved no ref; it stays pending for a retry"
-        );
+        assert_cancelled_lines(&store, land_line, root);
     }
 
     stop.send(()).unwrap();
+}
+
+/// A landed result names the head it moved to, and its ref line names
+/// the same new head and the old one it replaced.
+fn assert_landed_lines(
+    store: &Backend,
+    lines: &[serde_json::Value],
+    land_line: &serde_json::Value,
+    root: ChangesetId,
+) {
+    assert_eq!(
+        land_line["new"],
+        serde_json::Value::String(store.resolve_ref(REPO, "main").unwrap().to_string()),
+        "the land's result names the head it moved to"
+    );
+    let ref_line = refs_needed(lines, "t-cut");
+    assert_eq!(
+        ref_line["old"],
+        serde_json::Value::String(root.to_string()),
+        "the move names the head it replaced"
+    );
+    assert_eq!(
+        ref_line["new"], land_line["new"],
+        "the ref line and the land line name the same new head"
+    );
+}
+
+/// A cancelled result names its cancellation, and the land moved no
+/// ref: it stays pending for a retry with the same request key.
+fn assert_cancelled_lines(store: &Backend, land_line: &serde_json::Value, root: ChangesetId) {
+    assert_eq!(
+        land_line["why"], "cancelled",
+        "a cut call's land fails only by its own cancellation"
+    );
+    assert_eq!(
+        store.resolve_ref(REPO, "main").unwrap(),
+        root,
+        "a cancelled land moved no ref; it stays pending for a retry"
+    );
 }
 
 /// A call that sends no request ID — or one the server refuses to log
