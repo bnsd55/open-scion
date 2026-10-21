@@ -224,6 +224,14 @@ pub struct Access {
 }
 
 impl Access {
+    /// How many tokens the access carries: one per line of an access
+    /// file, or the one token of `--token`. The audit's start line
+    /// names it, so an operator can match a config to a log.
+    #[must_use]
+    pub fn token_count(&self) -> usize {
+        self.tokens.len()
+    }
+
     /// One token, whose principal ([`DEFAULT_PRINCIPAL`]) may read and write
     /// every repo.
     #[must_use]

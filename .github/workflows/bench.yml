@@ -55,3 +55,51 @@ jobs:
             ${{ runner.temp }}/bench-output.txt
             ${{ runner.temp }}/bench-logs/
           if-no-files-found: error
+
+  # The capacity envelope (issue #387): one server over a grid of
+  # writers, readers and backends, until the published table is full.
+  # Dispatch only, like the checkout benchmark: a shared runner is
+  # noisy, and the doc's table carries that in its caption. The
+  # Postgres cells need SCION_PG_URL, which the service container
+  # below provides.
+  capacity:
+    name: capacity envelope
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    services:
+      postgres:
+        image: postgres:17.11
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      # The full history: the run's footer names its commit, and the
+      # doc test verifies a named commit exists in a full clone.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: run the capacity grid
+        env:
+          SCION_PG_URL: postgres://postgres@127.0.0.1:5432/scion
+          CAPACITY_MACHINE: "GitHub ubuntu-24.04 hosted runner: 4 vCPU, 16 GiB RAM, 14 GiB SSD"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: scripts/capacity.sh
+      - name: upload the raw output and the logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: capacity-artifacts
+          path: ${{ runner.temp }}/capacity-artifacts/
+          if-no-files-found: error

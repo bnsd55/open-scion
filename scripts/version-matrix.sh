@@ -351,7 +351,7 @@ pair_1() {
   note "pair 1 ($side)"
   import "$dir" "$srv"
   port=$(start server "$dir" "$srv/scion-server" port --data "$dir/server" serve \
-    --listen 127.0.0.1:0 --token matrix --ticket-key "$dir/ticket.key")
+    --listen 127.0.0.1:0 --ticket-key "$dir/ticket.key")
   story "$dir" "http://127.0.0.1:$port"
   stop "$dir"
 }
@@ -366,7 +366,7 @@ pair_2() {
   note "pair 2 ($side)"
   import "$dir" "$srv"
   sport=$(start server "$dir" "$srv/scion-server" port --data "$dir/server" serve \
-    --listen 127.0.0.1:0 --token matrix --ticket-key "$dir/ticket.key" \
+    --listen 127.0.0.1:0 --ticket-key "$dir/ticket.key" \
     --metrics-listen 127.0.0.1:0)
   mport=$(metrics_port "$dir/server.log")
   [ -n "$mport" ] || die "pair '$PAIR' ($SIDE): the server logged no metrics port"
@@ -423,7 +423,7 @@ pair_3() {
   sock="$SOCK-$side"
   rm -f "$sock"
   sport=$(start server "$dir" "$BIN/scion-server" port --data "$dir/server" serve \
-    --listen 127.0.0.1:0 --token matrix --ticket-key "$dir/ticket.key")
+    --listen 127.0.0.1:0 --ticket-key "$dir/ticket.key")
   start daemon "$dir" "$daemon/scion-daemon" serving --data "$dir/daemon-data" \
     --socket "$sock" --upstream "http://127.0.0.1:$sport"
   mkdir -p "$dir/out"
@@ -457,7 +457,7 @@ pair_4() {
   "$BIN/scion-server" --data "$dir/server" fsck >"$dir/fsck.log" 2>&1 ||
     die "pair '$PAIR' ($SIDE): the N server cannot open the N-1 store"
   port=$(start server "$dir" "$BIN/scion-server" port --data "$dir/server" serve \
-    --listen 127.0.0.1:0 --token matrix --ticket-key "$dir/ticket.key")
+    --listen 127.0.0.1:0 --ticket-key "$dir/ticket.key")
   story "$dir" "http://127.0.0.1:$port"
   stop "$dir"
 

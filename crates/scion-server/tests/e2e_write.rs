@@ -97,6 +97,7 @@ async fn uploaded_file_reads_back_through_a_created_changeset() {
         TOKEN,
         service::ServeOptions {
             data: dir.path().to_path_buf(),
+            audit: scion_server::test_support::audit::Audit::off(),
             limits: Limits::default(),
             quotas: scion_server::Quotas::off(),
             pending_lands: None,

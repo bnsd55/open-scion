@@ -315,6 +315,30 @@ pub trait MetaTx {
     /// The blobs that `repo` may name, all of them.
     fn repo_blob_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>>;
 
+    /// The `(changeset ID, generation, body)` of the changesets `repo`
+    /// holds, in generation order. The archive's export reads them in this
+    /// order, and a restore replays them in it, so parents come first.
+    fn repo_changesets_with_bodies(&mut self, repo: RepoId) -> Result<Vec<ChangesetRow>>;
+
+    /// The refs of `repo`, as `(name, target, version)`, in name order.
+    /// The archive's export reads them.
+    fn list_refs(&mut self, repo: RepoId) -> Result<Vec<(String, Vec<u8>, i64)>>;
+
+    /// The lands of `repo` that are still `pending`, as the caller, the
+    /// request key, the target ref, and the input changeset, in land ID
+    /// order. The archive's export reads them.
+    fn pending_lands(&mut self, repo: RepoId) -> Result<Vec<PendingLand>>;
+
+    /// Puts ref `name` of `repo` at `target` with the exact `version`,
+    /// whatever is there now. The archive's restore uses it to carry the
+    /// version the export read; live traffic moves refs with
+    /// [`MetaTx::cas_ref`] instead, which bumps the version.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    fn restore_ref(&mut self, repo: RepoId, name: &str, target: &[u8], version: i64) -> Result<()>;
+
     /// Removes the row that names `blob` for `repo`.
     fn delete_repo_blob(&mut self, repo: RepoId, blob: &[u8]) -> Result<()>;
 
@@ -374,6 +398,24 @@ pub struct RepoId(pub i64);
 /// One stored changeset with its repo, as the collector's walk reads it:
 /// `(repo, changeset ID, body)`.
 pub struct RepoChangeset(pub RepoId, pub Vec<u8>, pub Vec<u8>);
+
+/// One row of [`MetaTx::repo_changesets_with_bodies`]: the changeset's
+/// ID, its derived generation, and its encoded body.
+pub type ChangesetRow = (Vec<u8>, i64, Vec<u8>);
+
+/// A land that is still pending, as the archive's export reads it: the
+/// fields a restore needs to record it again, so a retry with the same
+/// request key resumes it.
+pub struct PendingLand {
+    /// The principal that sent the land.
+    pub caller: String,
+    /// The client's request key, the idempotency of the retry.
+    pub request_key: String,
+    /// The ref the land moves.
+    pub target_ref: String,
+    /// The changeset the land puts on the ref.
+    pub input_cs: Vec<u8>,
+}
 
 /// A derived row of `fsck`: kind, version, changeset, value, and whether
 /// the changeset is stored.
