@@ -945,16 +945,34 @@ impl WalkState {
 /// asked for the walk, once the walk is done and nothing has been stranded
 /// since.
 fn walk_objects(db_path: &Path, objects: &Path, walk: &WalkState) {
-    let db = match rusqlite::Connection::open(db_path) {
-        Ok(db) => db,
-        Err(error) => {
-            // No repo on this line: the store sits below the repos, and the
-            // call whose work failed logs the repo and the caller.
-            tracing::warn!(%error, "the walk cannot open the index; the files stay uncounted");
-            walk.done.store(true, Ordering::Relaxed);
-            return;
-        }
+    // Every exit of the walk passes the tail, where the stop-time work
+    // and the tests' barriers live: an index that failed to open ends
+    // the walk with zero files, like an empty store would.
+    let (files, bytes) = 'walked: {
+        let db = match rusqlite::Connection::open(db_path) {
+            Ok(db) => db,
+            Err(error) => {
+                // No repo on this line: the store sits below the repos, and the
+                // call whose work failed logs the repo and the caller.
+                tracing::warn!(%error, "the walk cannot open the index; the files stay uncounted");
+                break 'walked (0, 0);
+            }
+        };
+        walk_index(&db, objects, walk)
     };
+    walk.done.store(true, Ordering::Relaxed);
+    #[cfg(test)]
+    walk_barrier(0, db_path);
+    tracing::info!(files, bytes, "the walk of the object directories is done");
+    #[cfg(test)]
+    walk_barrier(1, db_path);
+    #[cfg(test)]
+    walk_probe(&db_path.parent().unwrap().join("lock"));
+}
+
+/// The walk of the object directories: every object file that the index
+/// does not name is queued for the store to adopt.
+fn walk_index(db: &rusqlite::Connection, objects: &Path, walk: &WalkState) -> (u64, u64) {
     let _ = db.busy_timeout(std::time::Duration::from_secs(5));
     let mut files = 0u64;
     let mut bytes = 0u64;
@@ -1022,14 +1040,7 @@ fn walk_objects(db_path: &Path, objects: &Path, walk: &WalkState) {
             }
         }
     }
-    walk.done.store(true, Ordering::Relaxed);
-    #[cfg(test)]
-    walk_barrier(0, db_path);
-    tracing::info!(files, bytes, "the walk of the object directories is done");
-    #[cfg(test)]
-    walk_barrier(1, db_path);
-    #[cfg(test)]
-    walk_probe(&db_path.parent().unwrap().join("lock"));
+    (files, bytes)
 }
 
 /// The test's barrier in the walk's tail: the test installs one-shot
@@ -1049,7 +1060,11 @@ fn walk_barrier(n: u8, mine: &Path) {
     let (tx, rx) = pair;
     drop(pairs);
     let _ = tx.send(n);
-    let _ = rx.recv();
+    // Bounded: a test that died before its go must not hold the walk
+    // (and with it this binary) forever.
+    if rx.recv_timeout(std::time::Duration::from_secs(10)).is_err() {
+        tracing::warn!("the test never opened walk barrier {n}; the walk goes on");
+    }
 }
 
 /// The test's witness in the walk's tail: the walk polls the store's
@@ -1065,7 +1080,10 @@ fn walk_probe(lock_path: &Path) {
     let tx = {
         let mut probe = lock(&WALK_PROBE);
         match probe.as_mut() {
-            Some((tx, path)) if path == lock_path => tx.clone(),
+            // The third field says the store holds its directory lock:
+            // without it the lock's freedom means nothing, and a probe
+            // that ran anyway could report a drop that never was.
+            Some((tx, path, true)) if path == lock_path => tx.clone(),
             _ => return,
         }
     };
@@ -1098,16 +1116,20 @@ fn hold_the_walk(
     *lock(&WALK_BLOCK_PAIRS) = pairs.into_iter().map(|p| (p, path.to_path_buf())).collect();
 }
 
+/// One barrier pair and the index path it belongs to: a walk stops only
+/// at the pairs of its own store.
 #[cfg(test)]
-static WALK_BLOCK_PAIRS: std::sync::Mutex<
-    std::collections::VecDeque<(
-        (std::sync::mpsc::Sender<u8>, std::sync::mpsc::Receiver<()>),
-        PathBuf,
-    )>,
-> = std::sync::Mutex::new(std::collections::VecDeque::new());
+type WalkPair = (
+    (std::sync::mpsc::Sender<u8>, std::sync::mpsc::Receiver<()>),
+    PathBuf,
+);
 
 #[cfg(test)]
-static WALK_PROBE: std::sync::Mutex<Option<(std::sync::mpsc::Sender<u8>, PathBuf)>> =
+static WALK_BLOCK_PAIRS: std::sync::Mutex<std::collections::VecDeque<WalkPair>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+#[cfg(test)]
+static WALK_PROBE: std::sync::Mutex<Option<(std::sync::mpsc::Sender<u8>, PathBuf, bool)>> =
     std::sync::Mutex::new(None);
 
 /// A plain `fsync`: data reaches the drive, but on macOS not past its cache
@@ -1659,11 +1681,18 @@ impl Drop for DiskStore {
         // The walk's thread must not outlive the store: it holds its own
         // index connection, and the next store may already be open. Join
         // it before the adopt, so the queue is whole when it is read.
-        // The walk's thread must not outlive the store: it holds its own
-        // index connection, and the next store may already be open. Join
-        // it before the adopt, so the queue is whole when it is read.
-        if let Some(handle) = self.walk_thread.take() {
-            let _ = handle.join();
+        if let Some(handle) = self.walk_thread.take()
+            && let Err(panic) = handle.join()
+        {
+            let message = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "no panic message".to_owned());
+            tracing::warn!(
+                panic = %message,
+                "the index walk panicked; the next start walks the object directories"
+            );
         }
         let disk = self.disk.get_mut().unwrap_or_else(PoisonError::into_inner);
         Self::adopt_walk(walk.as_ref(), self.limit, &self.objects, disk);
@@ -1837,10 +1866,14 @@ mod tests {
         // The walk must be owed: a clean stop leaves none, so the first
         // store is crashed, as a killed daemon leaves its store.
         {
-            let mut store = DiskStore::open(&data, 1 << 20).unwrap();
+            let store = DiskStore::open(&data, 1 << 20).unwrap();
             store.put(a, &frame).unwrap();
             store.crash();
         }
+        // The store canonicalizes its directory (a symlink must not be
+        // followed again), so the walk sees the resolved path: the keys
+        // below are resolved too.
+        let data = fs::canonicalize(&data).unwrap();
         // The walk's two barriers and its probe, installed before the
         // reopen so only this store's walk stops at them.
         let (report0, at0) = std::sync::mpsc::channel();
@@ -1852,13 +1885,25 @@ mod tests {
         // on it, not on the directory.
         let db_path = data.join(INDEX);
         hold_the_walk(&db_path, vec![(report0, wait0), (report1, wait1)]);
-        *lock(&WALK_PROBE) = Some((probe_tx, data.join("lock")));
+        // The store under test holds its directory lock: open took it,
+        // and this store is never crashed, so the probe may watch it.
+        *lock(&WALK_PROBE) = Some((probe_tx, data.join("lock"), true));
         let store = reopen(&data, 1 << 20);
         until(|| store.walk_state().is_some_and(|(_, _, done)| done));
-        // The walk is parked at barrier 0; let it reach barrier 1.
-        assert_eq!(at0.recv().unwrap(), 0);
+        // The walk is parked at barrier 0; let it reach barrier 1. A
+        // walk that ended before a barrier (an index that failed to
+        // open) must fail here with its name, not hang.
+        assert_eq!(
+            at0.recv_timeout(Duration::from_secs(10)).unwrap(),
+            0,
+            "walk barrier 0 never reported"
+        );
         let _ = go0.send(());
-        assert_eq!(at1.recv().unwrap(), 1);
+        assert_eq!(
+            at1.recv_timeout(Duration::from_secs(10)).unwrap(),
+            1,
+            "walk barrier 1 never reported"
+        );
         // Drop the store in its own thread, and let the walk reach the
         // probe, which watches the directory lock from inside the walk.
         let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
@@ -1867,15 +1912,25 @@ mod tests {
             let _ = dropped_tx.send(());
         });
         let _ = go1.send(());
-        assert_eq!(probe_rx.recv().unwrap(), 2);
+        assert_eq!(
+            probe_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            2,
+            "the walk's probe never reported"
+        );
         // The drop must end only after the walk did: the probe says
         // whether the lock ever went free while the walk still ran.
-        let seen = probe_rx.recv();
+        // The probe reports only a lock that went free under the walk:
+        // silence is the good case, and the test's own sender clone in
+        // the static keeps the channel open, so silence is `Timeout`.
+        let seen = probe_rx.recv_timeout(Duration::from_secs(10));
         assert!(
-            seen == Err(std::sync::mpsc::RecvError),
+            seen == Err(std::sync::mpsc::RecvTimeoutError::Timeout),
             "the store was dropped while the walk thread still ran: {seen:?}"
         );
-        dropped_rx.recv().unwrap();
+        assert!(
+            dropped_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "drop never returned after the walk ended"
+        );
         dropper.join().unwrap();
     }
 
