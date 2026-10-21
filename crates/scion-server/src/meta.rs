@@ -42,6 +42,25 @@ use crate::history::NodeId;
 use crate::land::{LandOutcome, LandRequest, LandState};
 use crate::store::Store;
 
+/// One pending land the stale-land sweep found, with everything the
+/// answer to its intent line names: the repo (by ID for the ref's lock,
+/// by name for the line), the land ID, the target ref, the principal
+/// and the request key.
+pub struct StaleLand {
+    /// The repo the land belongs to, as the ref's lock names it.
+    pub repo: RepoId,
+    /// The land row's ID.
+    pub land_id: i64,
+    /// The ref the land would move.
+    pub target_ref: String,
+    /// The principal that asked for the land.
+    pub caller: String,
+    /// The request key a retry would resume the land with.
+    pub request_key: String,
+    /// The repo's name, as an audit line carries it.
+    pub repo_name: String,
+}
+
 /// The metadata storage of a server. One implementation per backend; a
 /// caller holds a concrete one and calls these methods.
 pub trait Meta: Send + Sync + 'static {
@@ -254,9 +273,10 @@ pub trait MetaTx {
         pending_limit: Option<usize>,
     ) -> Result<(RepoId, LandOutcome)>;
 
-    /// Lists the pending lands that started more than `stale_secs` ago, as
-    /// (repo, land ID, target ref).
-    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<(RepoId, i64, String)>>;
+    /// Lists the pending lands that started more than `stale_secs` ago, with
+    /// what an answer to their intent names: the repo and its name, the land
+    /// ID, the target ref, the principal and the request key.
+    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<StaleLand>>;
 
     /// Rejects a land that is still pending, and returns whether it changed
     /// (1) or was no longer pending (0). The caller holds the ref's lock

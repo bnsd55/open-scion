@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use prost::Message as _;
@@ -148,11 +149,19 @@ fn spawn_free_space_poll(
 /// Runs the stale-land sweep at once, then once per [`SWEEP_PERIOD`], until
 /// `stop` resolves. The first sweep settles what a restart left pending
 /// before the first client asks.
-async fn sweeps(worker: Worker, lands: Arc<Lands>, stale_secs: i64, mut stop: watch::Receiver<()>) {
+async fn sweeps(
+    worker: Worker,
+    lands: Arc<Lands>,
+    stale_secs: i64,
+    audit: crate::audit::Audit,
+    mut stop: watch::Receiver<()>,
+) {
     loop {
         let (lands, store) = (Arc::clone(&lands), worker.store());
+        let audit = audit.clone();
         let rejected =
-            tokio::task::spawn_blocking(move || lands.sweep_stale(&store, stale_secs)).await;
+            tokio::task::spawn_blocking(move || lands.sweep_stale(&store, stale_secs, &audit))
+                .await;
         match rejected {
             Ok(Ok(0)) => {}
             Ok(Ok(n)) => tracing::info!(rejected = n, "rejected stale pending lands"),
@@ -296,6 +305,7 @@ pub async fn serve(
         worker.clone(),
         Arc::clone(&lands),
         land_stale_secs,
+        audit.clone(),
         stop_rx,
     ));
     // Outside the access rules, so a refused call counts too. The layer
@@ -376,6 +386,71 @@ pub struct ScionService {
     /// The audit log: state changes record an intent line before they
     /// run and a result line after.
     audit: crate::audit::Audit,
+}
+
+/// One state per land call's answer: the intent is recorded, and
+/// exactly one of the handler's drop and the store job owns the result
+/// line. The job moves it to [`LAND_STARTED`] as its first statement;
+/// the handler's drop moves it to [`LAND_ABANDONED`] and answers only
+/// if its swap won.
+const LAND_INTENT: u8 = 0;
+const LAND_STARTED: u8 = 1;
+const LAND_ABANDONED: u8 = 2;
+
+/// The result line a land call owes its intent. Held by the handler
+/// from before the intent is recorded to the call's end, returned or
+/// dropped: its drop answers with `cancelled` only when the job never
+/// claimed the call, and it hands the line to the audit's writer off
+/// this thread, because a `Drop` must not fsync.
+struct LandAnswer {
+    state: Arc<AtomicU8>,
+    audit: crate::audit::Audit,
+    request_id: String,
+    principal: String,
+    repo: String,
+    target_ref: String,
+}
+
+impl Drop for LandAnswer {
+    fn drop(&mut self) {
+        if self.state.swap(LAND_ABANDONED, Ordering::AcqRel) != LAND_INTENT {
+            // The job claimed the call: its own lines answer the intent.
+            return;
+        }
+        let line = crate::audit::Event::new(
+            "land",
+            "failed",
+            json_fields(
+                &self.request_id,
+                &self.principal,
+                &serde_json::json!({
+                    "rpc": "Land",
+                    "repo": self.repo,
+                    "ref": self.target_ref,
+                    "why": "cancelled",
+                }),
+            ),
+        );
+        let audit = self.audit.clone();
+        let write = move || {
+            if let Err(why) = audit.record_blocking(&line) {
+                tracing::error!(
+                    reason = %why,
+                    "a cancelled land's audit line was not made durable"
+                );
+            }
+        };
+        // Off this thread: a Drop runs on a runtime worker, and a
+        // blocking append there would stall it.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(write);
+            }
+            Err(_) => {
+                std::thread::spawn(write);
+            }
+        }
+    }
 }
 
 impl ScionService {
@@ -639,7 +714,11 @@ pub(crate) fn check_whole_reader(
 }
 
 /// The shared fields of an audit line: who, which call, on which RPC.
-fn json_fields(request_id: &str, principal: &str, fields: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn json_fields(
+    request_id: &str,
+    principal: &str,
+    fields: &serde_json::Value,
+) -> serde_json::Value {
     let mut all = serde_json::json!({
         "request_id": request_id,
         "principal": principal,
@@ -1446,6 +1525,18 @@ impl Scion for ScionService {
         check_name("target_ref", &req.target_ref)?;
         check_name("request_key", &req.request_key)?;
         let principal = caller.0.clone();
+        // The answer the intent will owe: the job claims it as its first
+        // statement; if this call dies first, the guard's drop answers
+        // `cancelled`. One of the two answers, never both, never neither.
+        let answer = Arc::new(AtomicU8::new(LAND_INTENT));
+        let _answering = LandAnswer {
+            state: Arc::clone(&answer),
+            audit: self.audit.clone(),
+            request_id: request_id.clone(),
+            principal: principal.clone(),
+            repo: req.repo.clone(),
+            target_ref: req.target_ref.clone(),
+        };
         self.audit_intent(
             &request_id,
             principal.as_str(),
@@ -1480,6 +1571,15 @@ impl Scion for ScionService {
         let ran = self
             .worker
             .run(move |store| {
+                // The job's first statement claims the call's answer. If
+                // the handler's drop won the race, the call is gone and
+                // its drop has answered `cancelled`: run nothing, answer
+                // nothing more.
+                if answer.swap(LAND_STARTED, Ordering::AcqRel) == LAND_ABANDONED {
+                    return Err(crate::error::Error::Cancelled(
+                        "the call went before the land started".to_owned(),
+                    ));
+                }
                 // A rebase keeps the changes, so these are the paths that the
                 // land changes, on any ref of the repo. Checked on every call,
                 // before the land records anything, also on a retry.

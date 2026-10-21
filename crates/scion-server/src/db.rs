@@ -26,7 +26,7 @@ use crate::land::{
     EXPIRE_PER_LAND, LAND_RETENTION_SECS, LandOutcome, LandRequest, LandState, decode_paths,
     encode_paths,
 };
-use crate::meta::{FsckDerivedRow, MetaTx, RefState, RepoChangeset, RepoId};
+use crate::meta::{FsckDerivedRow, MetaTx, RefState, RepoChangeset, RepoId, StaleLand};
 
 #[cfg(test)]
 thread_local! {
@@ -800,22 +800,26 @@ impl MetaTx for SqliteTx<'_> {
     }
 
     /// The pending lands that started more than `stale_secs` ago.
-    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<(RepoId, i64, String)>> {
+    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<StaleLand>> {
         let mut stmt = self
             .0
             .prepare_cached(
-                "SELECT repo_id, land_id, target_ref FROM lands
-             WHERE state = 'pending' AND created_at > 0
-                 AND created_at < unixepoch() - ?1",
+                "SELECT l.repo_id, l.land_id, l.target_ref, l.caller, l.request_key, r.name
+                 FROM lands l JOIN repos r ON r.repo_id = l.repo_id
+                 WHERE l.state = 'pending' AND l.created_at > 0
+                     AND l.created_at < unixepoch() - ?1",
             )
             .map_err(crate::error::from_sqlite)?;
         let rows = stmt
             .query_map(params![stale_secs], |row| {
-                Ok((
-                    RepoId(row.get(0)?),
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
+                Ok(StaleLand {
+                    repo: RepoId(row.get(0)?),
+                    land_id: row.get(1)?,
+                    target_ref: row.get(2)?,
+                    caller: row.get(3)?,
+                    request_key: row.get(4)?,
+                    repo_name: row.get(5)?,
+                })
             })
             .map_err(crate::error::from_sqlite)?
             .collect::<Result<Vec<_>, _>>()

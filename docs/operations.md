@@ -363,6 +363,14 @@ changes themselves: each job records its result after its change. Each
 ref line names its old and new head, so a ref's history is rebuilt by
 linking old to new, not by line order.
 
+Every intent line gets one result line: the store job that claimed the
+change writes it, and a call that dies before its job starts has its
+drop answer `cancelled`; a land the sweep rejects at the next start is
+answered by the sweep (`why: stale`). One change is left where the
+result can be missing: a job that dies after it claimed the call but
+before it recorded anything - the server log then carries what the
+audit line cannot.
+
 ### Folder read rules
 
 A `read` or `write` rule may name a path prefix as its fourth field, by
