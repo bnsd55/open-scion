@@ -102,6 +102,31 @@ async fn wait_for_lines(path: &std::path::Path, n: usize) {
     );
 }
 
+/// Polls the audit file until a line of `event`/`outcome` is in it.
+/// The refused-auth line is the meter's: it flushes every ten seconds
+/// and once more at stop, so a line count alone can pass while it is
+/// still on the way.
+async fn wait_for_kind(path: &std::path::Path, event: &str, outcome: &str) {
+    for _ in 0..100 {
+        let has = fs::read(path).is_ok_and(|bytes| {
+            String::from_utf8_lossy(&bytes).lines().any(|line| {
+                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|line| {
+                    line["event"] == *event && line["outcome"] == *outcome
+                })
+            })
+        });
+        if has {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let bytes = fs::read(path).unwrap_or_default();
+    panic!(
+        "the audit file never held a {event}/{outcome} line: {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+}
+
 /// The parsed lines of the audit file.
 fn read_lines(path: &std::path::Path) -> Vec<serde_json::Value> {
     let bytes = fs::read(path).unwrap();
@@ -449,6 +474,7 @@ async fn exercise() -> (tempfile::TempDir, std::path::PathBuf) {
 
     // The stop flushes the meter's counts before the server ends.
     stop.send(()).unwrap();
+    wait_for_kind(&audit_path, "auth", "refused").await;
     wait_for_lines(&audit_path, 10).await;
     (dir, audit_path)
 }
