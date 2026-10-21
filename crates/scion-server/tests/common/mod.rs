@@ -268,11 +268,49 @@ impl Server {
 pub(crate) type Scion = ScionClient<InterceptedService<Channel, Bearer>>;
 pub(crate) type Objects = ObjectsClient<InterceptedService<Channel, Bearer>>;
 
-pub(crate) async fn connect(url: &str) -> Result<(Scion, Objects), tonic::transport::Error> {
-    let channel = Channel::from_shared(url.to_owned())
+/// How long a test client may take to connect, and how long one call
+/// may run. A server that dies mid-reply must not leave a client
+/// waiting forever: a Channel without a connect timeout keeps trying
+/// to reconnect, and a call without a deadline waits on the reply for
+/// good. The ceilings fail loud with a name, in seconds, instead of
+/// eating the job's cap.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One channel for a test client: the timeout is the point. Every call
+/// on the channel carries `timeout` (the Endpoint applies it per
+/// request), so a server that dies mid-reply ends the call instead of
+/// parking it. A test that wants a tighter deadline sets its own and
+/// the smaller one fires first.
+pub(crate) async fn channel(url: &str) -> Result<Channel, tonic::transport::Error> {
+    channel_within(url, CALL_TIMEOUT).await
+}
+
+/// The same channel with a ceiling of the test's choosing, for the test
+/// that proves the ceiling itself.
+pub(crate) async fn channel_within(
+    url: &str,
+    timeout: Duration,
+) -> Result<Channel, tonic::transport::Error> {
+    Channel::from_shared(url.to_owned())
         .unwrap()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(timeout)
         .connect()
-        .await?;
+        .await
+}
+
+pub(crate) async fn connect(url: &str) -> Result<(Scion, Objects), tonic::transport::Error> {
+    connect_within(url, CALL_TIMEOUT).await
+}
+
+/// The pair of clients on a channel with a ceiling of the test's
+/// choosing: the proof of the ceiling itself uses 2 s.
+pub(crate) async fn connect_within(
+    url: &str,
+    timeout: Duration,
+) -> Result<(Scion, Objects), tonic::transport::Error> {
+    let channel = channel_within(url, timeout).await?;
     let bearer = Bearer::new(TOKEN).unwrap();
     let objects = ObjectsClient::with_interceptor(channel.clone(), bearer.clone());
     Ok((ScionClient::with_interceptor(channel, bearer), objects))

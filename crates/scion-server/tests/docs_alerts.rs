@@ -146,11 +146,7 @@ async fn runbook() -> Runbook {
             stopped_metrics.await.ok();
         },
     ));
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(&format!("http://{addr}")).await.unwrap();
     Runbook {
         full: ObjectsClient::with_interceptor(channel.clone(), Bearer::new(TOKEN).unwrap()),
         partial: ObjectsClient::with_interceptor(channel, Bearer::new(CHILD).unwrap()),
@@ -219,11 +215,7 @@ fn run_guide_block(heading: &str, metrics_addr: std::net::SocketAddr) -> String 
 /// The calls that put two RPCs' histograms on the wire: an upload and a
 /// read of the root tree.
 async fn warm_the_histograms(rb: &mut Runbook) {
-    let channel = Channel::from_shared(rb.addr.clone())
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(&rb.addr).await.unwrap();
     let mut scion = ScionClient::with_interceptor(channel, Bearer::new(TOKEN).unwrap());
     scion
         .put_blob(tokio_stream::once(PutBlobRequest {
@@ -397,9 +389,7 @@ async fn tier_miss_ratio_falls_when_the_store_serves_the_second_read() {
             stopped_tier_metrics.await.ok();
         },
     ));
-    let channel = Channel::from_shared(format!("http://{cache_addr}"))
-        .unwrap()
-        .connect()
+    let channel = common::channel(&format!("http://{cache_addr}"))
         .await
         .unwrap();
     let mut tier = TierClient::with_interceptor(channel, Bearer::new(TOKEN).unwrap());

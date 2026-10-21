@@ -647,6 +647,13 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn put_trees(&mut self, trees: &[(TreeId, Vec<u8>)]) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.put_trees(trees),
+            Self::Postgres(pg) => pg.put_trees(trees),
+        }
+    }
+
     fn get_tree(&mut self, id: TreeId) -> Result<Tree> {
         match self {
             Self::Sqlite(tx) => tx.get_tree(id),
@@ -672,6 +679,13 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.add_repo_blob(repo, blob),
             Self::Postgres(pg) => pg.add_repo_blob(repo, blob),
+        }
+    }
+
+    fn add_repo_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.add_repo_blobs(repo, blobs),
+            Self::Postgres(pg) => pg.add_repo_blobs(repo, blobs),
         }
     }
 

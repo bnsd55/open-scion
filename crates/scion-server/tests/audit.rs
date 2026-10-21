@@ -113,11 +113,7 @@ async fn serve_with_audit(
 }
 
 async fn client(url: &str, token: &str) -> Scion {
-    let channel = Channel::from_shared(url.to_owned())
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(url).await.unwrap();
     let value = format!("Bearer {token}")
         .parse()
         .expect("a bearer header parses");
@@ -911,3 +907,6 @@ async fn a_call_without_a_request_id_gets_one_from_the_server() {
     let second = pairs[1].0["request_id"].as_str().unwrap();
     assert_ne!(first, second, "two calls made in one process differ");
 }
+
+#[path = "common/mod.rs"]
+mod common;
