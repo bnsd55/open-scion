@@ -208,17 +208,29 @@ fn hex(name: &str) -> String {
 /// A store whose repo `main` has one root changeset that puts `README`,
 /// and a writer who may change every path.
 fn write_access() -> Access {
-    let text = format!("token\tci\t{}\nwrite\tci\t{REPO}\nread\tci\t{REPO}\n", hex("ci"));
+    let text = format!(
+        "token\tci\t{}\nwrite\tci\t{REPO}\nread\tci\t{REPO}\n",
+        hex("ci")
+    );
     Access::parse(&text).expect("the access file parses")
 }
 
 /// A changeset with one parent that puts `path`.
-fn changeset(parents: Vec<scion_core::ChangesetId>, path: &str, content: scion_core::BlobId) -> scion_core::Changeset {
+fn changeset(
+    parents: Vec<scion_core::ChangesetId>,
+    path: &str,
+    content: scion_core::BlobId,
+) -> scion_core::Changeset {
     use scion_core::{FileState, IdentityTime, RepoPath};
     scion_core::Changeset::new(
         parents,
-        IdentityTime::new(b"Ada".to_vec(), b"ada@example.com".to_vec(), 1_700_000_000, 0)
-            .expect("identity fits the format"),
+        IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            0,
+        )
+        .expect("identity fits the format"),
         None,
         b"change\n".to_vec(),
         [(
@@ -285,8 +297,7 @@ async fn a_write_changeset_and_land_record_intent_and_result_pairs() {
 
     // The changeset on top of the root, then the land.
     let root = store.resolve_ref(REPO, "main").unwrap();
-    let (bytes, id) =
-        changeset(vec![root], "docs/guide", blob).encode_with_id();
+    let (bytes, id) = changeset(vec![root], "docs/guide", blob).encode_with_id();
     let mut ci = writer(&url, "t-create").await;
     ci.create_changeset(CreateChangesetRequest {
         repo: REPO.into(),
@@ -312,7 +323,11 @@ async fn a_write_changeset_and_land_record_intent_and_result_pairs() {
 
     // The write pair: bytes, and no blob digest anywhere.
     let writes = pairs(&lines, "write");
-    assert_eq!(writes.len(), 2, "one pair for the upload, one for the create");
+    assert_eq!(
+        writes.len(),
+        2,
+        "one pair for the upload, one for the create"
+    );
     let put = writes
         .iter()
         .find(|(intent, _)| intent["rpc"] == "PutBlob")
@@ -322,7 +337,10 @@ async fn a_write_changeset_and_land_record_intent_and_result_pairs() {
         .iter()
         .find(|(intent, _)| intent["rpc"] == "CreateChangeset")
         .expect("the create pair");
-    assert!(create.1["changeset"].is_string(), "the create names the changeset");
+    assert!(
+        create.1["changeset"].is_string(),
+        "the create names the changeset"
+    );
 
     // The land pair: state, land id, and the ref's move.
     let lands = pairs(&lines, "land");
@@ -336,7 +354,10 @@ async fn a_write_changeset_and_land_record_intent_and_result_pairs() {
         .collect();
     assert_eq!(refs.len(), 1, "one ref line: the move's record");
     assert!(refs[0]["new"].is_string(), "the move names its new target");
-    assert!(refs[0]["old"].is_null() || refs[0]["old"].is_string(), "the move names what it moved from");
+    assert!(
+        refs[0]["old"].is_null() || refs[0]["old"].is_string(),
+        "the move names what it moved from"
+    );
 
     // No line ever names a blob or a tree: the upload's data digest is
     // not in the file.

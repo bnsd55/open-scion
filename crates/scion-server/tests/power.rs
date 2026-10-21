@@ -377,7 +377,7 @@ async fn an_acknowledged_write_s_audit_lines_survive_a_power_cut() {
 
     // One upload with a request ID, through the real binary.
     let request_id = "cut-1";
-    put_blob(&server.url, request_id, b"audit survives the cut\n").await;
+    put_blob_marked(&server.url, request_id, b"audit survives the cut\n").await;
 
     // The cut drops every write that `LazyFS` had not seen an fsync
     // for. The reply is out, so the audit's lines cannot be among them.
@@ -407,22 +407,19 @@ async fn an_acknowledged_write_s_audit_lines_survive_a_power_cut() {
     let result = lines
         .iter()
         .find(|line| {
-            line["event"] == "write"
-                && line["outcome"] == "ok"
-                && line["request_id"] == request_id
+            line["event"] == "write" && line["outcome"] == "ok" && line["request_id"] == request_id
         })
         .expect("the acknowledged write's result line survived the cut");
     assert_eq!(result["bytes"], 23);
 }
 
 /// One upload through the real server, marked with a request ID.
-async fn put_blob(url: &str, request_id: &str, data: &[u8]) {
-    use scion_proto::runtime::auth::Bearer;
-    use scion_proto::v1::scion_client::ScionClient;
+async fn put_blob_marked(url: &str, request_id: &str, data: &[u8]) {
     use scion_proto::v1::PutBlobRequest;
+    use scion_proto::v1::scion_client::ScionClient;
+    use tonic::Request;
     use tonic::service::interceptor::Interceptor;
     use tonic::transport::Channel;
-    use tonic::Request;
 
     /// The bearer token of the default principal, and the request ID
     /// the audit's pair joins by.
@@ -430,7 +427,9 @@ async fn put_blob(url: &str, request_id: &str, data: &[u8]) {
 
     impl Interceptor for Mark {
         fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
-            request.metadata_mut().insert("authorization", self.0.clone().unwrap());
+            request
+                .metadata_mut()
+                .insert("authorization", self.0.clone().unwrap());
             let id = self.1.parse().unwrap();
             request.metadata_mut().insert("x-request-id", id);
             Ok(request)
@@ -442,7 +441,8 @@ async fn put_blob(url: &str, request_id: &str, data: &[u8]) {
         .connect()
         .await
         .unwrap();
-    let bearer = Bearer::new(common::TOKEN).unwrap();
+    let bearer: tonic::metadata::AsciiMetadataValue =
+        format!("Bearer {}", common::TOKEN).parse().unwrap();
     let mut scion =
         ScionClient::with_interceptor(channel, Mark(Some(bearer), request_id.to_owned()));
     scion

@@ -663,8 +663,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "the tear is a line of its own");
         assert!(lines[0].starts_with("{\"v\":1"), "the tear keeps its bytes");
-        serde_json::from_str::<serde_json::Value>(lines[1])
-            .expect("the next line parses whole");
+        serde_json::from_str::<serde_json::Value>(lines[1]).expect("the next line parses whole");
     }
 
     #[test]
