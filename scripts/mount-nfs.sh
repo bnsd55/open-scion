@@ -88,7 +88,7 @@ fi
   > "$WORK/server.log" 2>&1 &
 echo $! > "$WORK/server.pid"
 "$TIMEOUT" 30 bash -c 'until grep -q serving '"$WORK"'/server.log 2> /dev/null; do sleep 0.2; done' \
-  || die "the server did not start"
+  || { tail -n 20 "$WORK/server.log"; die "the server did not start"; }
 # The run proves the backend it was asked for: a Postgres-backed server
 # writes the marker and no SQLite database, so a spawn that lost its
 # --postgres-url fails here, not vacuously as a second SQLite run.

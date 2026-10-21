@@ -262,6 +262,28 @@ fn seed() -> u64 {
 /// the cut takes what was never fsynced, so a missing sync before a reply
 /// loses that reply.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+/// The lands pending in this directory's metadata, whatever backend
+/// holds it: a SQLite file beside the blobs, or the schema the test
+/// database names for the directory.
+fn pending(data: &std::path::Path) -> i64 {
+    if Backend::test_is_postgres() {
+        let url = std::env::var("SCION_TEST_POSTGRES_URL").expect("SCION_TEST_POSTGRES_URL");
+        let schema = Backend::test_schema(data).expect("the test names a schema");
+        let sep = if url.contains('?') { '&' } else { '?' };
+        let mut c = postgres::Client::connect(
+            &format!("{url}{sep}options=--search_path%3D{schema}"),
+            postgres::NoTls,
+        )
+        .expect("the test database is up");
+        c.query_one("SELECT count(*) FROM lands WHERE state = 'pending'", &[])
+            .expect("the lands read")
+            .get::<_, i64>(0)
+    } else {
+        let db = rusqlite::Connection::open(data.join("scion.db")).unwrap();
+        pending_lands(&db)
+    }
+}
+
 async fn every_reply_survives_a_power_cut() {
     if !may_run() {
         return;
@@ -323,17 +345,11 @@ async fn every_reply_survives_a_power_cut() {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
             _ => {
-                let db = rusqlite::Connection::open(data.join("scion.db")).unwrap();
-                wait_until_bounded("a land is pending in the database", 5, || {
-                    pending_lands(&db) > 0
-                })
-                .await;
+                wait_until_bounded("a land is pending in the database", 5, || pending(data) > 0)
+                    .await;
             }
         }
-        let pending_at_kill = {
-            let db = rusqlite::Connection::open(data.join("scion.db")).unwrap();
-            pending_lands(&db) > 0
-        };
+        let pending_at_kill = pending(data) > 0;
         if pending_at_kill {
             pending_kills += 1;
         }
