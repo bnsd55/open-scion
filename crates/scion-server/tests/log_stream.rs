@@ -6,8 +6,13 @@
 //! removes it by accident.
 
 use std::num::NonZeroU64;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+
+#[path = "common/log_fields.rs"]
+mod log_fields;
+
+use tracing_subscriber::fmt::MakeWriter;
 
 use scion_core::{Changeset, FileState, RepoPath};
 use scion_proto::MAX_MESSAGE_BYTES;
@@ -110,6 +115,7 @@ async fn client(url: &str) -> Scion {
         .unwrap()
         .initial_stream_window_size(65_535)
         .initial_connection_window_size(65_535)
+        .connect_timeout(common::CONNECT_TIMEOUT)
         .connect()
         .await
         .unwrap();
@@ -131,6 +137,51 @@ async fn stalled_log(client: &mut Scion, from: &[u8]) -> Streaming<scion_proto::
 }
 
 /// A client that stops reading: the parts of the reply pile up in HTTP/2,
+/// The log of the test binary, into this one buffer: the close notice of
+/// a stalled connection names its peer there.
+static LOG: LazyLock<Captured> = LazyLock::new(Captured::default);
+
+/// The tests share one log, so they run one at a time.
+static SERIAL: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
+
+fn init_log() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::level_filters::LevelFilter::WARN)
+            .with_writer(Captured::clone(&*LOG))
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+    });
+}
+
+fn log_text() -> String {
+    String::from_utf8(LOG.0.lock().unwrap().clone()).unwrap()
+}
+
+/// A log writer that collects what the test binary logs.
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for Captured {
+    type Writer = Captured;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 /// the reply's producer stops at its stall, and the stalled bytes go on the
 /// connection's count. Past `--max-stalled-bytes` the connection closes, so
 /// the stalled stream ends with the transport error. The clock is paused
@@ -139,6 +190,11 @@ async fn stalled_log(client: &mut Scion, from: &[u8]) -> Streaming<scion_proto::
 /// HTTP/2 windows back, and the reply flows instead of stalling.
 #[tokio::test(start_paused = true)]
 async fn a_stalled_log_reply_is_counted_and_closes_the_connection() {
+    init_log();
+    {
+        let _serial = SERIAL.lock().unwrap();
+        LOG.0.lock().unwrap().clear();
+    }
     // Twenty changesets with 300 KB messages each: the tip's page is about
     // six parts, and the client's connection takes under two, so a client
     // that never reads stalls the producer inside the reply.
@@ -167,6 +223,32 @@ async fn a_stalled_log_reply_is_counted_and_closes_the_connection() {
     // nothing was counted.
     let end = reply.message().await;
     assert!(end.is_err(), "the stalled reply was not cut off: {end:?}");
+
+    // The close notice names the connection's peer, so the runbook's
+    // `find the client` step has an address to grep for.
+    let text = log_text();
+    let notice = log_fields::find_line(
+        &text,
+        "closing a connection: its stalled replies hold too much",
+    )
+    .unwrap_or_else(|| panic!("the close notice is not in the log: {text}"));
+    let peer = notice
+        .field("peer")
+        .unwrap_or_else(|| panic!("the close notice names no peer: {notice:?}"));
+    // The event logs the peer as Debug: `Some(127.0.0.1:54321)`. The
+    // runbook's `find the client` step needs a real address, not a
+    // placeholder: a loopback host and a port the client actually
+    // held.
+    let peer = peer
+        .strip_prefix("Some(")
+        .and_then(|value| value.strip_suffix(')'))
+        .unwrap_or(peer)
+        .parse::<std::net::SocketAddr>()
+        .unwrap_or_else(|_| panic!("the close notice names a parseable peer: {peer}"));
+    assert!(
+        peer.ip().is_loopback() && peer.port() != 0,
+        "the close notice names the client's address: {peer}"
+    );
 }
 
 /// A service whose one unary reply is one byte over the largest message a
@@ -305,11 +387,7 @@ async fn a_unary_reply_over_the_message_limit_is_refused() {
         std::future::pending(),
         std::sync::Arc::new(scion_proto::runtime::metrics::Metrics::default()),
     ));
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(&format!("http://{addr}")).await.unwrap();
     let mut client = scion_proto::v1::scion_client::ScionClient::new(channel);
     let err = client
         .resolve_ref(scion_proto::v1::ResolveRefRequest::default())
@@ -362,4 +440,33 @@ async fn a_stalled_blame_reply_is_counted_and_closes_the_connection() {
     // nothing was counted.
     let end = reply.message().await;
     assert!(end.is_err(), "the stalled reply was not cut off: {end:?}");
+
+    // The close notice names the connection's peer, so the runbook's
+    // `find the client` step has an address to grep for.
+    let text = log_text();
+    let notice = log_fields::find_line(
+        &text,
+        "closing a connection: its stalled replies hold too much",
+    )
+    .unwrap_or_else(|| panic!("the close notice is not in the log: {text}"));
+    let peer = notice
+        .field("peer")
+        .unwrap_or_else(|| panic!("the close notice names no peer: {notice:?}"));
+    // The event logs the peer as Debug: `Some(127.0.0.1:54321)`. The
+    // runbook's `find the client` step needs a real address, not a
+    // placeholder: a loopback host and a port the client actually
+    // held.
+    let peer = peer
+        .strip_prefix("Some(")
+        .and_then(|value| value.strip_suffix(')'))
+        .unwrap_or(peer)
+        .parse::<std::net::SocketAddr>()
+        .unwrap_or_else(|_| panic!("the close notice names a parseable peer: {peer}"));
+    assert!(
+        peer.ip().is_loopback() && peer.port() != 0,
+        "the close notice names the client's address: {peer}"
+    );
 }
+
+#[path = "common/mod.rs"]
+mod common;

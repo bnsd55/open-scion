@@ -38,6 +38,12 @@ tonic-prost.workspace = true
 tracing.workspace = true
 zstd.workspace = true
 
+[features]
+# The client keepalive seam: a test shortens the keepalive so the same
+# dead-peer failure is proved in seconds. Nothing gated may live
+# ungated in a release build.
+test-hooks = []
+
 [dev-dependencies]
 rcgen.workspace = true
 tempfile.workspace = true

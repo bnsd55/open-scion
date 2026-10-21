@@ -48,10 +48,6 @@ READ_SECONDS=${READ_SECONDS:-90}
 CELL_WARM_SECONDS=${CELL_WARM_SECONDS:-60}
 CAPACITY_MACHINE=${CAPACITY_MACHINE:-unknown runner}
 RUN_URL=${RUN_URL:-}
-PGFLAGS=()
-if [ -n "${SCION_PG_URL:-}" ]; then
-  PGFLAGS=(--postgres-url "$SCION_PG_URL")
-fi
 
 # classifies LOG: the soak's accepted failures. A cell whose clients
 # failed with anything else is past the edge; the run stops there.
@@ -106,12 +102,23 @@ for backend in sqlite postgres; do
     note "no SCION_PG_URL: the Postgres cells are not run"
     continue
   fi
+  # The Postgres URL reaches every scion-server through the env, which
+  # postgres_url_of reads quietly and an empty value filters. The env
+  # decides the backend of every server this cell raises, so it is set
+  # here, per cell: the URL for postgres, empty for sqlite. A sqlite
+  # cell that saw a URL would open Postgres and die - what the first
+  # dispatch proved.
+  if [ "$backend" = postgres ]; then
+    export SCION_POSTGRES_URL=$SCION_PG_URL
+  else
+    export SCION_POSTGRES_URL=
+  fi
   # A fresh store per cell: every cell starts equal, and the growth a
   # cell measures is the growth its own lands cause.
   rm -rf "$WORK/server"
   note "importing for $backend"
   /usr/bin/time -p "$BIN/scion-server" --data "$WORK/server" import \
-    "${PGFLAGS[@]+"${PGFLAGS[@]}"}" --rev main "$WORK/src.git" \
+    --rev main "$WORK/src.git" \
     > "$WORK/import-$backend.out" 2> "$WORK/import-$backend.log" || {
     tail -n 20 "$WORK/import-$backend.log" >&2
     die "the $backend import failed"

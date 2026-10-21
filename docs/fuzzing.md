@@ -33,19 +33,24 @@ longer budget and keeps its corpus between runs (`.github/workflows/fuzz.yml`).
 | --- | --- |
 | the access file (`scion-server/src/access.rs`, `Access::parse`) | `scion-server/fuzz: access` |
 | the archive files (`scion-server/src/archive.rs`, `verify`/`restore`: the manifest and its names, `changesets.bin`, `refs.json`, `lands.json`, `members.txt`, `provenance.json`, the blob files) | `scion-server/fuzz: archive-verify` |
+| each archive section reader fed raw bytes (`scion-server/src/archive.rs`, `read_changesets`, `read_refs`, `read_lands`, `read_members`, `read_provenance`) | `scion-server/fuzz: archive-read` |
 | the tier snapshot seed file (`scion-tier/src/snapshot.rs`, `seed`; an operator drops the file beside a cold store) | `scion-tier/fuzz: snapshot-seed` |
 
 ### No target
 
 | decoder | why not |
 | --- | --- |
-| store-value decoders (`history.rs` `decode_node`, `decode_index`, `decode_row`; `graph.rs` `CommitGraph::decode`; the `derived.rs` value decodes; `fsck.rs`) | the bytes are always server-written: the same process encodes before it stores and decodes after it reads. Not a trust boundary. The blame cursor is the exception, because its bytes travel through the client, so it has one. |
+| store-value decoders (`history.rs` `decode_node`, `decode_index`, `decode_row`; `graph.rs` `CommitGraph::decode`; the `derived.rs` value decodes; `tree.rs` `decode`; `fsck.rs`; `codec.rs` `Tree::find_entry`, which scans stored bodies after their ID check and stops at the name it finds — a reader, not a validator) | the bytes are always server-written: the same process encodes before it stores and decodes after it reads. Not a trust boundary. The blame cursor is the exception, because its bytes travel through the client, so it has one. |
+| a land's conflict-path list (`scion-server/src/land.rs`, `decode_paths`: the `conflict_paths` blob of a lands-table row) | server-written, like the store-value decoders above. |
 | tier store records (`scion-tier/src/store.rs`, `parse_record`, `Key::from_bytes`) | fixed-width records from the server's own store file. |
 | ticket key config (`scion-server/src/tickets.rs`, `from_hex`) | operator config, fixed 32-byte hex. |
+| key and token files read as hex (`scion-server/src/main.rs`, `read_hex`) | operator config, hex text; the server refuses a malformed file instead of parsing on. |
 | land request names (`scion-server/src/land.rs`, `check_name`) | a length check only, no parse state; the property the `check-name` target asserts covers the shape. |
 | scn command-line parsing (`parse_repo_path`, `parse_dir`, `parse_put`) | local operator arguments, not bytes from the network or a file. |
 | NFS (`scn mount`) | the wire decode is `nfsserve` upstream's space; the object bytes scn's vfs reads go through `object::decode`, which the `object` target covers. |
 | gRPC and protobuf | tonic and prost upstream's space; the `object` target notes where our decoder takes over from prost's. |
+| scn's client-side decodes of server-sent objects (`scn/src/cmd/checkout.rs` `decode_tree`, `scn/src/cmd/read.rs` `decode_changeset`) | they wrap the fuzzed codec with an equality check: the object must decode and hash to the ID it was sent for. The codec target covers the decode. |
+| scn's own state files (`scn/src/cmd/mount.rs` `read_sessions`, `scn/src/vfs.rs` the note JSON) | written by scn itself, like the store-value decoders; not bytes another party crafts. |
 
 ## Reproducing a crash locally
 

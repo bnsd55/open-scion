@@ -11,7 +11,11 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A pull_request run may cancel the run before it (same branch,
+  # superseded); a push to main may not: a run in progress finishes
+  # and verifies the head it ran on, and while it runs only the
+  # newest push waits — an older pending run is replaced, not run.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Every third-party action is pinned to the commit SHA its version tag
 # named when this file last moved, with the version in a comment; Dependabot
@@ -216,6 +220,12 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-workspace-crates: true
+      # The Linux lint job never compiles macOS-only code (the ACL FFI
+      # module among it), so clippy runs here too, before the tests:
+      # same warm cache, a couple of minutes on a job that already
+      # builds everything, and no second macOS runner to book.
+      - run: cargo clippy --workspace --lib --bins -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
         env:
           PROPTEST_CASES: "2000"
@@ -229,6 +239,26 @@ jobs:
             echo "::error::the test suite left the work tree dirty: $dirty"
             exit 1
           fi
+
+  promtool:
+    name: promtool
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # promtool, pinned to the current LTS line (3.13, supported on
+      # prometheus.io's release-cycle page through 2027-07) by version
+      # and the release tarball's sha256 (the same discipline the action
+      # pins follow), downloaded with curl so no third-party action
+      # enters the supply chain.
+      - run: |
+          curl -fsSL -o /tmp/prometheus.tgz \
+            https://github.com/prometheus/prometheus/releases/download/v3.13.4/prometheus-3.13.4.linux-amd64.tar.gz
+          echo "87f21a66f96c597a189cef8d640e8921b621fc17a9feff707c332c4f3b3ddd56  /tmp/prometheus.tgz" | sha256sum -c -
+          mkdir /tmp/promtool
+          tar -xzf /tmp/prometheus.tgz -C /tmp/promtool --strip-components 1
+          /tmp/promtool/promtool check rules deploy/prometheus/openscion-alerts.yml
+          /tmp/promtool/promtool test rules deploy/prometheus/openscion-alerts-test.yml
 
   power-loss:
     name: power-loss

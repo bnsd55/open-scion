@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 use std::time::{Duration, SystemTime};
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
@@ -472,6 +473,35 @@ impl Store {
         (result, self.inner.committing.load(Ordering::Acquire))
     }
 
+    /// Runs `f` on one reader connection inside one explicit read
+    /// transaction, so every statement of `f` sees one snapshot. Plain
+    /// [`Store::read`] runs each statement autocommit, and a commit
+    /// between them changes what the later ones see. The cost is the
+    /// snapshot: the log cannot restart while `f` runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns what `f` returns, or an error from the transaction's
+    /// begin.
+    pub(crate) fn read_snapshot<T>(
+        &self,
+        f: impl for<'x> FnOnce(&'x mut SqliteTx<'x>) -> Result<T>,
+    ) -> Result<T> {
+        let reader = self.inner.readers.take();
+        let result = reader
+            .unchecked_transaction()
+            .map_err(from_sqlite)
+            .and_then(|tx| {
+                // A read transaction: nothing to keep, and the drop rolls
+                // it back. The drop must not hide what `f` returned.
+                let out = f(&mut SqliteTx(&reader));
+                drop(tx);
+                out
+            });
+        self.wait_durable(self.inner.committing.load(Ordering::Acquire))?;
+        result
+    }
+
     /// Returns once every commit that a read with count `seen` could see is
     /// durable ([`Store::read_counted`]). Call it after that read.
     ///
@@ -779,9 +809,18 @@ pub(crate) fn migrate(db: &Connection, target: u32) -> Result<()> {
             "database schema version {version} is newer than this build ({SCHEMA_VERSION})"
         )));
     }
+    if version == target {
+        return Ok(());
+    }
+    tracing::info!(
+        from_version = version,
+        to_version = target,
+        "migrating the metadata schema"
+    );
     // Each migration runs in its own transaction, with the version it sets.
     // A crash rolls it back, and the next open runs it again from its start.
     for (to, sql) in (1..=target).zip(MIGRATIONS).skip(version as usize) {
+        let step = Instant::now();
         let tx = db.unchecked_transaction().map_err(from_sqlite)?;
         tx.execute_batch(sql).map_err(from_sqlite)?;
         if to == 4 {
@@ -791,7 +830,18 @@ pub(crate) fn migrate(db: &Connection, target: u32) -> Result<()> {
         tx.pragma_update(None, "user_version", to)
             .map_err(from_sqlite)?;
         tx.commit().map_err(from_sqlite)?;
+        tracing::info!(
+            from_version = to - 1,
+            to_version = to,
+            elapsed_ms = u64::try_from(step.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "the metadata schema migrated one step"
+        );
     }
+    tracing::info!(
+        from_version = version,
+        to_version = target,
+        "the metadata migration is done"
+    );
     Ok(())
 }
 
@@ -2633,8 +2683,15 @@ mod tests {
             assert!(flock(&opening, FlockOperation::NonBlockingLockExclusive).unwrap());
             let path = dir.path().to_owned();
             let open = thread::spawn(move || Store::open_shared(&path).map(drop));
-            thread::sleep(Duration::from_millis(200));
-            assert!(!open.is_finished(), "an open waits for the one in progress");
+            // The open must not finish while the lock is held: a negative
+            // cannot be polled for once, so it is asserted across a
+            // window, every 20 ms. A slow start of the thread only
+            // strengthens the check, and a broken wait fails inside it.
+            let give_up = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < give_up {
+                assert!(!open.is_finished(), "an open waits for the one in progress");
+                thread::sleep(Duration::from_millis(20));
+            }
             drop(opening);
             open.join().unwrap().unwrap();
         });
@@ -3031,16 +3088,38 @@ mod tests {
         const CALLERS: usize = 8;
         let group = GroupFlush::default();
         let runs = AtomicUsize::new(0);
+        let ready = AtomicUsize::new(0);
+        let started = AtomicBool::new(false);
         let arrive = Barrier::new(CALLERS);
         let results: Vec<io::Result<()>> = thread::scope(|s| {
             let callers: Vec<_> = (0..CALLERS)
                 .map(|_| {
                     s.spawn(|| {
                         arrive.wait();
-                        // Slow, so the other callers arrive while it runs.
+                        // Every caller announces itself before the call,
+                        // so the flush that owns the group can hold it
+                        // open until every caller has had the chance to
+                        // share it. A fixed sleep here rested the sharing
+                        // on luck: under load, a caller that arrives late
+                        // runs its own flush, and the count goes wrong.
+                        ready.fetch_add(1, Ordering::SeqCst);
                         group.run(|| {
                             runs.fetch_add(1, Ordering::Relaxed);
-                            thread::sleep(Duration::from_millis(100));
+                            if started.swap(true, Ordering::SeqCst) {
+                                // A straggler that missed the group runs
+                                // its own flush; the count assert below
+                                // still holds.
+                                return Err(io::Error::other("the drive is gone"));
+                            }
+                            // Generous, so a loaded machine only slows
+                            // the test; the bound keeps a lost scheduler
+                            // slice from hanging it.
+                            let give_up = std::time::Instant::now() + Duration::from_secs(30);
+                            while ready.load(Ordering::SeqCst) < CALLERS
+                                && std::time::Instant::now() < give_up
+                            {
+                                thread::sleep(Duration::from_millis(5));
+                            }
                             Err(io::Error::other("the drive is gone"))
                         })
                     })

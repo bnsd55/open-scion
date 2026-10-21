@@ -38,6 +38,8 @@ This project rebuilds the ideas from that public article.
 **Platforms.** Linux and macOS. Windows is not supported. What exactly is
 tested and what is not: [Supported platforms](#supported-platforms) below.
 What each release promises per surface: [docs/stability.md](docs/stability.md).
+To check a release before you run it — the signed tag, the checksums,
+the build attestations, the SBOM: [docs/verify.md](docs/verify.md).
 
 **Interface.** openscion is a command-line tool and a service, and its
 interface is text: commands, plain files, and log lines. That is the
@@ -110,9 +112,9 @@ how it is stored, so the server can change it freely.
 ### For an agent
 
 ```sh
-scn cat main:src/lib.rs                                      # read one file, no clone
-cs=$(scn commit -m "fix parser" --put src/lib.rs=./lib.rs)   # create a changeset
-scn land "$cs"                                               # rebase onto main and move it
+./target/release/scn cat main:src/lib.rs                                      # read one file, no clone
+cs=$(./target/release/scn commit -m "fix parser" --put src/lib.rs=./lib.rs)   # create a changeset
+./target/release/scn land "$cs"                                               # rebase onto main and move it
 ```
 
 `scn land` exits non-zero on a conflict and prints the paths, so an agent can
@@ -128,35 +130,52 @@ cover and cannot write; the server derives a view of the repo for it.
 
 ## Try it
 
-`scripts/demo.sh` does all of the steps below on a fixed public repository,
-prints the numbers, and removes what it made. The method and the checkout
+`scripts/demo.sh` does all of the steps below on a fixed public repository
+(tokio at commit `be689a35f5ade5a39e507f79d3ec85cdab27806f`), prints the
+numbers, and removes what it made. The method and the checkout
 benchmark against git are in [docs/benchmarks.md](https://github.com/bnsd55/openscion/blob/main/docs/benchmarks.md).
+
+The steps below want a git repository with a `src/` folder and a
+`README.md`. Get one:
+
+```sh
+git clone https://github.com/tokio-rs/tokio /tmp/tokio
+git -C /tmp/tokio checkout be689a35f5ade5a39e507f79d3ec85cdab27806f
+```
+
+(any git repository with those two works). Every line below runs as
+written.
 
 ```sh
 cargo build --release
 export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
-./target/release/scion-server --data /tmp/scion import /path/to/a/git/repo
+./target/release/scion-server --data /tmp/scion import /tmp/tokio
 ./target/release/scion-server --data /tmp/scion ticket-key --out /tmp/scion/ticket.key > /tmp/scion/ticket.pub
 # the public key is now in ticket.pub; pass it to the tiers below
 ./target/release/scion-server --data /tmp/scion serve --ticket-key /tmp/scion/ticket.key &
 ./target/release/scion-server --data /tmp/scion fsck              # check the data directory; safe while the server runs
 ./target/release/scion-server --data /tmp/scion gc --dry-run      # what a collection would remove; safe while the server runs
 
-./target/release/scn ls main:src    # mode, kind, size, name per entry
+./target/release/scn ls main:src                    # mode, kind, size, name per entry
 ./target/release/scn log -n 5
-./target/release/scn log --path src -n 5          # changesets that changed src/
-./target/release/scn blame main:README.md         # last changeset of each line
+./target/release/scn log --path src -n 5            # changesets that changed src/
+./target/release/scn blame main:README.md
 ./target/release/scn cat main:README.md
-./target/release/scn checkout main --into /tmp/work   # --sparse DIR for part of it
+./target/release/scn checkout main --into /tmp/work # --sparse DIR for part of it
 mkdir -p /tmp/view
-./target/release/scn mount /tmp/view main             # files load when first read
+# The mount serves NFS from scn itself and holds this terminal: run it
+# in another terminal, and leave it there until `scn unmount`. On macOS
+# it runs `sudo mount_nfs`, so it asks for your password once.
+./target/release/scn mount /tmp/view main           # files load when first read
+# The mount is read-only, so this commit is refused until you mount
+# with `--unstable-writable` (see below); the refusal names the flag.
 ./target/release/scn commit -m "from the mount" --from-mount /tmp/view
 ./target/release/scn unmount /tmp/view
 echo hello > hello.txt
 cs=$(./target/release/scn commit -m "add hello" --put hello.txt=hello.txt)
-./target/release/scn diff main "$cs"              # A hello.txt, as git diff --name-status
-./target/release/scn merge-base main "$cs"        # as git merge-base --all
-./target/release/scn is-ancestor main "$cs"       # exits 0 for yes, 1 for no
+./target/release/scn diff main "$cs"                # A hello.txt, as git diff --name-status
+./target/release/scn merge-base main "$cs"          # as git merge-base --all
+./target/release/scn is-ancestor main "$cs"         # exits 0 for yes, 1 for no
 ./target/release/scn land "$cs"
 ./target/release/scn bench --agents 200 --lands 10000
 ```
@@ -166,7 +185,9 @@ error exits 2. A checkout that a signal stops removes what it wrote, and
 then dies by the signal (a shell reports 130 for Ctrl-C).
 
 `scn mount` serves a ref over NFSv3 from `scn` itself, so a file loads when
-it is first read, not when the checkout starts. In v0.1 the mount is
+it is first read, not when the checkout starts. It holds the terminal it
+runs in until `scn unmount` stops it, and on macOS it runs `sudo
+mount_nfs`, so it asks for your password once. In v0.1 the mount is
 read-only: every write is answered `EROFS`, and `scn commit --from-mount`
 refuses, because a symlinked parent directory in the overlay can still
 redirect a write outside it. `scn mount --unstable-writable` takes writes

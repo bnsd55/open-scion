@@ -149,11 +149,7 @@ async fn serve(
             stopped.await.ok();
         },
     ));
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(&format!("http://{addr}")).await.unwrap();
     let client = ScionClient::with_interceptor(channel, Bearer(Some(token.to_string())));
     (stop, client)
 }
@@ -642,3 +638,6 @@ async fn an_older_version_with_too_many_lines_counts_as_absent() {
     assert_eq!(changesets[0].changeset_id, child.as_bytes().to_vec());
     assert!(next.is_empty(), "the walk explained the whole file");
 }
+
+#[path = "common/mod.rs"]
+mod common;
