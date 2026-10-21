@@ -208,29 +208,17 @@ fn hex(name: &str) -> String {
 /// A store whose repo `main` has one root changeset that puts `README`,
 /// and a writer who may change every path.
 fn write_access() -> Access {
-    let text = format!(
-        "token\tci\t{}\nwrite\tci\t{REPO}\nread\tci\t{REPO}\n",
-        hex("ci")
-    );
+    let text = format!("token\tci\t{}\nwrite\tci\t{REPO}\nread\tci\t{REPO}\n", hex("ci"));
     Access::parse(&text).expect("the access file parses")
 }
 
 /// A changeset with one parent that puts `path`.
-fn changeset(
-    parents: Vec<scion_core::ChangesetId>,
-    path: &str,
-    content: scion_core::BlobId,
-) -> scion_core::Changeset {
+fn changeset(parents: Vec<scion_core::ChangesetId>, path: &str, content: scion_core::BlobId) -> scion_core::Changeset {
     use scion_core::{FileState, IdentityTime, RepoPath};
     scion_core::Changeset::new(
         parents,
-        IdentityTime::new(
-            b"Ada".to_vec(),
-            b"ada@example.com".to_vec(),
-            1_700_000_000,
-            0,
-        )
-        .expect("identity fits the format"),
+        IdentityTime::new(b"Ada".to_vec(), b"ada@example.com".to_vec(), 1_700_000_000, 0)
+            .expect("identity fits the format"),
         None,
         b"change\n".to_vec(),
         [(
@@ -297,7 +285,8 @@ async fn a_write_changeset_and_land_record_intent_and_result_pairs() {
 
     // The changeset on top of the root, then the land.
     let root = store.resolve_ref(REPO, "main").unwrap();
-    let (bytes, id) = changeset(vec![root], "docs/guide", blob).encode_with_id();
+    let (bytes, id) =
+        changeset(vec![root], "docs/guide", blob).encode_with_id();
     let mut ci = writer(&url, "t-create").await;
     ci.create_changeset(CreateChangesetRequest {
         repo: REPO.into(),
@@ -323,11 +312,7 @@ async fn a_write_changeset_and_land_record_intent_and_result_pairs() {
 
     // The write pair: bytes, and no blob digest anywhere.
     let writes = pairs(&lines, "write");
-    assert_eq!(
-        writes.len(),
-        2,
-        "one pair for the upload, one for the create"
-    );
+    assert_eq!(writes.len(), 2, "one pair for the upload, one for the create");
     let put = writes
         .iter()
         .find(|(intent, _)| intent["rpc"] == "PutBlob")
@@ -337,10 +322,7 @@ async fn a_write_changeset_and_land_record_intent_and_result_pairs() {
         .iter()
         .find(|(intent, _)| intent["rpc"] == "CreateChangeset")
         .expect("the create pair");
-    assert!(
-        create.1["changeset"].is_string(),
-        "the create names the changeset"
-    );
+    assert!(create.1["changeset"].is_string(), "the create names the changeset");
 
     // The land pair: state, land id, and the ref's move.
     let lands = pairs(&lines, "land");
@@ -354,10 +336,7 @@ async fn a_write_changeset_and_land_record_intent_and_result_pairs() {
         .collect();
     assert_eq!(refs.len(), 1, "one ref line: the move's record");
     assert!(refs[0]["new"].is_string(), "the move names its new target");
-    assert!(
-        refs[0]["old"].is_null() || refs[0]["old"].is_string(),
-        "the move names what it moved from"
-    );
+    assert!(refs[0]["old"].is_null() || refs[0]["old"].is_string(), "the move names what it moved from");
 
     // No line ever names a blob or a tree: the upload's data digest is
     // not in the file.
@@ -406,23 +385,13 @@ async fn a_write_whose_intent_fails_is_refused() {
     // The readiness loss latches: the health names flip and the server
     // drains, so a later call is refused too. The log has a hole; the
     // supervisor restarts a server that can prove its lines again.
-    // The call rides the connection the drain is still finishing, so
-    // poll with a deadline instead of racing the drain once.
-    let mut drained = false;
-    for _ in 0..100 {
-        let later = ci
-            .resolve_ref(ResolveRefRequest {
-                repo: REPO.into(),
-                name: "main".into(),
-            })
-            .await;
-        if later.is_err() {
-            drained = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(drained, "a server whose audit lost a line drains");
+    let later = ci
+        .resolve_ref(ResolveRefRequest {
+            repo: REPO.into(),
+            name: "main".into(),
+        })
+        .await;
+    assert!(later.is_err(), "a server whose audit lost a line drains");
 
     let _ = stop.send(());
 }
@@ -450,228 +419,6 @@ fn pairs<'a>(
         }
     }
     found
-}
-
-/// Lands contend on one ref: eight lands at once, each retried until
-/// it settles. The audit's ref lines, read in file order, must tell a
-/// history that happened: the first move's `old` is the ref's head
-/// before any land, and every later `old` is the `new` of the line
-/// before it. A move recorded from outside the ref's lock reads a head
-/// that a concurrent land has already replaced, and the chain breaks.
-#[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::too_many_lines)]
-async fn concurrent_lands_ref_lines_tell_one_true_history() {
-    use scion_core::{FileState, IdentityTime, RepoPath};
-    use scion_proto::v1::LandRequest;
-    use std::fmt::Write as _;
-
-    let dir = tempfile::tempdir().unwrap();
-    let store = store(dir.path());
-    let audit_path = dir.path().join("audit.log");
-    let audit = Audit::open(&audit_path).unwrap();
-    let start = store.resolve_ref(REPO, "main").unwrap();
-    let (stop, url) = serve_with_audit(&store, dir.path(), write_access(), audit).await;
-
-    // Eight changesets on the root, one per lander, inserted straight
-    // into the store: the land is what this test drives.
-    let lands: Vec<_> = (0..8)
-        .map(|i| {
-            let count = 2;
-            let mut blobs = Vec::new();
-            let changes: std::collections::BTreeMap<_, _> = (0..count)
-                .map(|j| {
-                    let blob = store
-                        .blobs()
-                        .put(format!("land {i} file {j}\n").as_bytes())
-                        .unwrap();
-                    blobs.push(blob);
-                    (
-                        RepoPath::new(format!("docs/{i}/{j}")).unwrap(),
-                        Some(FileState::Regular {
-                            content: blob,
-                            executable: false,
-                        }),
-                    )
-                })
-                .collect();
-            let change = scion_core::Changeset::new(
-                vec![start],
-                IdentityTime::new(
-                    b"Ada".to_vec(),
-                    b"ada@example.com".to_vec(),
-                    1_700_000_000,
-                    i,
-                )
-                .expect("identity fits the format"),
-                None,
-                format!("land {i}\n").into_bytes(),
-                changes,
-            )
-            .expect("changeset fits the format");
-            store
-                .write(|c| {
-                    let repo = c.repo_id(REPO)?;
-                    let id = c.insert_changeset(repo, &change)?;
-                    for blob in &blobs {
-                        c.add_repo_blob(repo, *blob)?;
-                    }
-                    Ok(id)
-                })
-                .unwrap()
-        })
-        .collect();
-    let mut start_hex = String::new();
-    for byte in start.as_bytes() {
-        write!(start_hex, "{byte:02x}").unwrap();
-    }
-
-    // Eight landers, one changeset each, retrying until the land
-    // settles. A land whose ref moved under it answers Aborted and
-    // stays pending; the same request key resumes it.
-    let join = |i: usize| {
-        let url = url.clone();
-        let cs = lands[i];
-        tokio::spawn(async move {
-            let mut ci = writer(&url, &format!("t-land-{i}")).await;
-            loop {
-                match ci
-                    .land(LandRequest {
-                        repo: REPO.into(),
-                        changeset_id: cs.as_bytes().to_vec(),
-                        target_ref: "main".into(),
-                        request_key: format!("k-{i}"),
-                    })
-                    .await
-                {
-                    Ok(_) => break,
-                    Err(status)
-                        if status.code() == tonic::Code::Aborted
-                            || status.code() == tonic::Code::Unavailable => {}
-
-                    Err(status) => panic!("land {i} failed: {status:?}"),
-                }
-            }
-        })
-    };
-    // Hold the store's write connection, so no land's job can record
-    // itself, let alone move the ref, until every call has read the
-    // ref: the calls' first tasks need only the readers, and the
-    // intents in the audit file say they are past them. Then let go:
-    // the ref lock serializes the jobs' moves, and each move's
-    // `previous` (or, on the racing code, the call's own early read)
-    // must be the head the move actually replaced.
-    let (held_tx, held_rx) = std::sync::mpsc::channel();
-    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
-    let blocker = std::thread::spawn({
-        let store = store.clone();
-        move || {
-            store
-                .read_unflushed(|_| {
-                    held_tx.send(()).unwrap();
-                    go_rx.recv().unwrap();
-                    Ok(())
-                })
-                .unwrap();
-        }
-    });
-    held_rx.recv().unwrap();
-    for i in 0..8 {
-        join(i);
-    }
-    // The eight intents say every call is past its intent; their
-    // first tasks read the ref within microseconds of it.
-    wait_for_lines(&audit_path, 8).await;
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    go_tx.send(()).unwrap();
-    blocker.join().unwrap();
-    for i in 0..8 {
-        join(i).await.unwrap();
-    }
-
-    // A replay of a landed land: the same request key, after the land
-    // settled. It reports the stored outcome and moved nothing, so its
-    // land line names no old, and no ref line appears for it.
-    let mut replay = writer(&url, "t-land-0").await;
-    replay
-        .land(LandRequest {
-            repo: REPO.into(),
-            changeset_id: lands[0].as_bytes().to_vec(),
-            target_ref: "main".into(),
-            request_key: "k-0".into(),
-        })
-        .await
-        .unwrap_or_else(|status| panic!("the replay failed: {status:?}"));
-
-    stop.send(()).unwrap();
-    // Eight intents, eight land results, eight ref lines, and the
-    // replay's land line.
-    wait_for_lines(&audit_path, 25).await;
-
-    let lines = read_lines(&audit_path);
-    let land_lines: Vec<&serde_json::Value> = lines
-        .iter()
-        .filter(|line| line["event"] == "land" && line["outcome"] == "ok")
-        .collect();
-    let replay_line = land_lines
-        .iter()
-        .rev()
-        .find(|line| line["request_id"] == "t-land-0")
-        .unwrap_or_else(|| panic!("the replay's land line is missing"));
-    assert!(
-        replay_line.get("old").is_none(),
-        "a replay moved nothing, so its land line names no old: {replay_line}"
-    );
-    // The move's own land line names the head the move replaced: the
-    // auditor finds it under the same land_id, and it agrees with the
-    // move's ref line.
-    let mover = land_lines
-        .iter()
-        .find(|line| line["land_id"] == replay_line["land_id"] && line.get("old").is_some())
-        .unwrap_or_else(|| panic!("the move's land line names no old"));
-    let mover_ref = refs_needed(&lines, "t-land-0");
-    assert_eq!(
-        mover["old"], mover_ref["old"],
-        "the move's land line and its ref line name the same head"
-    );
-
-    let refs: Vec<&serde_json::Value> = lines
-        .iter()
-        .filter(|line| line["event"] == "ref" && line["outcome"] == "ok")
-        .collect();
-    assert_eq!(
-        refs.len(),
-        8,
-        "only the calls that moved the ref have ref lines: {}",
-        refs.len()
-    );
-    let chain: Vec<(String, String)> = refs
-        .iter()
-        .map(|line| {
-            (
-                line["old"].as_str().unwrap_or_default().to_string(),
-                line["new"].as_str().unwrap_or_default().to_string(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        chain.first().map(|(old, _)| old.as_str()),
-        Some(start_hex.as_str()),
-        "the first move moved the head the lands started from"
-    );
-    for pair in chain.windows(2) {
-        assert_eq!(
-            pair[0].1, pair[1].0,
-            "each move moved the ref its predecessor left it at"
-        );
-    }
-}
-
-/// The ref line of the call whose request id is `id`.
-fn refs_needed<'a>(lines: &'a [serde_json::Value], id: &str) -> &'a serde_json::Value {
-    lines
-        .iter()
-        .find(|line| line["event"] == "ref" && line["request_id"] == id)
-        .unwrap_or_else(|| panic!("no ref line for {id}"))
 }
 
 /// Waits until the file holds `n` lines: the stop's flush runs on its

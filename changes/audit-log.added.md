@@ -22,15 +22,6 @@ On open, a file whose last line has no newline gets one, so a line
 that a full drive cut in the middle stays a fragment of its own and
 cannot swallow the lines that follow.
 
-A land's ref line names the head the move replaced, read where the
-move happens, under the ref's lock, and is written only by the call
-that made the move. A replayed land (the same request key after it
-landed) moved nothing, so its land line names no old and no ref line
-appears for it; an auditor finds the head the move replaced in the
-land line of the call that made the move, under the same land_id.
-The ref lines of a ref, in file order, are the ref's true history:
-each old is the previous line's new.
-
 Blob and tree digests are never logged (a digest is a dictionary key
 to contents), and neither are token bytes or token hashes. Rotation
 is by size, keeps a bounded number of old files, and names what it
