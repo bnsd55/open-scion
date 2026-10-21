@@ -1,0 +1,205 @@
+# The openscion alert rules: one floor per operator-visible failure,
+# over the metrics section 11 of docs/architecture.md defines and
+# nothing else. Severities are docs/support.md's levels. The Postgres
+# group is true only for the Postgres deployment shape; the gc group
+# reads the collector's textfile metrics through the node exporter.
+# The job in ci.yml checks this file with promtool (pinned) and runs
+# openscion-alerts-test.yml against it.
+groups:
+  - name: server
+    rules:
+      - alert: ServerDown
+        expr: up{job="scion-server"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          response: >-
+            The server stopped answering scrapes; the supervisor should
+            have restarted it (docs/operations.md section 1).
+      - alert: RpcErrorRateHigh
+        expr: >-
+          sum by (rpc) (rate(scion_requests_total{code!="ok"}[5m]))
+          / sum by (rpc) (rate(scion_requests_total[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: high
+        annotations:
+          response: >-
+            The code label names the failure class
+            (docs/operations.md section 6).
+      - alert: InternalErrors
+        expr: sum(rate(scion_requests_total{code="internal"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          response: >-
+            `internal` is a server bug; grep the logs for the failing
+            calls' request_id (docs/operations.md section 6).
+      - alert: LandErrors
+        expr: >-
+          sum by (outcome) (rate(scion_lands_total{outcome=~"internal|resource_exhausted|unavailable|aborted"}[10m])) > 0
+        for: 10m
+        labels:
+          severity: high
+        annotations:
+          response: The outcome names the class (docs/operations.md section 6).
+      - alert: LandReplanSpike
+        expr: rate(scion_land_replans_total[15m]) > 0.1
+        for: 30m
+        labels:
+          severity: medium
+        annotations:
+          response: >-
+            Lands contend with imports or other writers on one ref
+            (docs/operations.md section 6).
+      - alert: LatencyP99High
+        expr: >-
+          histogram_quantile(0.99, sum by (le, rpc) (rate(scion_request_seconds_bucket[5m]))) > 4
+        for: 15m
+        labels:
+          severity: medium
+        annotations:
+          response: >-
+            Sort the p99 by the rpc label to find the slow call; a
+            write-side rise points at the store's fsyncs (BlobSyncSlow
+            fires too), a read-side one at cache misses or a cold memo
+            (docs/operations.md section 6).
+      - alert: DiskNearlyFull
+        expr: scion_data_free_bytes < 10 * 1024 * 1024 * 1024
+        for: 15m
+        labels:
+          severity: high
+        annotations:
+          response: >-
+            Run the gc routine (docs/operations.md section 5) and check
+            the backup (section 3).
+      - alert: DiskFull
+        expr: scion_data_free_bytes < 1 * 1024 * 1024 * 1024
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          response: >-
+            Writes fail soon (docs/operations.md sections 5 and 3).
+      - alert: BlobSyncSlow
+        expr: >-
+          sum(rate(scion_blob_sync_seconds_sum[10m]))
+          / sum(rate(scion_blob_sync_seconds_count[10m])) > 2
+        for: 15m
+        labels:
+          severity: high
+        annotations:
+          response: >-
+            Mean fsync over 2 s: the drive cannot keep up with imports
+            (docs/operations.md section 6).
+      - alert: ViewMemoBypassed
+        expr: rate(scion_view_trees_walked_total[15m]) > 5
+        for: 30m
+        labels:
+          severity: low
+        annotations:
+          response: >-
+            The per-tree memo is not serving and every derivation
+            re-walks: compare the walk rate with a restart or a memory
+            cap and raise the memory (docs/operations.md section 6).
+      - alert: StalledRepliesHigh
+        expr: scion_stalled_reply_bytes > 48 * 1024 * 1024
+        for: 15m
+        labels:
+          severity: medium
+        annotations:
+          response: >-
+            Replies pile up because a client stops reading mid-reply:
+            find the connection in the log's stalled-reply notices; the
+            cap closes it at --max-stalled-bytes (docs/operations.md
+            section 6).
+      - alert: TicketRefusals
+        expr: >-
+          sum(rate(scion_requests_total{rpc="Objects/GetObjects", code=~"permission_denied|unauthenticated"}[5m])) > 1
+        for: 10m
+        labels:
+          severity: medium
+        annotations:
+          response: >-
+            During a key rotation, check the tiers carry both public
+            keys before the old one is dropped (docs/operations.md
+            section 2).
+  - name: postgres
+    rules:
+      - alert: PgReadersPinned
+        expr: scion_pg_readers_busy >= 8
+        for: 15m
+        labels:
+          severity: medium
+        annotations:
+          response: >-
+            Every reader walks a big history; pair with PgTxOld
+            (docs/operations.md section 6).
+      - alert: PgPoolWaitP99
+        expr: >-
+          histogram_quantile(0.99, sum by (le) (rate(scion_pg_pool_wait_seconds_bucket[5m]))) > 25
+        for: 10m
+        labels:
+          severity: high
+        annotations:
+          response: >-
+            Calls past the pool's 30 s bound fail `unavailable`
+            (docs/operations.md section 6).
+      - alert: PgTxOld
+        expr: scion_pg_tx_age_seconds > 120
+        for: 10m
+        labels:
+          severity: medium
+        annotations:
+          response: >-
+            Find the client in pg_stat_activity; raise the pool if the
+            walks are common (docs/operations.md section 6).
+      - alert: PgKeyWaitP99
+        expr: >-
+          histogram_quantile(0.99, sum by (le) (rate(scion_pg_collector_key_wait_seconds_bucket[10m]))) > 45
+        for: 15m
+        labels:
+          severity: high
+        annotations:
+          response: >-
+            Waits near the key's 60 s bound mean the writer queue does
+            not drain (docs/operations.md section 6).
+  - name: tier
+    rules:
+      - alert: CacheDown
+        expr: up{job="scion-cache"} == 0
+        for: 5m
+        labels:
+          severity: medium
+        annotations:
+          response: >-
+            Clients fall through to the server; a cache restarts
+            whenever (docs/operations.md section 1).
+      - alert: TierMissRate
+        expr: >-
+          sum(rate(scion_cache_misses_total[10m]))
+          / clamp_min(sum(rate(scion_cache_hits_total[10m]))
+          + sum(rate(scion_cache_misses_total[10m])), 0.001) > 0.5
+        for: 30m
+        labels:
+          severity: medium
+        annotations:
+          response: >-
+            The tier fetches what it should serve from its snapshot:
+            check CacheDown and the tier's memory caps (--max-bytes,
+            --snapshot-bytes), and raise or restart it
+            (docs/operations.md sections 1 and 6).
+  - name: gc
+    rules:
+      - alert: GcStale
+        expr: >-
+          time() - scion_gc_last_success_timestamp_seconds{dry_run="false"} > 172800
+        for: 1h
+        labels:
+          severity: high
+        annotations:
+          response: >-
+            The last successful run is over 48 h old: the cron stopped
+            firing or runs fail (docs/operations.md section 5).
