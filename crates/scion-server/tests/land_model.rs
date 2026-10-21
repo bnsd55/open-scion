@@ -683,6 +683,14 @@ fn cut(
     Notebook { recs }
 }
 
+/// The lands the database holds, of every state: a land's row is
+/// written once and never changes or leaves inside a test, so a count
+/// above zero is a condition that cannot pass between two looks.
+fn recorded_lands(c: &rusqlite::Connection) -> i64 {
+    c.query_row("SELECT count(*) FROM lands", [], |row| row.get(0))
+        .unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn the_model_holds_across_lands_retries_and_restarts() {
     let rounds = usize::try_from(env("SCION_LANDMODEL_ROUNDS", ROUNDS)).unwrap();
@@ -713,14 +721,19 @@ async fn the_model_holds_across_lands_retries_and_restarts() {
                 tokio::spawn(principal(url, caller, rng, OPS, signals))
             })
             .collect();
-        // Let the principals get to work, then kill the server under them:
-        // two rounds in three, at a moment a land is pending, so a crash
-        // meets a pending row.
+        // Let the principals get to work, then kill the server under
+        // them: two rounds in three, while their lands are live. The
+        // wait is for a land RECORDED in the database - any state, since
+        // a row never changes and never goes away - because the old wait
+        // watched for `pending`, a state a land holds only between its
+        // record and its settle: on a fast runner the principals finish
+        // their lands before the first poll, the moment passes unseen,
+        // and the wait names a hold that never happened (#478's flake).
         tokio::time::sleep(Duration::from_millis(150)).await;
         if round % 3 != 0 {
             let conn = rusqlite::Connection::open(data.join("scion.db")).unwrap();
-            wait_until("a land is pending in the database", || {
-                pending_lands(&conn) > 0
+            wait_until("a land is recorded in the database", || {
+                recorded_lands(&conn) > 0
             })
             .await;
         }
