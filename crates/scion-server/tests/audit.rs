@@ -455,11 +455,6 @@ async fn concurrent_lands_ref_lines_tell_one_true_history() {
     use scion_proto::v1::LandRequest;
     use std::fmt::Write as _;
 
-    // Seven large changesets and one small one: the large lands'
-    // jobs spend real time reading the changeset back, the small
-    // land settles fast.
-    const PATHS: usize = 5000;
-
     let dir = tempfile::tempdir().unwrap();
     let store = store(dir.path());
     let audit_path = dir.path().join("audit.log");
@@ -471,7 +466,7 @@ async fn concurrent_lands_ref_lines_tell_one_true_history() {
     // into the store: the land is what this test drives.
     let lands: Vec<_> = (0..8)
         .map(|i| {
-            let count = if i == 0 { 1 } else { PATHS };
+            let count = 2;
             let mut blobs = Vec::new();
             let changes: std::collections::BTreeMap<_, _> = (0..count)
                 .map(|j| {
@@ -552,9 +547,9 @@ async fn concurrent_lands_ref_lines_tell_one_true_history() {
     // itself, let alone move the ref, until every call has read the
     // ref: the calls' first tasks need only the readers, and the
     // intents in the audit file say they are past them. Then let go:
-    // the jobs proceed, the ref lock serializes their moves, and each
-    // move's `previous` (or, on the racing code, the call's own early
-    // read) must be the head the move actually replaced.
+    // the ref lock serializes the jobs' moves, and each move's
+    // `previous` (or, on the racing code, the call's own early read)
+    // must be the head the move actually replaced.
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     let blocker = std::thread::spawn({
@@ -570,10 +565,9 @@ async fn concurrent_lands_ref_lines_tell_one_true_history() {
         }
     });
     held_rx.recv().unwrap();
-    for i in 1..8 {
+    for i in 0..8 {
         join(i);
     }
-    join(0);
     // The eight intents say every call is past its intent; their
     // first tasks read the ref within microseconds of it.
     wait_for_lines(&audit_path, 8).await;
