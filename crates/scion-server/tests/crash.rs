@@ -53,7 +53,11 @@ fn seed() -> u64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_reply_survives_a_kill_of_the_server() {
     let mut rng = Rng::new(seed());
-    let kills = usize::try_from(env("SCION_CRASH_KILLS", 6)).unwrap();
+    // Ten kills: at the measured rate about half the kills meet a land
+    // pending in the database, so the chance that all ten miss is about
+    // 0.5^10, just under 0.1% - the bar the assert's margin needs, so
+    // the assert itself cannot be the next flake.
+    let kills = usize::try_from(env("SCION_CRASH_KILLS", 10)).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let (data, log) = (dir.path().join("data"), dir.path().join("server.log"));
     create_repo(&data);
@@ -61,8 +65,9 @@ async fn every_reply_survives_a_kill_of_the_server() {
     let mut ledger = Ledger::default();
     let mut checked = Checked::default();
     let (mut left, mut cut) = (0, 0);
+    let mut pending_kills = 0usize;
     for round in 0..kills {
-        let server = Server::start(&data, &log);
+        let server = Server::start_on("One server", &data, &log);
         check(&server.url, &data, &mut ledger, &mut checked, &mut rng).await;
         let signals = Arc::new(Signals::default());
         let clients: Vec<_> = (0..CLIENTS)
@@ -80,16 +85,31 @@ async fn every_reply_survives_a_kill_of_the_server() {
         match rng.below(3) {
             0 => {}
             1 => {
-                wait_until(|| signals.large_uploads.load(Ordering::SeqCst) > 0).await;
+                wait_until("a large upload is in flight", || {
+                    signals.large_uploads.load(Ordering::SeqCst) > 0
+                })
+                .await;
                 let delay = u64::try_from(rng.below(30)).unwrap();
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
             _ => {
                 let db = rusqlite::Connection::open(data.join("scion.db")).unwrap();
-                wait_until(|| pending_lands(&db) > 0).await;
+                wait_until_bounded("a land is pending in the database", 5, || {
+                    pending_lands(&db) > 0
+                })
+                .await;
             }
         }
         signals.killed.store(true, Ordering::SeqCst);
+        {
+            // Whatever arm chose the moment, the kill may still meet a
+            // land the clients have in flight: count it, the test's
+            // whole point is that a crash meets a pending row.
+            let db = rusqlite::Connection::open(data.join("scion.db")).unwrap();
+            if pending_lands(&db) > 0 {
+                pending_kills += 1;
+            }
+        }
         drop(server);
         for client in clients {
             let mut got = client.await.unwrap();
@@ -102,7 +122,7 @@ async fn every_reply_survives_a_kill_of_the_server() {
         // restart inside `check`; what a kill left is a folder per process.
         left += fs::read_dir(data.join("tmp")).unwrap().count();
     }
-    let server = Server::start(&data, &log);
+    let server = Server::start_on("One server", &data, &log);
     check(&server.url, &data, &mut ledger, &mut checked, &mut rng).await;
 
     println!(
@@ -111,6 +131,12 @@ async fn every_reply_survives_a_kill_of_the_server() {
         checked.files.len(),
     );
     assert!(ledger.lands.len() > kills, "the clients did little work");
+    assert!(
+        pending_kills > 0,
+        "no kill met a land pending in the database: {pending_kills} of {kills} kills; \
+         the wide lands must keep pending common"
+    );
+    println!("{pending_kills} of {kills} kills met a land pending in the database");
 }
 
 /// Derived rows in the schema-upgrade test, so that the upgrade of version 2

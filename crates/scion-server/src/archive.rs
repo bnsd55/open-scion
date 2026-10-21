@@ -37,11 +37,34 @@ struct RepoSection {
 
 /// A land of an archive, as its file holds it: the fields a restore needs
 /// to record it again.
-struct ArchiveLand {
-    caller: String,
-    request_key: String,
-    target_ref: String,
-    input_cs: ChangesetId,
+pub(crate) struct ArchiveLand {
+    pub(crate) caller: String,
+    pub(crate) request_key: String,
+    pub(crate) target_ref: String,
+    pub(crate) input_cs: ChangesetId,
+}
+
+// The test's writer between a section's statements. A test installs it
+// on its own thread, and the export runs on the caller's thread, so the
+// hook fires inside that test's export and in no other's. One-shot:
+// the first section takes it, the rest pass. None passes nothing.
+#[cfg(any(test, feature = "test-hooks"))]
+thread_local! {
+    static SECTION_HOOK: std::cell::RefCell<Option<Box<dyn Fn() + Send>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs the hook that runs between a section's statements, or takes
+/// it back with `None`.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn set_section_hook(hook: Option<Box<dyn Fn() + Send>>) {
+    SECTION_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+/// Takes the installed hook, if any.
+#[cfg(any(test, feature = "test-hooks"))]
+fn take_section_hook() -> Option<Box<dyn Fn() + Send>> {
+    SECTION_HOOK.with(|slot| slot.borrow_mut().take())
 }
 
 /// Exports `repo`, or the whole store with `all`, to the archive directory
@@ -571,9 +594,13 @@ fn copy_blobs(data: &Path, archive: &Path, ids: &[BlobId]) -> Result<()> {
 }
 
 /// The metadata of `name`, as ONE read transaction holds it: the
-/// snapshot every section of an export shares.
+/// snapshot every section of an export shares. The explicit read
+/// transaction is what makes the claim true on SQLite: each statement
+/// would otherwise see its own snapshot, and a land that commits
+/// between them would leave a ref naming a changeset the archive does
+/// not hold.
 fn snapshot_section(store: &Backend, name: &str) -> Result<RepoSection> {
-    store.read(|tx| {
+    store.read_snapshot(|tx| {
         let repo_id = tx.repo_id(name)?;
         let changesets = tx
             .repo_changesets_with_bodies(repo_id)?
@@ -584,6 +611,12 @@ fn snapshot_section(store: &Backend, name: &str) -> Result<RepoSection> {
                 Ok((id, generation, body))
             })
             .collect::<Result<Vec<_>>>()?;
+        // A test's writer, called between the section's statements: what
+        // it commits must stay outside this section's snapshot.
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(hook) = take_section_hook() {
+            hook();
+        }
         let refs = tx
             .list_refs(repo_id)?
             .into_iter()
@@ -735,7 +768,7 @@ fn write_changesets(path: &Path, changesets: &[(ChangesetId, i64, Vec<u8>)]) -> 
 // repo's full history (bodies) in RAM. Ceiling: a repo whose history is
 // gigabytes needs gigabytes. Upgrade path: stream the frames from a
 // `BufReader`, one record at a time, into the replay transaction.
-fn read_changesets(path: &Path) -> Result<Vec<(ChangesetId, i64, Vec<u8>)>> {
+pub(crate) fn read_changesets(path: &Path) -> Result<Vec<(ChangesetId, i64, Vec<u8>)>> {
     let bytes = fs::read(path)?;
     let mut out = Vec::new();
     let mut at = 0_usize;
@@ -788,7 +821,7 @@ fn write_members(path: &Path, members: &[BlobId]) -> Result<()> {
 }
 
 /// Reads the member list back.
-fn read_members(path: &Path) -> Result<Vec<BlobId>> {
+pub(crate) fn read_members(path: &Path) -> Result<Vec<BlobId>> {
     let text = fs::read_to_string(path)?;
     text.lines()
         .filter(|line| !line.is_empty())
@@ -807,7 +840,7 @@ fn read_members(path: &Path) -> Result<Vec<BlobId>> {
 }
 
 /// Writes the refs file: `[{name, target, version}]`.
-fn read_refs(path: &Path) -> Result<Vec<(String, ChangesetId, i64)>> {
+pub(crate) fn read_refs(path: &Path) -> Result<Vec<(String, ChangesetId, i64)>> {
     let value = read_json(path)?;
     let rows = value.as_array().ok_or_else(|| corrupt_json(path))?;
     rows.iter()
@@ -831,7 +864,7 @@ fn read_refs(path: &Path) -> Result<Vec<(String, ChangesetId, i64)>> {
 }
 
 /// Reads the lands file back.
-fn read_lands(path: &Path) -> Result<Vec<ArchiveLand>> {
+pub(crate) fn read_lands(path: &Path) -> Result<Vec<ArchiveLand>> {
     let value = read_json(path)?;
     let rows = value.as_array().ok_or_else(|| corrupt_json(path))?;
     rows.iter()
@@ -866,7 +899,7 @@ fn read_lands(path: &Path) -> Result<Vec<ArchiveLand>> {
 }
 
 /// Reads the provenance file back.
-fn read_provenance(path: &Path) -> Result<Vec<(ObjectId, ChangesetId)>> {
+pub(crate) fn read_provenance(path: &Path) -> Result<Vec<(ObjectId, ChangesetId)>> {
     let value = read_json(path)?;
     let rows = value.as_array().ok_or_else(|| corrupt_json(path))?;
     rows.iter()
@@ -901,7 +934,7 @@ fn read_json(path: &Path) -> Result<serde_json::Value> {
         .map_err(|error| Error::Corrupt(format!("{} does not parse: {error}", path.display())))
 }
 
-fn read_manifest(archive: &Path) -> Result<serde_json::Value> {
+pub(crate) fn read_manifest(archive: &Path) -> Result<serde_json::Value> {
     let manifest = read_json(&archive.join("manifest.json"))?;
     if manifest["format"] != "scion-archive" {
         return Err(Error::FailedPrecondition(format!(

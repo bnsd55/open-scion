@@ -368,7 +368,7 @@ fn matrix_rows() -> Vec<Row> {
 /// every shipped binary (server, cache, daemon, scn) is `supported` on
 /// that OS and architecture. A cell the release builds but the matrix
 /// does not back, or a supported cell the release omits, fails here —
-/// so coder1's support-matrix flip (#418) must move both files in one
+/// so the support-matrix flip (#418) must move both files in one
 /// change.
 #[test]
 fn release_cells_are_exactly_the_fully_supported_ones() {

@@ -38,6 +38,8 @@ This project rebuilds the ideas from that public article.
 **Platforms.** Linux and macOS. Windows is not supported. What exactly is
 tested and what is not: [Supported platforms](#supported-platforms) below.
 What each release promises per surface: [docs/stability.md](docs/stability.md).
+To check a release before you run it — the signed tag, the checksums,
+the build attestations, the SBOM: [docs/verify.md](docs/verify.md).
 
 **Interface.** openscion is a command-line tool and a service, and its
 interface is text: commands, plain files, and log lines. That is the

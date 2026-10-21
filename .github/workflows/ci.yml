@@ -5,13 +5,24 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # The nightly: the same suite, on main, once a night. The v0.8.0 line
+  # "the scheduled full suite passes 30 consecutive runs" counts these
+  # runs (scripts/nightly-streak.sh reads them with --event schedule).
+  schedule:
+    - cron: "0 3 * * *"
 
 permissions:
   contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A pull_request run may cancel the run before it (same branch,
+  # superseded); a push to main may not: a run in progress finishes
+  # and verifies the head it ran on, and while it runs only the
+  # newest push waits — an older pending run is replaced, not run.
+  # A 03:00 schedule and a push to main share one group, and neither
+  # cancels: the nightly waits its turn.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Every third-party action is pinned to the commit SHA its version tag
 # named when this file last moved, with the version in a comment; Dependabot
@@ -43,6 +54,16 @@ jobs:
         run: scripts/check-changelog.sh
       - name: the changelog merge script does what it says
         run: scripts/test-merge-changelog.sh
+      # The release pipeline's tag verdicts, fed canned tag objects: no
+      # CI run holds a signed release tag, so the decision is tested
+      # here instead of being trusted.
+      - name: the release tag verdicts hold (release-verify-tag)
+        run: scripts/test-release-verify-tag.sh
+      # A workflow that cannot parse fails here, on the PR that carries
+      # it, not main's next push-triggered run (#416, #419). The
+      # actionlint release is pinned by version and sha256.
+      - name: the workflows parse (actionlint)
+        run: scripts/lint-workflows.sh
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
@@ -508,3 +529,19 @@ jobs:
       # and 002): import, ticket-key, serve, scn reads and writes, fsck,
       # and a one-signal shutdown that must exit 0, on Linux and macOS.
       - run: scripts/release-smoke.sh
+
+  nightly-streak:
+    name: nightly streak
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # A report, not a gate: the v0.8.0 line "the scheduled full suite
+    # passes 30 consecutive runs" is a fact this job prints, and the run
+    # history is where anyone re-checks it. Read-only over the runs.
+    permissions:
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: the current streak of the nightly
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/nightly-streak.sh

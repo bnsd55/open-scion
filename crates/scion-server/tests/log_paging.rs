@@ -89,11 +89,7 @@ async fn serve(store: Backend, dir: &std::path::Path) -> String {
 
 async fn client(url: &str) -> Scion {
     ScionClient::with_interceptor(
-        Channel::from_shared(url.to_owned())
-            .unwrap()
-            .connect()
-            .await
-            .unwrap(),
+        common::channel(url).await.unwrap(),
         Bearer::new(TOKEN).unwrap(),
     )
 }
@@ -251,3 +247,6 @@ async fn log_paging_with_a_path_matches_one_full_walk() {
     paged(&mut client, &tip, &positions, 7, b"d/f.txt").await;
     paged(&mut client, &tip, &positions, 4, b"d/f.txt").await;
 }
+
+#[path = "common/mod.rs"]
+mod common;
