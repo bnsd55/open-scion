@@ -215,6 +215,9 @@ fn every_proof_line_names_a_test_that_exists() {
 /// `runbook_block` helper, or says why it cannot: a `(drill)` proof
 /// names the recorded drill, a `(behaviour, no command)` proof names
 /// the behaviour its test holds when the runbook's steps are operator
+/// actions, a `(measured, no command)` proof names a measured time the
+/// section's workflow takes, not a shell command,
+/// the behaviour its test holds when the runbook's steps are operator
 /// actions rather than shell commands, and a proof still converting
 /// sits in `NOT_YET_DRIVING`. Anything else fails here, and so does a
 /// stale row: the list must match the guide exactly, so no proof is
@@ -236,7 +239,10 @@ fn every_proof_runs_the_guides_command_or_says_why() {
             continue;
         };
         proofs += 1;
-        if proof.contains("(drill)") || proof.contains("(behaviour, no command") {
+        if proof.contains("(drill)")
+            || proof.contains("(behaviour, no command")
+            || proof.contains("(measured, no command")
+        {
             continue;
         }
         let named = proof
@@ -323,10 +329,7 @@ fn every_proof_runs_the_guides_command_or_says_why() {
 /// runs its section's command block or carries its marker now, so the
 /// list is empty: a new proof must drive the block or say why it
 /// cannot, and a stale row or a silent exemption fails the check.
-const NOT_YET_DRIVING: &[(&str, &str)] = &[(
-    "7. Capacity",
-    "a_restart_after_a_kill_recovers_in_a_stated_time",
-)];
+const NOT_YET_DRIVING: &[(&str, &str)] = &[];
 
 /// The alerts' responses point at the operations guide, and every
 /// pointer resolves: a `docs/operations.md#anchor` names a heading of

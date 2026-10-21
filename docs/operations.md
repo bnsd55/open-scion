@@ -1226,4 +1226,4 @@ current numbers live in the workflow's run log on `main`, and a run
 that drifts far from them is a regression to look at, not a promise to
 restate here.
 
-Proof: crates/scion-server/tests/recovery_bench.rs::a_restart_after_a_kill_recovers_in_a_stated_time
+Proof: crates/scion-server/tests/recovery_bench.rs::a_restart_after_a_kill_recovers_in_a_stated_time (measured, no command: the section's number is what the recovery-bench workflow measures - a kill, a restart, and the seconds to serving - which no shell command of the guide reproduces)
