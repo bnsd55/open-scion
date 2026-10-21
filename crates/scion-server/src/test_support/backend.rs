@@ -99,6 +99,34 @@ impl Backend {
     pub fn test_is_postgres() -> bool {
         std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres")
     }
+
+    /// The Postgres statements this process has run since the last
+    /// reset. The land round-trip guard measures the delta around one
+    /// land; on SQLite the count is always zero, which is why the guard
+    /// skips there.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn test_statement_count() -> u64 {
+        crate::pg::test_statement_count()
+    }
+
+    /// Sets the statement count back to zero.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_reset_statement_count() {
+        crate::pg::test_reset_statement_count();
+    }
+
+    /// Whether the server's first stale-land sweep has finished: a test
+    /// that counts a call's statements waits for it, so the sweep's own
+    /// statements cannot fall inside its window.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn test_first_sweep_done() -> bool {
+        crate::service::TEST_FIRST_SWEEP_DONE.load(std::sync::atomic::Ordering::Acquire)
+    }
     /// The schema that [`Backend::open_test`] gave this data directory on
     /// Postgres: a test that counts rows through its own Postgres client
     /// names it the same way. A result, so the callers unwrap one shape.

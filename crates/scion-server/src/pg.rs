@@ -22,7 +22,7 @@
 //!   twice, and the newest land holds the largest one.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -1398,8 +1398,31 @@ fn run_with_retry(
     run_statement(client, job)
 }
 
+/// The statements this process has run against Postgres since the last
+/// reset. A test hook: the land round-trip guard reads the delta around
+/// one land and fails the run when it grows past the budget. The count
+/// lives on the worker thread's side, so the read crosses no lock; the
+/// guard's binary runs one measuring test, so a process-wide total is
+/// one land's count.
+#[cfg(any(test, feature = "test-hooks"))]
+static TEST_STATEMENTS: AtomicU64 = AtomicU64::new(0);
+
+/// The statement count of this process since the last reset.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn test_statement_count() -> u64 {
+    TEST_STATEMENTS.load(Ordering::Relaxed)
+}
+
+/// Sets the statement count back to zero.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn test_reset_statement_count() {
+    TEST_STATEMENTS.store(0, Ordering::Relaxed);
+}
+
 /// Runs one statement of a job on the client.
 fn run_statement(client: &mut Client, job: &Job) -> Result<Reply> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    TEST_STATEMENTS.fetch_add(1, Ordering::Relaxed);
     let refs = as_refs(&job.params);
     match job.kind {
         Kind::Batch => client.batch_execute(&job.sql).map(|(): ()| Reply::Count(0)),
