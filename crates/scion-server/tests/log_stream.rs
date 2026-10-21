@@ -6,8 +6,10 @@
 //! removes it by accident.
 
 use std::num::NonZeroU64;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+
+use tracing_subscriber::fmt::MakeWriter;
 
 use scion_core::{Changeset, FileState, RepoPath};
 use scion_proto::MAX_MESSAGE_BYTES;
@@ -131,6 +133,51 @@ async fn stalled_log(client: &mut Scion, from: &[u8]) -> Streaming<scion_proto::
 }
 
 /// A client that stops reading: the parts of the reply pile up in HTTP/2,
+/// The log of the test binary, into this one buffer: the close notice of
+/// a stalled connection names its peer there.
+static LOG: LazyLock<Captured> = LazyLock::new(Captured::default);
+
+/// The tests share one log, so they run one at a time.
+static SERIAL: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
+
+fn init_log() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::level_filters::LevelFilter::WARN)
+            .with_writer(Captured::clone(&*LOG))
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+    });
+}
+
+fn log_text() -> String {
+    String::from_utf8(LOG.0.lock().unwrap().clone()).unwrap()
+}
+
+/// A log writer that collects what the test binary logs.
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for Captured {
+    type Writer = Captured;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 /// the reply's producer stops at its stall, and the stalled bytes go on the
 /// connection's count. Past `--max-stalled-bytes` the connection closes, so
 /// the stalled stream ends with the transport error. The clock is paused
@@ -139,6 +186,11 @@ async fn stalled_log(client: &mut Scion, from: &[u8]) -> Streaming<scion_proto::
 /// HTTP/2 windows back, and the reply flows instead of stalling.
 #[tokio::test(start_paused = true)]
 async fn a_stalled_log_reply_is_counted_and_closes_the_connection() {
+    init_log();
+    {
+        let _serial = SERIAL.lock().unwrap();
+        LOG.0.lock().unwrap().clear();
+    }
     // Twenty changesets with 300 KB messages each: the tip's page is about
     // six parts, and the client's connection takes under two, so a client
     // that never reads stalls the producer inside the reply.
@@ -167,6 +219,18 @@ async fn a_stalled_log_reply_is_counted_and_closes_the_connection() {
     // nothing was counted.
     let end = reply.message().await;
     assert!(end.is_err(), "the stalled reply was not cut off: {end:?}");
+
+    // The close notice names the connection's peer, so the runbook's
+    // `find the client` step has an address to grep for.
+    let text = log_text();
+    assert!(
+        text.contains("closing a connection: its stalled replies hold too much"),
+        "the close notice is not in the log: {text}"
+    );
+    assert!(
+        text.contains("peer=Some(127.0.0.1"),
+        "the close notice names no peer: {text}"
+    );
 }
 
 /// A service whose one unary reply is one byte over the largest message a
@@ -362,4 +426,16 @@ async fn a_stalled_blame_reply_is_counted_and_closes_the_connection() {
     // nothing was counted.
     let end = reply.message().await;
     assert!(end.is_err(), "the stalled reply was not cut off: {end:?}");
+
+    // The close notice names the connection's peer, so the runbook's
+    // `find the client` step has an address to grep for.
+    let text = log_text();
+    assert!(
+        text.contains("closing a connection: its stalled replies hold too much"),
+        "the close notice is not in the log: {text}"
+    );
+    assert!(
+        text.contains("peer=Some(127.0.0.1"),
+        "the close notice names no peer: {text}"
+    );
 }

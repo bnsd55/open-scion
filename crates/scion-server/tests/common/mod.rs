@@ -83,6 +83,11 @@ impl Server {
     pub(crate) fn pid(&self) -> u32 {
         self.child.id()
     }
+
+    /// Whether the server process exited, and how: `None` while it runs.
+    pub(crate) fn try_wait(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().unwrap()
+    }
 }
 
 impl Server {
