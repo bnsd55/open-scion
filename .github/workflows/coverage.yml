@@ -238,7 +238,7 @@ jobs:
           # output goes to a file, not the step log: the agent
           # buffers what it streams.
           mkdir -p .config
-          printf '[profile.default]\ntimeout = "300s"\nretries = 1\nslow-timeout = { period = "60s", terminate-after = 2 }\n' > .config/nextest.toml
+          printf '[profile.default]\ntimeout = "600s"\nretries = 1\nslow-timeout = { period = "60s", terminate-after = 8 }\n' > .config/nextest.toml
           # shellcheck disable=SC1090
           source <(cargo llvm-cov show-env --sh)
           # A hard cap 15 minutes under the wall the agent dies at:
