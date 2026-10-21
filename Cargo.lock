@@ -2576,7 +2576,6 @@ dependencies = [
  "http-body-util",
  "hyper",
  "jiff",
- "open-scion",
  "open-scion-core",
  "open-scion-proto",
  "open-scion-server",

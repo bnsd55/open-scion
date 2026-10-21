@@ -62,14 +62,6 @@ test-hooks = []
 
 [dev-dependencies]
 open-scion-server = { path = ".", features = ["test-hooks"] }
-# A test drives scn's own product client against a real server process,
-# which `CARGO_BIN_EXE` cannot name for another crate's binary. The
-# dev-dep cycle (scn dev-depends on this crate) is what cargo allows
-# for tests.
-open-scion = { version = "0.1.0", path = "../scn" }
-# The keepalive test shortens the client keepalive through the seam,
-# which the feature turns on for the test build's scion-proto.
-open-scion-proto = { workspace = true, features = ["test-hooks"] }
 # The ledger's own hash, on purpose not the store's BLAKE3 (#377).
 sha2 = "0.11.1"
 proptest.workspace = true
