@@ -110,9 +110,8 @@ async fn wait_for_kind(path: &std::path::Path, event: &str, outcome: &str) {
     for _ in 0..100 {
         let has = fs::read(path).is_ok_and(|bytes| {
             String::from_utf8_lossy(&bytes).lines().any(|line| {
-                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|line| {
-                    line["event"] == *event && line["outcome"] == *outcome
-                })
+                serde_json::from_str::<serde_json::Value>(line)
+                    .is_ok_and(|line| line["event"] == *event && line["outcome"] == *outcome)
             })
         });
         if has {
