@@ -406,13 +406,23 @@ async fn a_write_whose_intent_fails_is_refused() {
     // The readiness loss latches: the health names flip and the server
     // drains, so a later call is refused too. The log has a hole; the
     // supervisor restarts a server that can prove its lines again.
-    let later = ci
-        .resolve_ref(ResolveRefRequest {
-            repo: REPO.into(),
-            name: "main".into(),
-        })
-        .await;
-    assert!(later.is_err(), "a server whose audit lost a line drains");
+    // The call rides the connection the drain is still finishing, so
+    // poll with a deadline instead of racing the drain once.
+    let mut drained = false;
+    for _ in 0..100 {
+        let later = ci
+            .resolve_ref(ResolveRefRequest {
+                repo: REPO.into(),
+                name: "main".into(),
+            })
+            .await;
+        if later.is_err() {
+            drained = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(drained, "a server whose audit lost a line drains");
 
     let _ = stop.send(());
 }
