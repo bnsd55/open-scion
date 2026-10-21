@@ -13,10 +13,11 @@ mod common;
 
 use scion_core::{Changeset, IdentityTime, RepoPath};
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+use scion_server::test_support::tree;
 use scion_server::test_support::write;
 use scion_server::{Backend, Error};
 
-use crate::common::{REPO, create_repo};
+use crate::common::{REPO, author};
 
 fn required() -> bool {
     if !cfg!(target_os = "linux") {
@@ -636,9 +637,26 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     let store = Backend::open_test(&data).expect("the store opens");
-    // The suite's repo helper: the repo r with a root changeset and the
-    // ref main, so the lands below have a parent to land onto.
-    create_repo(&data);
+    // The repo, its root changeset, and the ref main, all through the
+    // same open the lands below use: a second open of one schema cannot
+    // run beside the first (the per-schema one-server lock), and a bare
+    // repo has no main for the lands' parent read.
+    store
+        .write(|c| {
+            let repo = c.create_repo(REPO)?;
+            let root = Changeset::new(
+                vec![],
+                author(),
+                None,
+                b"root\n".to_vec(),
+                std::collections::BTreeMap::new(),
+            )
+            .expect("the root fits the format");
+            let (id, _) = tree::store_changeset(c, repo, &root, &mut tree::lens_of(&store))?;
+            assert!(c.cas_ref(repo, "main", None, id)?);
+            Ok(())
+        })
+        .expect("the repo and its main land");
     let outcome = loop {
         // A backstop: lands that never stop mean the fill was not full,
         // which is this test's own failure, not the server's.
