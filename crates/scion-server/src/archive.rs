@@ -144,7 +144,17 @@ pub fn verify(archive: &Path) -> Result<Vec<String>> {
     let manifest = read_manifest(archive)?;
     let names = repo_names(&manifest)?;
     let mut damages = Vec::new();
+    // The manifest is data from a file: a name twice means the reader
+    // and the restore would both walk the repo twice, and the restore
+    // would replay two stores into one. Name it before anything else.
+    let mut seen_names = HashSet::new();
     for name in &names {
+        if !seen_names.insert(name) {
+            damages.push(format!(
+                "the manifest names repo {name} twice; one repo, one section"
+            ));
+            continue;
+        }
         let dir = archive.join("repos").join(name);
         let changesets = read_changesets(&dir.join("changesets.bin"))?;
         let ids: HashSet<ChangesetId> = changesets.iter().map(|(id, _, _)| *id).collect();
@@ -183,7 +193,18 @@ pub fn verify(archive: &Path) -> Result<Vec<String>> {
                 ));
             }
         }
+        // The pending lands replay as the store's own `record_land`
+        // calls, and the store keeps a request key unique per repo: two
+        // lands on one key make the replay fail halfway, with half a
+        // store behind it. Name the collision here, before any write.
+        let mut seen_keys = HashSet::new();
         for land in read_lands(&dir.join("lands.json"))? {
+            if !seen_keys.insert(land.request_key.clone()) {
+                damages.push(format!(
+                    "repo {name}: two pending lands share the request key {}; one key, one land",
+                    land.request_key
+                ));
+            }
             if !ids.contains(&land.input_cs) {
                 damages.push(format!(
                     "repo {name}: the land with request key {} names input {}, which the archive does not hold",
@@ -232,6 +253,13 @@ pub fn verify(archive: &Path) -> Result<Vec<String>> {
 ///
 /// A data directory that already holds a store, a failed open, damage
 /// [`verify`] finds, or what the replay's writes return.
+/// Replays an archive into an empty store: the blob bytes go through the
+/// store's own write path, so every object ID is the hash of its bytes;
+/// the data directory the caller named is filled by renaming a staging
+/// directory beside it into place only when the whole replay held — a
+/// restore that fails, for any reason, leaves the target as it found it:
+/// an operator cannot tell restored state from unrestored, so a half
+/// store is the one thing this must never leave.
 pub fn restore(
     archive: &Path,
     data: &Path,
@@ -246,6 +274,51 @@ pub fn restore(
             )));
         }
     }
+    // The staging directory sits beside the target, on the same
+    // filesystem, so the final publication is one rename: either the
+    // target is the restored store or it is what it was.
+    let file_name = data.file_name().ok_or_else(|| {
+        Error::FailedPrecondition(format!(
+            "{} has no file name; a restore needs a named directory",
+            data.display()
+        ))
+    })?;
+    let staging = data.with_file_name(format!("{}.restoring", file_name.to_string_lossy()));
+    if staging.exists() {
+        // The scratch name is this restore's own: a leftover of a run
+        // that died mid-replay, never a store an operator made.
+        fs::remove_dir_all(&staging)?;
+    }
+    fs::create_dir_all(&staging)?;
+    let replayed = restore_into(archive, &staging, postgres_url, postgres_ca);
+    match replayed {
+        Ok(names) => {
+            if let Err(error) = fs::rename(&staging, data) {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(Error::FailedPrecondition(format!(
+                    "the restore replayed whole, but {} could not take {}'s place: {error}",
+                    data.display(),
+                    staging.display()
+                )));
+            }
+            Ok(names)
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            Err(error)
+        }
+    }
+}
+
+/// The replay itself, into whatever directory the caller named: the
+/// publication (the rename into the target) is [`restore`]'s, so a
+/// failure here cannot leave anything behind.
+fn restore_into(
+    archive: &Path,
+    data: &Path,
+    postgres_url: Option<&str>,
+    postgres_ca: Option<&Path>,
+) -> Result<Vec<String>> {
     let manifest = read_manifest(archive)?;
     let names = repo_names(&manifest)?;
     // One check path: the same verify a reader runs, before any write. A
