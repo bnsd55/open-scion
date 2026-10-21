@@ -259,7 +259,6 @@ fn hex16(bytes: &[u8; 16]) -> String {
     hex
 }
 
-
 impl Backend {
     /// Where a ref points.
     ///
