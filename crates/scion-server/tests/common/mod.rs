@@ -86,6 +86,15 @@ pub(crate) fn token_file() -> &'static std::path::PathBuf {
     FILE.get_or_init(|| std::env::temp_dir().join(format!("scion-token-{}", std::process::id())))
 }
 
+/// One staging name per call: two tests spawning at once must not race
+/// one staging file's rename.
+fn staging() -> &'static std::sync::atomic::AtomicU64 {
+    use std::sync::OnceLock;
+    use std::sync::atomic::AtomicU64;
+    static STAGING: OnceLock<AtomicU64> = OnceLock::new();
+    STAGING.get_or_init(|| AtomicU64::new(0))
+}
+
 impl Server {
     /// The server process's id, for a test that must tell the server's
     /// files from another process's.
@@ -140,10 +149,7 @@ impl Server {
         // the walk refuses. The rename is atomic, so a server that reads
         // while a sibling test rewrites sees whole bytes.
         let token_file = token_file();
-        // The staging name is unique per call: two tests spawning at once
-        // must not race one staging file's rename.
-        static STAGING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = STAGING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let n = staging().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = token_file.with_extension(format!("tmp{n}"));
         {
             use std::os::unix::fs::OpenOptionsExt as _;
