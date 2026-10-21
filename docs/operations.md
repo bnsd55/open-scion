@@ -717,3 +717,60 @@ of one operation.
 
 A ticket refusal, an access refusal, or a corrupt blob each log one line
 per event, never the bytes or the token that caused them.
+
+## 7. Capacity
+
+What one server takes, measured on one named machine, so the numbers have
+a bottom. The table below is the published envelope
+([#387](https://github.com/bnsd55/openscion/issues/387)): every cell is a
+run of [`scripts/capacity.sh`](../scripts/capacity.sh) on a GitHub-hosted
+runner of the class named in the caption, with the dataset of
+[benchmarks.md](benchmarks.md) (tokio at a pinned commit), SQLite or
+Postgres behind the server, `scn bench` landing through it and readers
+checking out through a cache and a daemon beside it.
+
+| | |
+|---|---|
+| Commit | the `git rev-parse HEAD` of the run that produced the table |
+| Runner | the hosted runner class, by its public label and spec |
+| Repetitions | 2 per cell; the table reports the cell's whole run, and the run's raw samples are the workflow run's `capacity.csv` artifact |
+
+| backend | writers | readers | lands/min | land p99 ms | checkout p50 ms | checkout p99 ms | errors | server RSS MiB | store KiB per 1k lands |
+|---|---|---|---|---|---|---|---|---|---|
+| sqlite | 2 | 0 | - | - | - | - | - | - | - |
+| sqlite | 2 | 5 | - | - | - | - | - | - | - |
+| sqlite | 2 | 20 | - | - | - | - | - | - | - |
+| sqlite | 50 | 0 | - | - | - | - | - | - | - |
+| sqlite | 50 | 5 | - | - | - | - | - | - | - |
+| sqlite | 50 | 20 | - | - | - | - | - | - | - |
+| sqlite | 200 | 0 | - | - | - | - | - | - | - |
+| sqlite | 200 | 5 | - | - | - | - | - | - | - |
+| sqlite | 200 | 20 | - | - | - | - | - | - | - |
+| postgres | 2 | 0 | - | - | - | - | - | - | - |
+| postgres | 2 | 5 | - | - | - | - | - | - | - |
+| postgres | 2 | 20 | - | - | - | - | - | - | - |
+| postgres | 50 | 0 | - | - | - | - | - | - | - |
+| postgres | 50 | 5 | - | - | - | - | - | - | - |
+| postgres | 50 | 20 | - | - | - | - | - | - | - |
+| postgres | 200 | 0 | - | - | - | - | - | - | - |
+| postgres | 200 | 5 | - | - | - | - | - | - | - |
+| postgres | 200 | 20 | - | - | - | - | - | - | - |
+
+The cells with `-` are the ones no run has filled yet. The errors column
+is part of the data, not a failure of the run: the envelope's edge IS
+where errors start, so a cell whose clients failed is recorded with its
+error count and stands in the table. The edge, the point where a cell
+stops being an answer: a checkout p99 over 5 seconds, a land p99 over
+5 seconds, or a client error outside the accepted classes of the soak -
+in the table, that is a cell with errors above 0. A reader who wants a
+different edge applies it to the run's `capacity.csv` artifact, which
+the footer's workflow run keeps. A cell whose bench died names no land
+percentile (`-` there); its lands per minute still come from the
+server's counter.
+
+The store growth column is the SQLite store's only; the Postgres cells
+name no store growth, because the database's disk is its service
+container's, not a file tree the script can measure. RSS is the server's
+at the end of the cell: a capacity cell is minutes long, not the hours a
+warm-up would need, so it is a level, not a leak bound - the leak bound
+is the soak's.
