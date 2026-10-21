@@ -26,8 +26,8 @@ Make the project safe to install anywhere it claims to work.
   the suite runs per push and per pull request. The one suspected
   flake, scn's `failed printing to stdout: Broken pipe` in the release
   smoke, is confirmed fixed: [#341](https://github.com/bnsd55/openscion/pull/341)
-  landed the fix, and none of the 57 CI runs on `main` since it merged
-  shows a `Broken pipe` in the release smoke.
+  landed the fix, and none of the 57 CI runs on `main` from its merge
+  to 2026-10-21 shows a `Broken pipe` in the release smoke.
 - [Ubuntu's umask 002 and user private groups trip the group-writable
   checks](https://github.com/bnsd55/openscion/issues/302): open, the
   last item of this gate.
@@ -65,7 +65,7 @@ Make the pieces trustworthy together, and the data safe to lose.
   ([#320](https://github.com/bnsd55/openscion/issues/320); its last
   scheduled run failed on the RSS warm-up before
   [#365](https://github.com/bnsd55/openscion/pull/365) landed the fix,
-  and no scheduled run has happened since), and the last
+  and the first scheduled run after it confirms it), and the last
   missing operating metric (gc's) a textfile
   ([#327](https://github.com/bnsd55/openscion/issues/327)).
 - The fault and recovery matrix: disk full, EIO, a Postgres restart,
