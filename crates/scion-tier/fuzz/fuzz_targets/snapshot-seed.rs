@@ -10,6 +10,7 @@ use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt as _;
 
 use libfuzzer_sys::fuzz_target;
+use scion_proto::runtime::object::MAX_ENCODED_BYTES;
 use scion_tier::DiskStore;
 use scion_tier::snapshot;
 
@@ -40,8 +41,11 @@ fuzz_target!(|data: &[u8]| {
 
 /// The object records `data` frames, read independently of `seed`: the
 /// magic and repo name header, then per record its 37-byte head and the
-/// payload the head's size names. A head or a payload that ends past the
-/// file is the one record `seed` marks damaged.
+/// payload the head's size names. The count follows seed's damage rule
+/// (snapshot.rs `seed`): a head that ends past the file, an op that is
+/// not an object record's, a size over the store's limit, or a payload
+/// that ends past the file is the one record seed marks damaged, and
+/// the bytes after it frame nothing - so the count stops with it.
 fn object_records(data: &[u8]) -> usize {
     const MAGIC: &[u8; 9] = b"scnsnap1\n";
     const HEAD: usize = 1 + 32 + 4;
@@ -67,7 +71,16 @@ fn object_records(data: &[u8]) -> usize {
             records += 1;
             break;
         };
+        let op = head[0];
         let size = u32::from_le_bytes([head[33], head[34], head[35], head[36]]) as usize;
+        // `parse_record` accepts an object record: an uppercase op and a
+        // size within the limit. Anything else (including a tombstone's
+        // lowercase op, which `seed`'s destructuring rejects) is the
+        // damaged mark, and nothing after it is counted.
+        if !matches!(op, b'T' | b'B') || size > MAX_ENCODED_BYTES {
+            records += 1;
+            break;
+        }
         rest += HEAD;
         if rest_data(data, rest).len() < size {
             records += 1;

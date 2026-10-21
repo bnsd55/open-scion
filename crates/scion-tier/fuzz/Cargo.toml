@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 tempfile = "3"
 open-scion-tier = { path = ".." }
+open-scion-proto = { path = "../../scion-proto" }
 
 [[bin]]
 name = "snapshot-seed"
