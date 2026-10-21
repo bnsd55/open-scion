@@ -303,7 +303,7 @@ fn a_disk_full_runbook_gcs_then_writes_resume() {
     store
         .write(|c| c.cas_ref(repo, "main", None, cs))
         .expect("the ref moves");
-    let _ = store.blobs().put(b"kept-by-history\n").unwrap();
+    let unnamed = store.blobs().put(b"unnamed\n").unwrap();
 
     // Step 0, the alert's trigger: the disk fills and refuses.
     let (error, _landed) = fill_with_blobs(&store, 64 * 1024);
@@ -359,9 +359,16 @@ fn a_disk_full_runbook_gcs_then_writes_resume() {
         "the real run removed the unnamed blobs, not {files}: {real}"
     );
 
-    // The gc freed the unnamed blobs: the named one still reads, and a
-    // write lands again with no restart.
+    // The gc freed the space the unnamed blobs held: the named one
+    // still reads, the unnamed one is gone, and a write lands again
+    // with no restart and no grow.
     assert_eq!(store.blobs().get(named).unwrap(), b"named\n");
+    assert!(
+        store.blobs().get(unnamed).is_err(),
+        "gc removed the blob nothing names"
+    );
+    let freed = store.blobs().put(b"freed\n").unwrap();
+    assert_eq!(store.blobs().get(freed).unwrap(), b"freed\n");
 
     // Step 2 of the runbook: fsck, and it is clean.
     let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();

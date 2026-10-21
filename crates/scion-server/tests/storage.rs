@@ -55,20 +55,15 @@ fn a_put_the_disk_refuses_answers_out_of_space_and_leaves_no_torn_file() {
     // The next file write is the one the disk refuses.
     store.blobs().fail_writes_after(0);
     let error = store.blobs().put(b"refused\n").unwrap_err();
-    // The kind first, then the reply: the reply assert consumes the error.
+    // The kind first, then the reply: the reply conversion consumes the
+    // error, and it is the store's own error that converts.
     assert!(is_out_of_space(&error), "{error:?}");
-    let reply = tonic::Status::from(match &error {
-        Error::Io(io) => Error::Io(std::io::Error::from_raw_os_error(
-            io.raw_os_error().unwrap(),
-        )),
-        _ => unreachable!(),
-    });
+    let reply = tonic::Status::from(error);
     assert_eq!(reply.code(), tonic::Code::ResourceExhausted);
     assert_eq!(
         reply.message(),
         "the server is out of disk space; retry later"
     );
-    drop(error);
     // No torn file: the refused blob's name never appeared, and no temp
     // file of the failed write is left behind.
     let id = scion_core::BlobId::of(b"refused\n");
@@ -241,14 +236,10 @@ fn a_read_on_a_failing_disk_answers_internal_and_keeps_serving_the_rest() {
     let io_failure = matches!(&error, Error::Io(io) if io.raw_os_error() == Some(5));
     assert!(io_failure, "{error:?}");
     // EIO is a failing device, not a busy one: the reply is an internal
-    // error, not an invitation to retry.
-    let reply = tonic::Status::from(match &error {
-        Error::Io(_io) => Error::Io(std::io::Error::from_raw_os_error(5)),
-        _ => unreachable!(),
-    });
+    // error, not an invitation to retry. The store's own error converts.
+    let reply = tonic::Status::from(error);
     assert_eq!(reply.code(), tonic::Code::Internal);
     assert_eq!(reply.message(), "internal error");
-    drop(error);
     // The hook is spent: the rest of the store keeps serving.
     assert_eq!(store.blobs().get(two).unwrap(), b"two\n");
     // And the failed read works once the disk recovers.
@@ -383,16 +374,21 @@ fn a_failing_disk_runbook_fscks_restores_and_serves() {
     copy_tree(&dir.path().join("objects"), &backup.join("objects"));
 
     // The disk fails: a read of the healthy blob answers EIO, and the
-    // client's reply is an internal error, not a retry invitation.
+    // client's reply is an internal error, not a retry invitation. The
+    // store's own error converts - no rebuilt stand-in.
     store.blobs().fail_reads_after(0);
     let error = store.blobs().get(healthy).unwrap_err();
     let io_failure = matches!(&error, Error::Io(io) if io.raw_os_error() == Some(5));
     assert!(io_failure, "{error:?}");
-    let reply = tonic::Status::from(match &error {
-        Error::Io(_io) => Error::Io(std::io::Error::from_raw_os_error(5)),
-        _ => unreachable!(),
-    });
+    let reply = tonic::Status::from(error);
     assert_eq!(reply.code(), tonic::Code::Internal);
+
+    // While the blob reads fail, the rest of the store keeps serving:
+    // the ref still answers from the metadata.
+    let head = store
+        .read(|c| c.get_ref(repo, "main").map(|r| r.map(|r| r.target)))
+        .expect("the ref still answers while the blob reads fail");
+    assert_eq!(head, Some(cs), "the ref names the changeset it named");
 
     // The damage the runbook's fsck must find: the disk wrote wrong
     // bytes to the named blob's file behind the store's back.
