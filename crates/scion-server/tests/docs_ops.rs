@@ -318,28 +318,12 @@ fn every_proof_runs_the_guides_command_or_says_why() {
 /// to a Proof-line marker - the list must match the guide exactly, so
 /// a stale row fails the check. This list, mirrored in the PR body,
 /// is today's honest state: no proof is exempt silently.
-const NOT_YET_DRIVING: &[(&str, &str)] = &[
-    (
-        "A failed migration",
-        "a_newer_schema_refuses_the_open_and_a_restore_serves",
-    ),
-    (
-        "A failed migration",
-        "a_kill_during_a_schema_upgrade_leaves_the_old_schema_or_the_new_one",
-    ),
-    (
-        "5. Routines",
-        "a_real_run_writes_the_report_as_textfile_metrics",
-    ),
-    (
-        "5. Routines",
-        "a_failing_disk_runbook_fscks_restores_and_serves",
-    ),
-    (
-        "Stalled replies high",
-        "a_stalled_log_reply_is_counted_and_closes_the_connection",
-    ),
-];
+/// The proofs whose tests still run the guide's commands their own
+/// way, not through the shared `runbook_block` helper. Every proof
+/// runs its section's command block or carries its marker now, so the
+/// list is empty: a new proof must drive the block or say why it
+/// cannot, and a stale row or a silent exemption fails the check.
+const NOT_YET_DRIVING: &[(&str, &str)] = &[];
 
 /// The alerts' responses point at the operations guide, and every
 /// pointer resolves: a `docs/operations.md#anchor` names a heading of

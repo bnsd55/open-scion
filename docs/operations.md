@@ -709,7 +709,7 @@ is the rule that names the case:
 After the fix, the server starts and serves; `fsck` says the store is
 whole.
 
-Proof: crates/scion-server/tests/crash.rs::a_newer_schema_refuses_the_open_and_a_restore_serves
+Proof: crates/scion-server/tests/crash.rs::a_newer_schema_refuses_the_open_and_a_restore_serves (behaviour, no command: the section states the two failure rules in prose; the proof is the refusal and the restore those rules name)
 
 
 An import reads git revision `--rev` (default `HEAD`) into scion repo
@@ -731,7 +731,7 @@ backfills a whole history in steps when you want it done before the first
 query (it opens the directory as the server, so with the server stopped, and
 it is safe to repeat).
 
-Proof: crates/scion-server/tests/crash.rs::a_kill_during_a_schema_upgrade_leaves_the_old_schema_or_the_new_one
+Proof: crates/scion-server/tests/crash.rs::a_kill_during_a_schema_upgrade_leaves_the_old_schema_or_the_new_one (behaviour, no command: the section's upgrade steps are prose; the proof is the kill's own timing inside the migration)
 
 ### Rollback
 
@@ -763,7 +763,7 @@ The routines are these:
   into a fresh directory, and fsck clean on the restored copy before
   the server starts.
 
-  Proof: crates/scion-server/tests/storage.rs::a_failing_disk_runbook_fscks_restores_and_serves
+  Proof: crates/scion-server/tests/storage.rs::a_failing_disk_runbook_fscks_restores_and_serves (behaviour, no command: the section's only command block is the collector's; the fsck-restore proof holds the stop-and-restore behaviour the guide states in prose)
 - `tmp/` needs no attention: every open removes the staging folders of dead
   processes, and a lone open also removes files a build older than the
   schema left there.
@@ -1112,7 +1112,7 @@ Tell the causes apart:
 Escalate when the close notice repeats for one peer and the client is
 not yours to fix: the client's owner stops the waste, not the server.
 
-Proof: crates/scion-server/tests/log_stream.rs::a_stalled_log_reply_is_counted_and_closes_the_connection
+Proof: crates/scion-server/tests/log_stream.rs::a_stalled_log_reply_is_counted_and_closes_the_connection (behaviour, no command: the section's commands read a live server's metrics; the test holds the stall, the count, and the close on a paused clock, where a shell client would deadlock)
 
 ### Tier miss rate
 

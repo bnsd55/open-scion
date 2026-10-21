@@ -35,9 +35,12 @@ pub fn runbook_block(heading: &str, subs: &[(&str, &str)]) -> String {
 pub fn runbook_block_with(heading: &str, needle: &str, subs: &[(&str, &str)]) -> String {
     let doc = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/operations.md");
     let text = std::fs::read_to_string(&doc).expect("docs/operations.md opens");
-    let mut lines = text
-        .lines()
-        .skip_while(|line| line.trim() != format!("### {heading}").trim());
+    // The heading may be a section (###) or a numbered part (##).
+    let wants = |line: &str| {
+        let s = line.trim();
+        s == format!("### {heading}") || s == format!("## {heading}")
+    };
+    let mut lines = text.lines().skip_while(|line| !wants(line));
     lines.next();
     let mut block: Vec<&str> = Vec::new();
     let mut chosen = false;
