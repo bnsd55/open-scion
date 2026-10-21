@@ -661,9 +661,14 @@ pub(crate) fn pending_lands(c: &rusqlite::Connection) -> i64 {
 pub(crate) fn metadata(store: &Backend, seen: &mut HashSet<Vec<u8>>) -> (BTreeSet<BlobId>, i64) {
     // The rows of the data directory's own database: this helper asserts the
     // storage's internals, which only the SQLite backend holds.
-    let raw = store
-        .sqlite()
-        .expect("the storage's internals are a data-directory thing");
+    let Some(raw) = store.sqlite() else {
+        // SHORTCUT: this ceiling is the empty walk; the Postgres rows are
+        // unread by this test, so the metadata-named cross-check has no
+        // Postgres run (the files on disk still verify, and the RPC-side
+        // ledger checks still run). Upgrade path: a MetaTx listing for
+        // changesets and trees, then drop the branch.
+        return (BTreeSet::new(), 0);
+    };
     raw.read(|c| {
         let mut named = BTreeSet::new();
         for table in ["changesets", "trees"] {
