@@ -100,6 +100,31 @@ Proof: crates/scion-server/tests/backend_refusals.rs::a_lost_server_lock_fences_
 Proof: crates/scion-server/tests/backend_refusals.rs::an_unreachable_database_is_not_a_takeover
 Proof: crates/scion-server/tests/crash.rs::every_reply_survives_a_kill_of_the_server
 
+#### Stopping it for real: a unit file
+
+An operator does not run the server in a shell; it runs under a
+supervisor. The minimal systemd unit — the token through the file
+(§1), the restart on a crash, and the drain on a stop — is:
+
+```ini
+# /etc/systemd/system/scion.service
+[Service]
+ExecStart=/usr/local/bin/scion-server --data /srv/scion serve \
+  --token-file /etc/scion/token \
+  --ticket-key /srv/scion-keys/ticket.key
+Restart=on-failure
+User=scion
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`systemctl stop scion` sends SIGTERM, and the drain of the last
+section is what happens next. Never kill by pattern: on a machine that
+runs more than one service, `pkill -f scion-server` kills every
+project's server, not yours. Stop by unit, or by the exact PID of the
+process you started.
+
 ### Server and a regional cache
 
 A cache serves object reads to a region and refuses every other call
@@ -376,12 +401,14 @@ Rotation, step by step:
 3. Restart the server with both keys: `--ticket-key NEW.key
    --ticket-key-old OLD-PUBLIC`. The old argument is a file holding the
    **public** key of the previous key (the hex that the old run printed),
-   not its seed. A public key is not a secret: anyone may read the file,
-   but group and others must not be able to WRITE it (a changed key breaks
-   every tier that verifies against the old one), it must not be a
-   symlink, and the directories above it must be private to its owner or
-   root. `chmod go-w OLD-PUBLIC` fixes a copy tool's 0666. Tickets of
-   either key verify while both are given.
+   not its seed — and the file holds the bare hex and nothing else: 64
+   hex characters, no `name=` prefix, no trailing line. A public key is
+   not a secret: anyone may read the file, but group and others must not
+   be able to WRITE it (a changed key breaks every tier that verifies
+   against the old one), it must not be a symlink, and the directories
+   above it must be private to its owner or root. `chmod go-w
+   OLD-PUBLIC` fixes a copy tool's 0666. Tickets of either key verify
+   while both are given.
 4. When no client can hold a ticket of the old key any more (tickets live 15
    minutes), restart the server without `--ticket-key-old` and the caches
    with only the new public key.
@@ -780,7 +807,9 @@ the process, scraped from there. The names:
 token: the server's health covers the services `scion.v1.Scion` and
 `scion.v1.Objects`, a tier's covers `scion.v1.Objects`. The server
 serves no gRPC reflection, so a probe tool must know the health protocol
-itself (`grpc_health_probe` does).
+itself (`grpc_health_probe` does). Get it from that project's GitHub
+releases (a single static binary per platform — no other install), or
+use Kubernetes probes, which speak the same protocol natively.
 
 Probe the service's name for readiness and the empty name for liveness.
 Readiness is `NOT_SERVING` from the start of a drain to the exit, so a load
