@@ -126,7 +126,7 @@ that breaks one is caught.
   each digest maps to one principal with its rules.
   `scion-proto/src/runtime/auth/mod.rs::each_token_gets_its_own_principal`. The
   compare is constant
-  time (`scion-proto/src/runtime/auth/mod.rs::constant_time_eq`); no test yet - a timing test is
+  time (`constant_time_eq`); no test yet - a timing test is
   not reliable, so the code is the proof.
 - **A repo outside a principal's rules does not exist.** Every RPC
   answers `NOT_FOUND` for it, as for a repo that is not there.
@@ -176,7 +176,7 @@ that breaks one is caught.
   `scion-proto/src/runtime/auth/mod.rs::a_group_readable_secret_is_refused_and_a_group_writable_shared_file_is_refused`,
   `scion-proto/src/runtime/auth/mod.rs::a_secret_reads_through_the_descriptor_and_a_link_dies_at_the_open`,
   `scion-proto/src/runtime/auth/mod.rs::a_directory_that_others_can_write_is_refused_unless_sticky`,
-  `scion-server/src/main.rs::key_file_tests:a_key_owned_by_another_user_is_refused`,
+  `scion-server/src/main.rs::a_symlinked_key_is_refused_with_a_perfect_target`,
   `scion-proto/src/runtime/tls.rs::a_symlinked_certificate_is_refused_with_a_perfect_target`
 - **A data directory opens only as one server, for one build.** The
   locks fence a second server and a build mismatch;
@@ -203,7 +203,7 @@ that breaks one is caught.
   snapshot file.** On a case-insensitive disk, `main` and `MAIN` would
   fold one onto the other: the second repo's snapshot write replaced
   the first's, and a seed of the first read the second's file;
-  `scion-tier/src/snapshot.rs::file_name` escapes
+  `file_name` escapes
   every capital (and every byte outside the plain name set) as `%XX`,
   so the file name keeps lowercase only, and the property test holds
   it for any repo name
@@ -251,8 +251,8 @@ that breaks one is caught.
   the bytes are read bounded at a fixed cap, so a file that lies about
   its size, or grows between the fstat and the read, is refused
   deterministically. (#433)
-  `scion-proto/src/runtime/auth/mod.rs::open_checked_file`,
-  `scion-proto/src/runtime/auth/mod.rs::read_bounded` over
+  `open_checked_file`,
+  `read_bounded` over
   `MAX_CHECKED_FILE`; the tests
   `scion-proto/src/runtime/auth/mod.rs::a_file_that_is_not_a_file_is_refused`,
   `scion-proto/src/runtime/auth/mod.rs::a_reader_that_yields_one_byte_past_the_cap_is_refused`
@@ -260,11 +260,11 @@ that breaks one is caught.
   or land half.** `verify` refuses a manifest that names one repo
   twice, and refuses two names that fold to one directory on a
   case-insensitive disk — the disk's own (device, inode) is the judge,
-  not a fold table (`scion-server/src/archive.rs::check_section_dir`); colliding land
+  not a fold table (`check_section_dir`); colliding land
   keys are named or tolerated, never half-restored; and a replay that
   dies halfway leaves the target empty, because `restore` fills a
   staging directory and publishes by one rename
-  (`scion-server/src/archive.rs::restore_impl`). (#438) The tests:
+  (`restore_impl`). (#438) The tests:
   `scion-server/tests/archive.rs::an_archive_naming_two_repos_that_fold_to_one_is_refused`,
   `scion-server/tests/archive_attacks.rs::a_manifest_naming_one_repo_twice_is_refused_before_any_write`,
   `scion-server/tests/archive_attacks.rs::two_pending_lands_sharing_a_request_key_are_named_or_tolerated`,
@@ -276,7 +276,7 @@ that breaks one is caught.
   routes — so one machine opening a thousand connections from a
   thousand ports cannot fill the peer cap for free and bury a real
   stranger in the shared bucket. (#414)
-  `scion-server/src/audit.rs::meter_key`, and the test
+  `meter_key`, and the test
   `scion-server/src/audit.rs::one_address_rotating_ports_does_not_bury_a_stranger`
 - **A restore verifies first, and goes only into an empty store.** It
   runs the same `verify` a reader runs and refuses on any damage, and it
