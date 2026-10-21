@@ -337,22 +337,42 @@ pub(crate) struct Ledger {
 }
 
 /// Repo `r` with one root changeset, and refs `main` and `dev` at it. No RPC
+/// The root's directory is wide: a land's tree and history nodes hold
+/// the whole level of every directory on the changed path, and the root
+/// is on every path, so about 64 bytes per entry of metadata ride each
+/// land (measured by the `land_cost` test). Wide enough that a land stays
+/// pending between two looks at the database - the moment a kill must
+/// meet (the flake of #478: a fast runner's lands passed through
+/// pending before the first poll).
+const WIDE_ENTRIES: usize = 1500;
+
 pub(crate) fn create_repo(data: &Path) {
     let store = Store::open(data).unwrap();
     let readme = store.blobs().put(b"crash suite\n").unwrap();
+    let mut files = vec![(
+        RepoPath::new("README").unwrap(),
+        Some(FileState::Regular {
+            content: readme,
+            executable: false,
+        }),
+    )];
+    for i in 0..WIDE_ENTRIES {
+        let bytes = format!("wide {i}\n").into_bytes();
+        let blob = store.blobs().put(&bytes).unwrap();
+        files.push((
+            RepoPath::new(format!("w{i:06}").into_bytes()).unwrap(),
+            Some(FileState::Regular {
+                content: blob,
+                executable: false,
+            }),
+        ));
+    }
     let root = Changeset::new(
         vec![],
         author(),
         None,
         b"root\n".to_vec(),
-        [(
-            RepoPath::new("README").unwrap(),
-            Some(FileState::Regular {
-                content: readme,
-                executable: false,
-            }),
-        )]
-        .into(),
+        files.into_iter().collect(),
     )
     .expect("changeset fits the format");
     store
@@ -370,6 +390,24 @@ pub(crate) fn create_repo(data: &Path) {
             Ok(())
         })
         .unwrap();
+}
+
+/// A bounded [`wait_until`]: gives the condition its time, reports
+/// whether it ever held, and never panics. The kill suites use it where
+/// a moment they want is likely but not certain, and count the kills
+/// that met it.
+pub(crate) async fn wait_until_bounded(what: &str, secs: u64, ready: impl Fn() -> bool) -> bool {
+    let give_up = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if ready() {
+            return true;
+        }
+        if Instant::now() >= give_up {
+            eprintln!("the waited-for condition did not hold within {secs} s: {what}");
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 }
 
 pub(crate) async fn put_blob(scion: &mut Scion, data: &[u8]) -> Result<BlobId, Status> {

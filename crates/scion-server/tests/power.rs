@@ -270,6 +270,7 @@ async fn every_reply_survives_a_power_cut() {
     let seed = seed();
     let mut rng = Rng::new(seed);
     let rounds = usize::try_from(env("SCION_POWER_ROUNDS", 4)).unwrap();
+    let mut pending_kills = 0usize;
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("server.log");
     let mut cut_lands = 0;
@@ -319,13 +320,20 @@ async fn every_reply_survives_a_power_cut() {
             }
             _ => {
                 let db = rusqlite::Connection::open(data.join("scion.db")).unwrap();
-                wait_until("a land is pending in the database", || {
+                wait_until_bounded("a land is pending in the database", 5, || {
                     pending_lands(&db) > 0
                 })
                 .await;
             }
         }
-        eprintln!("round {round}: clients spawning");
+        let pending_at_kill = {
+            let db = rusqlite::Connection::open(data.join("scion.db")).unwrap();
+            pending_lands(&db) > 0
+        };
+        if pending_at_kill {
+            pending_kills += 1;
+        }
+        eprintln!("round {round}: clients spawning (pending at kill: {pending_at_kill})");
         signals.killed.store(true, Ordering::SeqCst);
         // The freeze: no reply can follow it, so no reply can follow the
         // cut either ([#185]).
@@ -357,6 +365,12 @@ async fn every_reply_survives_a_power_cut() {
     }
     println!("{rounds} cuts; {total} lands, {cut_lands} of them cut mid-call");
     assert!(total > 0, "the clients did little work");
+    assert!(
+        pending_kills > 0,
+        "no cut met a land pending in the database: {pending_kills} of {rounds} cuts; \
+         the wide lands must keep pending common"
+    );
+    println!("{pending_kills} of {rounds} cuts met a land pending in the database");
 }
 
 /// The audit proves sync-before-reply on its own: a write whose reply

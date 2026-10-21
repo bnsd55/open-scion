@@ -683,14 +683,6 @@ fn cut(
     Notebook { recs }
 }
 
-/// The lands the database holds, of every state: a land's row is
-/// written once and never changes or leaves inside a test, so a count
-/// above zero is a condition that cannot pass between two looks.
-fn recorded_lands(c: &rusqlite::Connection) -> i64 {
-    c.query_row("SELECT count(*) FROM lands", [], |row| row.get(0))
-        .unwrap()
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn the_model_holds_across_lands_retries_and_restarts() {
     let rounds = usize::try_from(env("SCION_LANDMODEL_ROUNDS", ROUNDS)).unwrap();
@@ -708,6 +700,7 @@ async fn the_model_holds_across_lands_retries_and_restarts() {
 
     let mut model = Model::default();
     let mut rng = Rng::new(seed);
+    let mut pending_kills = 0usize;
     for round in 0..rounds {
         let server = Server::start(&data, &log);
         let signals = Arc::new(Signals::default());
@@ -722,20 +715,24 @@ async fn the_model_holds_across_lands_retries_and_restarts() {
             })
             .collect();
         // Let the principals get to work, then kill the server under
-        // them: two rounds in three, while their lands are live. The
-        // wait is for a land RECORDED in the database - any state, since
-        // a row never changes and never goes away - because the old wait
-        // watched for `pending`, a state a land holds only between its
-        // record and its settle: on a fast runner the principals finish
-        // their lands before the first poll, the moment passes unseen,
-        // and the wait names a hold that never happened (#478's flake).
+        // them: two rounds in three, at a moment a land is pending, so a
+        // crash meets a pending row. The wide lands keep a land pending
+        // long enough to see; the wait is bounded and counted, not
+        // fatal - the test asserts at its end that at least one kill met
+        // a pending row, so the moment the model exists to test is
+        // measured, not assumed (the flake of #478: a fast runner's
+        // lands finished before the first poll, and the old fatal wait
+        // named a hold that never happened).
         tokio::time::sleep(Duration::from_millis(150)).await;
         if round % 3 != 0 {
             let conn = rusqlite::Connection::open(data.join("scion.db")).unwrap();
-            wait_until("a land is recorded in the database", || {
-                recorded_lands(&conn) > 0
+            if wait_until_bounded("a land is pending in the database", 5, || {
+                pending_lands(&conn) > 0
             })
-            .await;
+            .await
+            {
+                pending_kills += 1;
+            }
         }
         tokio::time::sleep(Duration::from_millis(u64::try_from(rng.below(60)).unwrap())).await;
         signals.killed.store(true, Ordering::SeqCst);
@@ -778,4 +775,10 @@ async fn the_model_holds_across_lands_retries_and_restarts() {
         "{} lands checked over {rounds} rounds; the model holds",
         model.recs.len()
     );
+    assert!(
+        pending_kills > 0,
+        "no kill met a land pending in the database: {pending_kills} of {rounds} rounds; \
+         the wide lands must keep pending common"
+    );
+    println!("{pending_kills} of {rounds} kill rounds met a land pending in the database");
 }

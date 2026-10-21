@@ -61,6 +61,7 @@ async fn every_reply_survives_a_kill_of_the_server() {
     let mut ledger = Ledger::default();
     let mut checked = Checked::default();
     let (mut left, mut cut) = (0, 0);
+    let mut pending_kills = 0usize;
     for round in 0..kills {
         let server = Server::start(&data, &log);
         check(&server.url, &data, &mut ledger, &mut checked, &mut rng).await;
@@ -89,13 +90,22 @@ async fn every_reply_survives_a_kill_of_the_server() {
             }
             _ => {
                 let db = rusqlite::Connection::open(data.join("scion.db")).unwrap();
-                wait_until("a land is pending in the database", || {
+                wait_until_bounded("a land is pending in the database", 5, || {
                     pending_lands(&db) > 0
                 })
                 .await;
             }
         }
         signals.killed.store(true, Ordering::SeqCst);
+        {
+            // Whatever arm chose the moment, the kill may still meet a
+            // land the clients have in flight: count it, the test's
+            // whole point is that a crash meets a pending row.
+            let db = rusqlite::Connection::open(data.join("scion.db")).unwrap();
+            if pending_lands(&db) > 0 {
+                pending_kills += 1;
+            }
+        }
         drop(server);
         for client in clients {
             let mut got = client.await.unwrap();
@@ -117,6 +127,12 @@ async fn every_reply_survives_a_kill_of_the_server() {
         checked.files.len(),
     );
     assert!(ledger.lands.len() > kills, "the clients did little work");
+    assert!(
+        pending_kills > 0,
+        "no kill met a land pending in the database: {pending_kills} of {kills} kills; \
+         the wide lands must keep pending common"
+    );
+    println!("{pending_kills} of {kills} kills met a land pending in the database");
 }
 
 /// Derived rows in the schema-upgrade test, so that the upgrade of version 2
