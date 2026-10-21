@@ -636,29 +636,37 @@ fn fill_all(client: &mut postgres::Client, dry: bool) -> usize {
     landed
 }
 
-/// Lands wide changesets until the wall stops one (the wet run), or
-/// until `stop` have landed (the dry run). The count rides in `landed`
-/// so the caller's phase prints can say how far it got.
-fn land_until(
-    store: &Backend,
-    from: usize,
-    blob: scion_core::BlobId,
-    dry: bool,
-) -> Result<(), Error> {
+/// Lands wide changesets until the wall stops one (the wet run: the
+/// error and the stopped changeset's bytes come back for the retry),
+/// or until 40 have landed (the dry run: the last land's id). The
+/// count rides in `from` so the land names stay distinct.
+/// How the lands ended: the last land's id, and the wall - the error
+/// and the stopped changeset's bytes, for the retry - when one stopped
+/// them.
+type LandStop = (
+    Option<scion_core::ChangesetId>,
+    Result<(), (Error, Vec<u8>)>,
+);
+
+fn land_until(store: &Backend, from: usize, blob: scion_core::BlobId, dry: bool) -> LandStop {
     let mut landed = from;
+    let mut last = None;
     loop {
         // A backstop: lands that never stop mean the fill was not full,
         // which is this test's own failure, not the server's.
         assert!(landed < 5000, "the lands never hit the database's limit");
         if dry && landed == 40 {
-            return Ok(());
+            return (last, Ok(()));
         }
         landed += 1;
         let cs = wide_changeset(store, &format!("fill{landed}"), landed % 2 == 1, blob);
         // The helper stores the changeset and its tree; the ref move is
         // the land's own act, so main advances here and the next land's
         // base tree holds the last land's files.
-        let id = write::create_changeset(store, REPO, &cs.encode())?;
+        let id = match write::create_changeset(store, REPO, &cs.encode()) {
+            Ok(id) => id,
+            Err(e) => return (last, Err((e, cs.encode()))),
+        };
         let head = store
             .read(|c| {
                 let repo = c.repo_id(REPO)?;
@@ -673,6 +681,7 @@ fn land_until(
                 Ok(())
             })
             .expect("main advances");
+        last = Some(id);
     }
 }
 
@@ -739,28 +748,10 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
     // same open the lands below use: a second open of one schema cannot
     // run beside the first (the per-schema one-server lock), and a bare
     // repo has no main for the lands' parent read.
-    // The blob the re-creations share: stored first, then named a
-    // member of the repo, so the lands' checks accept it.
-    let blob = store.blobs().put(&incompressible(64)).unwrap();
-    store
-        .write(|c| {
-            let repo = c.create_repo(REPO)?;
-            let root = Changeset::new(
-                vec![],
-                author(),
-                None,
-                b"root\n".to_vec(),
-                std::collections::BTreeMap::new(),
-            )
-            .expect("the root fits the format");
-            let (id, _) = tree::store_changeset(c, repo, &root, &mut tree::lens_of(&store))?;
-            assert!(c.cas_ref(repo, "main", None, id)?);
-            c.add_repo_blobs(repo, &[blob])?;
-            Ok(())
-        })
-        .expect("the repo and its main land");
-    let outcome = land_until(&store, landed, blob, dry);
-    let Err(outcome) = outcome else {
+    let blob = repo_with_main(&store);
+    let (last_land, stopped) = land_until(&store, landed, blob, dry);
+    let last_land = last_land.expect("the lands landed at least one");
+    if let Ok(()) = stopped {
         // The dry arm: the plumbing ran; the row's read, drop, and the
         // land after, close it out.
         println!("dry: the lands landed with no wall in the way");
@@ -774,6 +765,9 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
             .write(|c| c.create_repo("after"))
             .expect("the same write lands");
         return;
+    }
+    let Err((outcome, failed)) = stopped else {
+        unreachable!("the dry arm returned above");
     };
     // The wet run's break carries the error; a land that never fails is
     // the backstop's own panic above.
@@ -797,14 +791,63 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
         .get(0);
     assert!(read > 0, "the filler's rows vanished");
 
-    // The space comes back, and the same write lands with no restart.
+    // Reads work through the store while the disk is full: main names
+    // the last land, and that land's blob reads back whole.
+    assert_eq!(main_target(&store), last_land, "main names the last land");
+    let readback = store.blobs().get(blob).expect("the blob reads");
+    assert_eq!(readback, incompressible(64), "the blob reads back whole");
+
+    // The space comes back, and the exact write the wall stopped - the
+    // same encoded bytes - lands now, and main moves to it.
     client
         .batch_execute("DROP SCHEMA diskfull_filler CASCADE")
         .expect("the filler drops");
     client
         .batch_execute("CHECKPOINT")
         .expect("the checkpoint runs");
+    let retried = write::create_changeset(&store, REPO, &failed)
+        .expect("the stopped write lands once the database has room");
+    assert_eq!(
+        main_target(&store),
+        retried,
+        "main moves to the retried write"
+    );
+}
+
+/// The repo the lands land into: the root changeset, the ref main,
+/// and one stored blob the re-creations share - all through the same
+/// open the lands use (a second open of one schema cannot run beside
+/// the first: the per-schema one-server lock).
+fn repo_with_main(store: &Backend) -> scion_core::BlobId {
+    // The blob the re-creations share: stored first, then named a
+    // member of the repo, so the lands' checks accept it.
+    let blob = store.blobs().put(&incompressible(64)).unwrap();
     store
-        .write(|c| c.create_repo("after"))
-        .expect("the same write lands");
+        .write(|c| {
+            let repo = c.create_repo(REPO)?;
+            let root = Changeset::new(
+                vec![],
+                author(),
+                None,
+                b"root\n".to_vec(),
+                std::collections::BTreeMap::new(),
+            )
+            .expect("the root fits the format");
+            let (id, _) = tree::store_changeset(c, repo, &root, &mut tree::lens_of(store))?;
+            assert!(c.cas_ref(repo, "main", None, id)?);
+            c.add_repo_blobs(repo, &[blob])?;
+            Ok(())
+        })
+        .expect("the repo and its main land");
+    blob
+}
+
+/// The ref main's target, read through the store.
+fn main_target(store: &Backend) -> scion_core::ChangesetId {
+    store
+        .read(|c| {
+            let repo = c.repo_id(REPO)?;
+            Ok(c.get_ref(repo, "main")?.expect("main exists").target)
+        })
+        .expect("main reads")
 }
