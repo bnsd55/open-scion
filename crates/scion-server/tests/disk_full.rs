@@ -403,3 +403,171 @@ fn a_disk_full_runbook_gcs_then_writes_resume() {
     let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
     assert!(report.is_clean(), "{:?}", report.problems);
 }
+
+/// A raw connection of the database, for the fill and the checks.
+fn raw(url: &str) -> postgres::Client {
+    postgres::Client::connect(url, postgres::NoTls).expect("the test database is up")
+}
+
+/// The SQLSTATE a store error carries, when it does.
+fn sqlstate(e: &Error) -> Option<String> {
+    use std::error::Error as _;
+    match e {
+        Error::Storage(storage) => {
+            let inner = storage.source()?;
+            let down = inner.downcast_ref::<postgres::Error>()?;
+            down.code().map(|state| state.code().to_owned())
+        }
+        _ => None,
+    }
+}
+
+/// The database's data directory, as the database names it.
+fn data_dir(client: &mut postgres::Client) -> String {
+    client
+        .query_one("SHOW data_directory", &[])
+        .expect("the data directory answers")
+        .get::<_, String>(0)
+}
+
+/// Fills the database with `chunk`-sized rows from its own connection
+/// until its on-disk size passes `ceiling` bytes, and returns the raw
+/// error of the insert that hit the full disk, when one did - the fill
+/// itself can be the write that fails first.
+fn fill(client: &mut postgres::Client, chunk_len: usize, ceiling: u64) -> Option<postgres::Error> {
+    client
+        .batch_execute("CREATE SCHEMA IF NOT EXISTS pg_diskfull_filler")
+        .expect("the filler schema is created");
+    client
+        .batch_execute("CREATE TABLE IF NOT EXISTS pg_diskfull_filler.filler (chunk bytea)")
+        .expect("the filler table is created");
+    let chunk = vec![b'f'; chunk_len];
+    loop {
+        let size: i64 = client
+            .query_one("SELECT pg_database_size(current_database())", &[])
+            .expect("the database size answers")
+            .get(0);
+        if size.cast_unsigned() >= ceiling {
+            return None;
+        }
+        match client.execute(
+            "INSERT INTO pg_diskfull_filler.filler VALUES ($1)",
+            &[&chunk],
+        ) {
+            Ok(_) => {
+                // A checkpoint keeps the WAL small, so the tmpfs's space
+                // goes to the filler's heap pages and the margin holds.
+                client
+                    .batch_execute("CHECKPOINT")
+                    .expect("the checkpoint runs");
+            }
+            Err(e) => return Some(e),
+        }
+    }
+}
+
+#[test]
+fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
+    if !required() {
+        return;
+    }
+    if !Backend::test_is_postgres() {
+        println!("skipping: the database's own disk full is a Postgres row");
+        return;
+    }
+    // The fill only proves the row where the database's data directory
+    // sits on a small tmpfs: the workflow's own job mounts it and says
+    // so here. SHORTCUT: the env var is the tmpfs's only witness - a
+    // local run against a big disk would fill for hours before 53100.
+    let Ok(mib) = std::env::var("SCION_PG_TMPFS_MB") else {
+        println!("skipping: set SCION_PG_TMPFS_MB to the service's tmpfs size");
+        return;
+    };
+    let Ok(mib) = mib.parse::<u64>() else {
+        panic!("SCION_PG_TMPFS_MB must be a number of MiB");
+    };
+    let url = std::env::var("SCION_TEST_POSTGRES_URL").expect("SCION_TEST_POSTGRES_URL");
+    let mut client = raw(&url);
+    let dir = data_dir(&mut client);
+    if !std::path::Path::new(&dir).exists() {
+        // A service container's path: the job cannot see it, and the
+        // env var is the witness instead.
+        println!("the data directory {dir} is the service's own; the env var vouches for it");
+    }
+    // The margin keeps the proving write's own extend inside a full
+    // disk: a WAL segment and slack, so a WAL write can also be the one
+    // that hits ENOSPC - the panic arm the test names when it fires.
+    let margin = 32 * 1024 * 1024;
+    assert!(
+        mib * 1024 * 1024 > margin * 2,
+        "the tmpfs is too small to fill"
+    );
+    let ceiling = mib * 1024 * 1024 - margin;
+
+    // The fill: the database's own disk fills to the margin, either by
+    // the filler's inserts or by the insert that failed first.
+    let filled_by = fill(&mut client, 4 * 1024 * 1024, ceiling);
+    let mut arm = match &filled_by {
+        Some(e) if e.code() == Some(&postgres::error::SqlState::DISK_FULL) => {
+            "A (the filler's insert took the 53100)"
+        }
+        Some(e) => panic!("the fill failed with something else: {e:?}"),
+        None => "the margin (the proving write's extend)",
+    };
+
+    // The proving write: the same land a client's client would run,
+    // through the store's own write path.
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let store = Backend::open_test(&data).expect("the store opens");
+    let _repo = store
+        .read(|c| c.create_repo("filler"))
+        .expect("the repo lands");
+    let name = "the write that must fail";
+    let outcome = store.write(|c| c.create_repo(name));
+    match outcome {
+        Err(e) if sqlstate(&e).as_deref() == Some("53100") => {
+            // Arm A: the clean 53100, mapped to the disk-full storage
+            // class - the class the fixed ResourceExhausted reply rides
+            // on (the pg_error_of unit test pins the reply's text).
+            assert!(
+                is_out_of_space(&e),
+                "the full database's write must map to out of space: {e:?}"
+            );
+        }
+        Err(e) if sqlstate(&e).is_none() => {
+            // Arm B: the WAL write hit the disk and Postgres panicked -
+            // the connection died with it. The client must NOT see the
+            // fixed disk reply: the store answers busy or unavailable,
+            // a retry-able answer, while the service recovers.
+            arm = "B (the WAL write panicked and the connection died)";
+            assert!(
+                !is_out_of_space(&e),
+                "a lost connection must not wear the disk's reply: {e:?}"
+            );
+        }
+        Err(e) => panic!("the proving write failed another way: {e:?}"),
+        Ok(_) => panic!(
+            "the proving write landed on a database filled to its margin; the fill was not full"
+        ),
+    }
+    let _ = arm;
+
+    // Reads work on both arms: the rows the fill landed are still there.
+    let read: i64 = client
+        .query_one("SELECT count(*) FROM pg_diskfull_filler.filler", &[])
+        .expect("the filler reads")
+        .get(0);
+    assert!(read > 0, "the filler's rows vanished");
+
+    // The space comes back, and the same write lands with no restart.
+    client
+        .batch_execute("DROP SCHEMA pg_diskfull_filler CASCADE")
+        .expect("the filler drops");
+    client
+        .batch_execute("CHECKPOINT")
+        .expect("the checkpoint runs");
+    store
+        .write(|c| c.create_repo("after"))
+        .expect("the same write lands");
+}
