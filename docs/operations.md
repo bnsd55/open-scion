@@ -1183,7 +1183,12 @@ wire for two seconds, kills the server with SIGKILL mid-land, and then
 measures from the restart's command until readiness answers `SERVING`
 and the first read resolves a ref. It prints the seconds and fails past
 a 60 s bound. The kill is the runbook's crash: no flush, no drain -
-whatever the write-ahead log holds is what recovery starts from. The
+whatever the write-ahead log holds is what recovery starts from. On
+the fixed runner that recovery took 0.1 s (run 39623531102: readiness
+answered `SERVING` and the first read resolved within a tenth of a
+second of the restart's command, with 5 pending lands left by the
+kill; the store built in 0.7 s). One sample at one size; a second size
+is the next step when the number starts steering a decision. The
 current numbers live in the workflow's run log on `main`, and a run
 that drifts far from them is a regression to look at, not a promise to
 restate here.
