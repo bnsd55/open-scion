@@ -43,6 +43,11 @@ jobs:
         run: scripts/check-changelog.sh
       - name: the changelog merge script does what it says
         run: scripts/test-merge-changelog.sh
+      # The release pipeline's tag verdicts, fed canned tag objects: no
+      # CI run holds a signed release tag, so the decision is tested
+      # here instead of being trusted.
+      - name: the release tag verdicts hold (release-verify-tag)
+        run: scripts/test-release-verify-tag.sh
       # A workflow that cannot parse fails here, on the PR that carries
       # it, not main's next push-triggered run (#416, #419). The
       # actionlint release is pinned by version and sha256.
