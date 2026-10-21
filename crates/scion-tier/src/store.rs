@@ -1176,6 +1176,11 @@ pub struct DiskStore {
     /// Never read: the lock lasts while the file is open.
     #[allow(dead_code)]
     dir_lock: Option<fs::File>,
+    /// Set by a simulated crash: the drop that follows is the death of
+    /// the process, not a stop, so it must not commit or adopt. Never
+    /// set outside the tests.
+    #[cfg(test)]
+    crashed: bool,
 }
 
 impl DiskStore {
@@ -1264,6 +1269,8 @@ impl DiskStore {
             dropped: AtomicU64::default(),
             stray: AtomicBool::new(false),
             dir_lock: Some(lock_file),
+            #[cfg(test)]
+            crashed: false,
         };
         // Drops first: they free room.
         let mut disk = lock(&store.disk);
@@ -1491,11 +1498,36 @@ impl DiskStore {
 
     /// Simulates a crash of the process: no stop-time commit, no clean
     /// flag, and the lock released, as a killed process leaves them. What
-    /// the index does not have yet stays what it is.
+    /// the index does not have yet stays what it is. The death also
+    /// closes every connection the process held, so the store is taken
+    /// apart by hand: a plain forget leaks a live index that the reopened
+    /// store of the same test then writes beside.
     #[cfg(test)]
     fn crash(mut self) {
+        // A killed process leaves no stop-time commit and no clean flag,
+        // and its death closes every connection and releases every lock
+        // it held. So the walk is stopped without adopting, the lock is
+        // released, and the index is closed in place: a plain forget
+        // here left a live index that the reopened store of the same
+        // test then wrote beside. The guarded drop that follows is the
+        // death itself, and commits nothing.
+        if let Some(walk) = lock(&self.walk).clone() {
+            walk.stop.store(true, Ordering::Relaxed);
+            walk.room.notify_all();
+        }
+        *lock(&self.walk) = None;
         self.dir_lock.take();
-        std::mem::forget(self);
+        let disk = self.disk.get_mut().unwrap_or_else(PoisonError::into_inner);
+        // An in-memory connection takes the index's place, so the real
+        // one closes here, as the death of the process closes it. The
+        // stand-in closes with the store.
+        disk.conn = rusqlite::Connection::open_in_memory()
+            .expect("the stand-in connection opens");
+        disk.pending.clear();
+        disk.pending_bytes = 0;
+        disk.newest.clear();
+        self.crashed = true;
+        drop(self);
     }
 
     /// How the walk of this start is doing: the files it found, their
@@ -1518,6 +1550,13 @@ impl Drop for DiskStore {
     /// next start then trusts the rows, and walks only if the walk of this
     /// one did not finish.
     fn drop(&mut self) {
+        #[cfg(test)]
+        if self.crashed {
+            // The crash already stopped the walk and closed the index;
+            // this drop is the death of the process, and nothing of a
+            // death is committed.
+            return;
+        }
         let walk = lock(&self.walk).clone();
         if let Some(walk) = walk.as_ref() {
             walk.stop.store(true, Ordering::Relaxed);

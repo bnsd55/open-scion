@@ -2937,8 +2937,15 @@ mod tests {
             assert!(flock(&opening, FlockOperation::NonBlockingLockExclusive).unwrap());
             let path = dir.path().to_owned();
             let open = thread::spawn(move || Store::open_shared(&path).map(drop));
-            thread::sleep(Duration::from_millis(200));
-            assert!(!open.is_finished(), "an open waits for the one in progress");
+            // The open must not finish while the lock is held: a negative
+            // cannot be polled for once, so it is asserted across a
+            // window, every 20 ms. A slow start of the thread only
+            // strengthens the check, and a broken wait fails inside it.
+            let give_up = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < give_up {
+                assert!(!open.is_finished(), "an open waits for the one in progress");
+                thread::sleep(Duration::from_millis(20));
+            }
             drop(opening);
             open.join().unwrap().unwrap();
         });
@@ -3335,16 +3342,38 @@ mod tests {
         const CALLERS: usize = 8;
         let group = GroupFlush::default();
         let runs = AtomicUsize::new(0);
+        let ready = AtomicUsize::new(0);
+        let started = AtomicBool::new(false);
         let arrive = Barrier::new(CALLERS);
         let results: Vec<io::Result<()>> = thread::scope(|s| {
             let callers: Vec<_> = (0..CALLERS)
                 .map(|_| {
                     s.spawn(|| {
                         arrive.wait();
-                        // Slow, so the other callers arrive while it runs.
+                        // Every caller announces itself before the call,
+                        // so the flush that owns the group can hold it
+                        // open until every caller has had the chance to
+                        // share it. A fixed sleep here rested the sharing
+                        // on luck: under load, a caller that arrives late
+                        // runs its own flush, and the count goes wrong.
+                        ready.fetch_add(1, Ordering::SeqCst);
                         group.run(|| {
                             runs.fetch_add(1, Ordering::Relaxed);
-                            thread::sleep(Duration::from_millis(100));
+                            if started.swap(true, Ordering::SeqCst) {
+                                // A straggler that missed the group runs
+                                // its own flush; the count assert below
+                                // still holds.
+                                return Err(io::Error::other("the drive is gone"));
+                            }
+                            // Generous, so a loaded machine only slows
+                            // the test; the bound keeps a lost scheduler
+                            // slice from hanging it.
+                            let give_up = std::time::Instant::now() + Duration::from_secs(30);
+                            while ready.load(Ordering::SeqCst) < CALLERS
+                                && std::time::Instant::now() < give_up
+                            {
+                                thread::sleep(Duration::from_millis(5));
+                            }
                             Err(io::Error::other("the drive is gone"))
                         })
                     })
