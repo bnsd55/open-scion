@@ -234,7 +234,39 @@ that breaks one is caught.
   refuses a data directory that already holds a store
   (`scion-server/tests/archive.rs::a_verify_names_a_blob_whose_bytes_someone_corrupted`,
   `scion-server/tests/archive.rs::a_restore_refuses_a_data_directory_that_already_holds_a_store`).
-
+- **A secret path cannot hang or flood the checked read.** The open is
+  `O_NONBLOCK`, so a planted FIFO dies at the open instead of blocking
+  the server at startup; the kind check takes a regular file only; and
+  the bytes are read bounded at a fixed cap, so a file that lies about
+  its size, or grows between the fstat and the read, is refused
+  deterministically. (#433)
+  `scion-proto/src/runtime/auth/mod.rs::open_checked_file`,
+  `scion-proto/src/runtime/auth/mod.rs::read_bounded` over
+  `MAX_CHECKED_FILE`; the tests
+  `scion-proto/src/runtime/auth/mod.rs::a_file_that_is_not_a_file_is_refused`,
+  `scion-proto/src/runtime/auth/mod.rs::a_reader_that_yields_one_byte_past_the_cap_is_refused`
+- **An archive cannot fold two names onto one file, duplicate a repo,
+  or land half.** A manifest that names one repo twice is refused
+  before any write; two names that fold to one directory on a
+  case-insensitive disk are refused by the disk's own (device, inode),
+  not by a fold table; two pending lands sharing a request key are
+  named or tolerated, never half-restored; and a replay that dies
+  halfway leaves the target empty, because the restore publishes by
+  rename into an empty store. (#438, open — the checks and their tests
+  land with it.)
+- **A refused-auth flood is counted by the machine, not the socket.**
+  The audit meter folds one peer's refusals into counted lines keyed
+  by the address — an IPv6 by its /64, the smallest block one site
+  routes — so one machine opening a thousand connections from a
+  thousand ports cannot fill the peer cap for free and bury a real
+  stranger in the shared bucket. (#414)
+  `scion-server/src/audit.rs::meter_key`, and the test
+  `scion-server/src/audit.rs::one_address_rotating_ports_does_not_bury_a_stranger`
+- **A restore verifies first, and goes only into an empty store.** It
+  runs the same `verify` a reader runs and refuses on any damage, and it
+  refuses a data directory that already holds a store
+  (`scion-server/tests/archive.rs::a_verify_names_a_blob_whose_bytes_someone_corrupted`,
+  `scion-server/tests/archive.rs::a_restore_refuses_a_data_directory_that_already_holds_a_store`).
 ## 6. What has no test yet
 
 Each of these is a claim this document makes without a test behind it.
@@ -243,15 +275,12 @@ They become issues as the project moves past alpha.
 - The token compare is constant time: the code is (`auth.rs`,
   `constant_time_eq`), but no test observes it, and a timing test would
   be flaky by nature. The digest form of the access file is the main
-  defence, and that is the load-time format.
-- A narrowed access file does not cut outstanding tickets: they hold
+  defence, and that is the load-time format.- A narrowed access file does not cut outstanding tickets: they hold
   for at most 15 minutes from signing, by design (rotate the key to cut
   at once). The window and the cut are pinned:
   `scion-server/tests/access.rs::an_outstanding_ticket_survives_a_narrowed_access_file_until_the_key_rotates`
 - TLS revocation, and hostname checks beyond what the CA signs: no
   test; revocation has no issue yet.
-- The owner and mode checks read no ACLs: an ACL that grants a write
-  the mode does not gets past them. Documented as a limit; no test.
 - A partial reader sees real changeset IDs for its view: a landing on
   hidden paths moves `main`, and the reader's `ResolveRef` answers the
   new ID over an unchanged view. The channel is pinned as documented
@@ -263,6 +292,11 @@ They become issues as the project moves past alpha.
   the hardware below the process, so no test of this repository can
   observe them, let alone refuse them. The data directory's file modes
   are the only wall, and they are tested.
+- A tier snapshot's names are not checked against folds on a
+  case-insensitive disk yet: the archive sections got their fold check
+  in #438, and the snapshot loader's is still to come. A snapshot is
+  read through the checked descriptor, so a planted file cannot hang
+  or flood the read either way.
 - The mount's single-user rule rests on the operating system: the NFS
   server cannot tell local users apart, so the code has nothing to
   check, and a test of this repository cannot observe other local users
