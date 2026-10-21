@@ -112,11 +112,7 @@ async fn serve_with_audit(
 }
 
 async fn client(url: &str, token: &str) -> Scion {
-    let channel = Channel::from_shared(url.to_owned())
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(url).await.unwrap();
     let value = format!("Bearer {token}")
         .parse()
         .expect("a bearer header parses");
@@ -217,3 +213,6 @@ async fn wait_for_lines(path: &std::path::Path, n: usize) {
         String::from_utf8_lossy(&bytes)
     );
 }
+
+#[path = "common/mod.rs"]
+mod common;

@@ -225,11 +225,39 @@ impl Server {
 pub(crate) type Scion = ScionClient<InterceptedService<Channel, Bearer>>;
 pub(crate) type Objects = ObjectsClient<InterceptedService<Channel, Bearer>>;
 
-pub(crate) async fn connect(url: &str) -> Result<(Scion, Objects), tonic::transport::Error> {
-    let channel = Channel::from_shared(url.to_owned())
+/// How long a test client may take to connect, and how long one call
+/// may run. A server that dies mid-reply must not leave a client
+/// waiting forever: a Channel without a connect timeout keeps trying
+/// to reconnect, and a call without a deadline waits on the reply for
+/// good. The ceilings fail loud with a name, in seconds, instead of
+/// eating the job's cap.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One channel for a test client: the timeout is the point.
+pub(crate) async fn channel(url: &str) -> Result<Channel, tonic::transport::Error> {
+    Channel::from_shared(url.to_owned())
         .unwrap()
+        .connect_timeout(CONNECT_TIMEOUT)
         .connect()
-        .await?;
+        .await
+}
+
+/// The callers' ceiling: a call that outlives `CALL_TIMEOUT` is the
+/// test's bug, named. A call that carries its own tighter timeout is
+/// wrapped by its test instead.
+pub(crate) async fn within_call_ceiling<T>(
+    what: &str,
+    call: impl std::future::Future<Output = T>,
+) -> T {
+    match tokio::time::timeout(CALL_TIMEOUT, call).await {
+        Ok(done) => done,
+        Err(_) => panic!("{what} outlived its {} s ceiling", CALL_TIMEOUT.as_secs()),
+    }
+}
+
+pub(crate) async fn connect(url: &str) -> Result<(Scion, Objects), tonic::transport::Error> {
+    let channel = channel(url).await?;
     let bearer = Bearer::new(TOKEN).unwrap();
     let objects = ObjectsClient::with_interceptor(channel.clone(), bearer.clone());
     Ok((ScionClient::with_interceptor(channel, bearer), objects))

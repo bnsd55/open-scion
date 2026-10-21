@@ -112,6 +112,7 @@ async fn client(url: &str) -> Scion {
         .unwrap()
         .initial_stream_window_size(65_535)
         .initial_connection_window_size(65_535)
+        .connect_timeout(common::CONNECT_TIMEOUT)
         .connect()
         .await
         .unwrap();
@@ -369,11 +370,7 @@ async fn a_unary_reply_over_the_message_limit_is_refused() {
         std::future::pending(),
         std::sync::Arc::new(scion_proto::runtime::metrics::Metrics::default()),
     ));
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(&format!("http://{addr}")).await.unwrap();
     let mut client = scion_proto::v1::scion_client::ScionClient::new(channel);
     let err = client
         .resolve_ref(scion_proto::v1::ResolveRefRequest::default())
@@ -439,3 +436,6 @@ async fn a_stalled_blame_reply_is_counted_and_closes_the_connection() {
         "the close notice names no peer: {text}"
     );
 }
+
+#[path = "common/mod.rs"]
+mod common;
