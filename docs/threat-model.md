@@ -201,8 +201,9 @@ that breaks one is caught.
   `scion-tier/src/snapshot.rs::a_symlinked_snapshot_is_refused`
 - **Two repos whose names differ only by case do not share one
   snapshot file.** On a case-insensitive disk, `main` and `MAIN` would
-  fold one onto the other and the second seed would read the first
-  repo's snapshot; `scion-tier/src/snapshot.rs::file_name` escapes
+  fold one onto the other: the second repo's snapshot write replaced
+  the first's, and a seed of the first read the second's file;
+  `scion-tier/src/snapshot.rs::file_name` escapes
   every capital (and every byte outside the plain name set) as `%XX`,
   so the file name keeps lowercase only, and the property test holds
   it for any repo name
