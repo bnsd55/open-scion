@@ -93,7 +93,7 @@ jobs:
       - name: run the capacity grid
         env:
           SCION_PG_URL: postgres://postgres@127.0.0.1:5432/scion
-          CAPACITY_MACHINE: GitHub ubuntu-24.04 hosted runner: 4 vCPU, 16 GiB RAM, 14 GiB SSD
+          CAPACITY_MACHINE: "GitHub ubuntu-24.04 hosted runner: 4 vCPU, 16 GiB RAM, 14 GiB SSD"
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: scripts/capacity.sh
       - name: upload the raw output and the logs

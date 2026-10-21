@@ -35,6 +35,10 @@ thread_local! {
     pub(crate) static CHANGESET_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "test_support/db.rs"]
+pub(crate) mod test_hooks;
+
 /// The transaction handle of the SQLite [`Store`](crate::store::Store): a
 /// reader, or the write connection inside one transaction. The queries of
 /// the shared tables are its [`MetaTx`] methods.
@@ -126,14 +130,6 @@ pub(crate) fn fill_repo_blobs(c: &Connection) -> Result<(u64, u64)> {
         "schema 4: added each repo's blobs"
     );
     Ok((read, added))
-}
-
-/// The error of a graph walk that reached its bound.
-#[cfg(any(test, feature = "test-hooks"))]
-fn too_deep(max_visits: usize) -> Error {
-    Error::ResourceExhausted(format!(
-        "the history is too deep: the answer needs more than {max_visits} changesets"
-    ))
 }
 
 /// Reads a tree's rows and checks them against its ID.
@@ -413,7 +409,7 @@ impl MetaTx for SqliteTx<'_> {
                 continue;
             }
             if seen.len() > max_visits {
-                return Err(too_deep(max_visits));
+                return Err(test_hooks::too_deep(max_visits));
             }
             stack.extend(self.parents(id, id_gen)?);
         }

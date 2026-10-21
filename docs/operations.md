@@ -254,6 +254,17 @@ repos all its users may read whole.
 
 ### Folder read rules
 
+The server records an audit log: an append-only JSON-lines file of
+refused authentication (counted per peer), writes, ref changes, lands
+and administrative changes, with no tokens and no contents. It lives at
+`audit.log` in the data directory; `--audit-file` puts it elsewhere.
+There is no way to turn it off: a server that cannot record refuses the
+changes it cannot account for, and flips readiness until a restart. The
+file is mode 0600, never a symlink, in a directory only the server's
+user may write.
+
+### Folder read rules
+
 A `read` or `write` rule may name a path prefix as its fourth field, by
 path parts: `read alice main src` lets alice read `src` and below
 (`src/a` yes, `srcx` no), and nothing else of that repo. No prefix means

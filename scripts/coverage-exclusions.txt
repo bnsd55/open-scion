@@ -10,18 +10,7 @@
 # - The generated proto code (tonic_prost_build) builds into OUT_DIR
 #   under target/, which the measure never counts.
 #
-# The test seam IS in the measure, and the count is accepted for now
-# (SHORTCUT: the seam rides in the measured files; move its items into
-# their own files - lib.rs's test_support module and the cfg-gated
-# items of backend.rs, pg.rs and store.rs, about 900 lines together -
-# and then one pattern here excludes them). The gate is on the total,
-# and the seam's lines are the tests' own calls: a test build compiles
-# the test-hooks feature (the crate's dev-dependency open-scion-server
-# names it), so lib.rs's test_support module (87 lines) and the
-# cfg-gated hook items across the sources (~800 more) count in every
-# report. They are exercised by the same suite the report measures,
-# so their share is honest test-side code, not unmeasured
-# production code. The seam's ~880 counted lines are about 2.5 points
-# of the total, so they can hold a gate above the truth: when the
-# total falls to 83 percent or below, move the seam into its own
-# files before the gate's number is trusted.
+# The test seam lives in its own files (crates/scion-server/src/test_support/),
+# declared by their parent modules with #[path], so the exclusion here is a
+# file pattern and the production files carry no seam code:
+crates/scion-server/src/test_support/

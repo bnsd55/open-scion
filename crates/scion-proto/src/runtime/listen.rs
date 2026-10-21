@@ -40,6 +40,7 @@
 
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
@@ -54,7 +55,7 @@ use crate::runtime::request_id;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::time::Sleep;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::server::TlsStream;
@@ -160,17 +161,30 @@ struct Counted {
     waker: Mutex<Option<Waker>>,
     /// Whether the crossing has been logged.
     logged: AtomicBool,
+    /// The peer of the connection, when it is a socket: the audit's
+    /// refusal lines name it, and the call span's `peer` field carries
+    /// it. None on a connection that is not a socket.
+    peer: Option<SocketAddr>,
 }
 
 impl Stalled {
-    pub(crate) fn new(limit: u64, metrics: Arc<Metrics>) -> Self {
+    pub(crate) fn new(peer: Option<SocketAddr>, limit: u64, metrics: Arc<Metrics>) -> Self {
         Self(Arc::new(Counted {
+            peer,
             limit,
             bytes: AtomicU64::new(0),
             metrics,
             waker: Mutex::new(None),
             logged: AtomicBool::new(false),
         }))
+    }
+
+    /// The peer of `request`'s connection, when it is a socket. Below
+    /// the router the connect info is the only peer a call still has:
+    /// the audit's refusal lines name it.
+    #[must_use]
+    pub fn peer(&self) -> Option<SocketAddr> {
+        self.0.peer
     }
 
     /// The handle of `request`'s connection, if it is one of ours. A reply
@@ -286,6 +300,7 @@ const TIMERS: Timers = Timers {
 pub async fn health(
     services: &[&'static str],
     shutdown: impl Future<Output = ()>,
+    mut ready: watch::Receiver<bool>,
 ) -> (
     tonic_health::pb::health_server::HealthServer<impl tonic_health::pb::health_server::Health>,
     impl Future<Output = ()>,
@@ -297,7 +312,15 @@ pub async fn health(
             .await;
     }
     let shutdown = async move {
-        shutdown.await;
+        tokio::select! {
+            () = shutdown => {},
+            // The audit lost a line: the log has a hole, so the names
+            // flip now and stay flipped until a restart. The audit has
+            // logged the reason on its own path.
+            _ = ready.wait_for(|ready| !*ready) => {
+                tracing::error!("readiness lost: an audit line was not made durable");
+            },
+        }
         // Only the service names flip: the empty name is liveness, and a
         // stop must not tell the supervisor to kill a draining server.
         for name in services.iter().copied() {
@@ -329,7 +352,7 @@ impl Limits {
     ) -> Result<(), tonic::transport::Error>
     where
         I: Stream<Item = io::Result<IO>> + Send + 'static,
-        IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
+        IO: AsyncRead + AsyncWrite + Connected + PeerOf + Unpin + Send + 'static,
     {
         self.serve_with(&TIMERS, router, incoming, tls, shutdown, metrics)
             .await
@@ -346,7 +369,7 @@ impl Limits {
     ) -> Result<(), tonic::transport::Error>
     where
         I: Stream<Item = io::Result<IO>> + Send + 'static,
-        IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
+        IO: AsyncRead + AsyncWrite + Connected + PeerOf + Unpin + Send + 'static,
     {
         // One span per call: the RPC and the peer at the start, and the
         // principal and the repo once the call knows them. `error_span`, so
@@ -354,10 +377,13 @@ impl Limits {
         // `warn` filter still shows its fields.
         let server = Server::builder()
             .trace_fn(|request| {
+                // The connection's handle carries the peer: the connect
+                // info of a request below the router is ours, and the
+                // transport's `TcpConnectInfo` is not on the request.
                 let peer = request
                     .extensions()
-                    .get::<tonic::transport::server::TcpConnectInfo>()
-                    .and_then(tonic::transport::server::TcpConnectInfo::remote_addr)
+                    .get::<Stalled>()
+                    .and_then(Stalled::peer)
                     .map(|addr| addr.to_string())
                     .unwrap_or_default();
                 // The caller's request ID, if it sent one that fits. A
@@ -441,7 +467,7 @@ fn accept_tls<I, IO>(
 ) -> ReceiverStream<io::Result<Connection<TlsStream<IO>>>>
 where
     I: Stream<Item = io::Result<IO>> + Send + 'static,
-    IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
+    IO: AsyncRead + AsyncWrite + Connected + PeerOf + Unpin + Send + 'static,
 {
     let places = Arc::new(Semaphore::new(max.get()));
     let (done, served) = mpsc::channel(max.get());
@@ -488,6 +514,7 @@ where
             tokio::spawn(async move {
                 match wait.await {
                     Ok(Ok(stream)) => {
+                        let peer = stream.get_ref().0.peer_of();
                         // The place goes with the connection, and frees when
                         // it is dropped, which the gone receiver also does.
                         let _ = sender
@@ -495,7 +522,7 @@ where
                                 io: stream,
                                 _place: place,
                                 preface,
-                                stalled: Stalled::new(stalled_bytes, metrics),
+                                stalled: Stalled::new(peer, stalled_bytes, metrics),
                             }))
                             .await;
                     }
@@ -527,6 +554,7 @@ fn accept<I, IO, E>(
 ) -> impl Stream<Item = Result<Connection<IO>, E>>
 where
     I: Stream<Item = Result<IO, E>>,
+    IO: PeerOf,
 {
     let max = max.get();
     let stalled_bytes = stalled_bytes.get();
@@ -545,14 +573,44 @@ where
                     .await
                     .expect("the semaphore of places is never closed")
             };
+            let peer = io.peer_of();
             Ok(Connection {
                 io,
                 _place: place,
                 preface: Some((PREFACE_BYTES, Box::pin(tokio::time::sleep(handshake)))),
-                stalled: Stalled::new(stalled_bytes, metrics),
+                stalled: Stalled::new(peer, stalled_bytes, metrics),
             })
         }
     })
+}
+
+/// The peer of a connected stream, for the audit's refusal lines and
+/// the call span's `peer` field: the connect info a request carries
+/// below the router is the only peer a call still has.
+#[allow(unreachable_pub)]
+pub trait PeerOf {
+    /// The peer of the stream, when it is a socket.
+    fn peer_of(&self) -> Option<SocketAddr>;
+}
+
+impl PeerOf for tokio::net::TcpStream {
+    fn peer_of(&self) -> Option<SocketAddr> {
+        self.peer_addr().ok()
+    }
+}
+
+impl<IO: PeerOf> PeerOf for TlsStream<IO> {
+    fn peer_of(&self) -> Option<SocketAddr> {
+        self.get_ref().0.peer_of()
+    }
+}
+
+/// A Unix socket has no peer address: the audit's refusal lines name no
+/// peer for it.
+impl PeerOf for UnixStream {
+    fn peer_of(&self) -> Option<SocketAddr> {
+        None
+    }
 }
 
 /// A connection that keeps its place of [`accept`] until it is dropped.

@@ -197,6 +197,9 @@ pub struct ServeOptions {
     /// The data directory the server serves, for the free-space gauge of
     /// its filesystem.
     pub data: std::path::PathBuf,
+    /// The audit log. Every server has one; the caller opens it (or
+    /// passes the off handle of the tests) and records its start line.
+    pub audit: crate::audit::Audit,
 }
 
 /// Serves the API on `listener` within `options`, until `shutdown` resolves,
@@ -227,6 +230,7 @@ pub async fn serve(
         tls,
         metrics,
         data,
+        audit,
     } = options;
     let access = Arc::new(access.into());
     let auth = access.auth();
@@ -253,6 +257,15 @@ pub async fn serve(
     // The free space of the data directory's filesystem, so the operator
     // sees a full drive before the server hits it.
     spawn_free_space_poll(data, Arc::clone(&metrics), stop_rx.clone());
+    // Refused authentication is counted per peer and flushed as one
+    // line per peer, so a stranger who spams bad tokens cannot fill the
+    // audit log or the disk with refusal lines.
+    let meter = Arc::new(crate::audit::Meter::default());
+    tokio::spawn(crate::audit::meter_task(
+        Arc::clone(&meter),
+        audit.clone(),
+        stop_rx.clone(),
+    ));
     tokio::spawn(pg_tx_age_sample(
         worker.store(),
         Arc::clone(&metrics),
@@ -295,7 +308,7 @@ pub async fn serve(
             Arc::clone(&metrics),
         )
         .into_server(),
-        auth.clone(),
+        crate::audit::AuditedAuth::new(auth.clone(), Arc::clone(&meter)),
     ));
     // No token interceptor on `objects`: `GetObjects` authenticates by
     // ticket alone, and the service's other calls check the token
@@ -308,9 +321,15 @@ pub async fn serve(
     // same port, without a token: a probe carries none. The store opens
     // before this call, so the server starts serving. A fence trip
     // resolves the shutdown, so the names flip to NOT_SERVING on the
-    // service's own path, and the process exits a grace later.
-    let (health, shutdown) =
-        listen::health(&["scion.v1.Scion", "scion.v1.Objects"], shutdown).await;
+    // service's own path, and the process exits a grace later. An audit
+    // line that was not made durable flips the names too, and latches:
+    // the log has a hole, so the server must not be picked for writes.
+    let (health, shutdown) = listen::health(
+        &["scion.v1.Scion", "scion.v1.Objects"],
+        shutdown,
+        audit.ready(),
+    )
+    .await;
     let router = |server: Server| {
         server
             .timeout(REQUEST_TIMEOUT)
