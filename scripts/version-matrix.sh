@@ -5,10 +5,15 @@
 #
 # N-1 is PREV_REF when set (any commit or tag), else the newest release
 # tag that is an ancestor of HEAD and not HEAD itself: when HEAD carries
-# the release tag, N-1 is the one before it. With no tag and no PREV_REF
-# the script prints `skipped: no release tag yet` in the step summary
-# (GITHUB_STEP_SUMMARY when set) and exits 0: the matrix starts at
-# v0.1.0 and says so, it never passes silently.
+# the release tag, N-1 is the one before it. With no tag and no
+# PREV_REF, N-1 is the newest commit of the stand-in ladder below - the
+# same two pinned commits scripts/store-upgrade.sh runs, chosen where
+# the store schema changed, so every leg has something real to prove
+# from the first nightly on. A run with nothing to compare against
+# fails; the matrix never passes as a skip.
+# SHORTCUT: the pins stand in for release tags; the first release tag
+# replaces them, because a release tag is an ancestor of HEAD and the
+# pins sit on main.
 #
 # The pairs, and what each proves:
 #
@@ -16,10 +21,10 @@
 #      ticket key, log, ls, cat, blame, commit, land, read back) answers
 #      inside the v1 contract with the client and the server at opposite
 #      versions.
-#   2. tier <-> server, both directions: a read through the cache
-#      matches a direct read byte for byte, the ticket verifies (the
-#      cache holds its public half), and the second read is served by
-#      the cache: the server's GetObjects counter does not grow.
+#   2. tier <-> server, both directions: a checkout through the cache
+#      matches a direct checkout byte for byte, the ticket verifies (the
+#      cache holds its public half), and the second checkout is served
+#      by the cache: the server's GetObjects counter does not grow.
 #   3. scn <-> daemon over the unix:// path, both directions: the
 #      checkout reads what cli.md documents, and --json keeps its shape.
 #      The server stays at N: the pair under test is the socket pair.
@@ -29,6 +34,15 @@
 #      server of N-1 is refused with the version reason -- but only when
 #      the two builds write different schema versions at all; when they
 #      share one, the script says so instead of failing.
+#   5. the ticket window, both directions (ROADMAP v0.6.0: tickets
+#      follow the N and N-1 mixed-version window): the ticket one
+#      version's server signs verifies on the tier of the other version,
+#      and both versions' tiers refuse a ticket of another key with the
+#      ticket reason - the claims cross the window, not just the bytes.
+#   6. the snapshot window, both directions (ROADMAP v0.6.0: snapshots
+#      follow the N and N-1 mixed-version window): the snapshot one
+#      version's cache writes opens as the other version's daemon seed,
+#      and a checkout through that daemon reads the repo whole.
 #
 # Left out on purpose, per docs/compatibility.md:
 #   - tier <-> tier (a chain of caches): the policy's chain rule follows
@@ -76,6 +90,16 @@ die() {
   exit 1
 }
 
+# The stand-in ladder of scripts/store-upgrade.sh (coder3, #428): until
+# the first release tag, N-1 is the newest of these two pinned commits,
+# chosen where the store schema changed (8: read rules per folder, 9:
+# view memo). One resolution, two users: whoever lands second rebases
+# onto the other's form.
+STANDIN_TAGS=(
+  32a6117bf54510450b1bfea10b6c873dcb383207 # view memo: schema 9 (newest)
+  afe1c4db878f38fa22bd6adddd57a8c410668db5 # read rules per folder: schema 8
+)
+
 note() { echo "-- $*" >&2; }
 
 # summary LINE: what a CI run reads. Into the step summary when there is
@@ -85,8 +109,9 @@ summary() {
   [ -z "${GITHUB_STEP_SUMMARY:-}" ] || echo "$*" >> "$GITHUB_STEP_SUMMARY"
 }
 
-# prev_ref: the ref to test as N-1, per the header. Empty when there is
-# none: PREV_REF unset, and no release tag behind HEAD.
+# prev_ref: the ref to test as N-1, per the header. There is always
+# one: PREV_REF, else the newest release tag behind HEAD, else the
+# newest stand-in commit.
 prev_ref() {
   if [ -n "${PREV_REF:-}" ]; then
     printf '%s\n' "$PREV_REF"
@@ -94,24 +119,25 @@ prev_ref() {
   fi
   local tag head
   head=$(git -C "$ROOT" rev-parse HEAD)
-  git -C "$ROOT" tag --list 'v[0-9]*' --sort=-version:refname --merged=HEAD |
-    while read -r tag; do
-      if [ "$(git -C "$ROOT" rev-parse "$tag^{commit}")" != "$head" ]; then
-        printf '%s\n' "$tag"
+  tag=$(git -C "$ROOT" tag --list 'v[0-9]*' --sort=-version:refname --merged=HEAD |
+    while read -r t; do
+      if [ "$(git -C "$ROOT" rev-parse "$t^{commit}")" != "$head" ]; then
+        printf '%s\n' "$t"
         break
       fi
-    done
+    done)
+  if [ -n "$tag" ]; then
+    printf '%s\n' "$tag"
+  else
+    printf '%s\n' "${STANDIN_TAGS[0]}"
+  fi
 }
 
 # --resolve-ref: print the N-1 ref and exit, so a workflow can key its
-# cache on the commit before any build runs. No ref: say why, exit 0.
+# cache on the commit before any build runs. There is always a ref, so
+# this never skips.
 if [ "${1:-}" = "--resolve-ref" ]; then
-  ref=$(prev_ref)
-  if [ -z "$ref" ]; then
-    summary "skipped: no release tag yet"
-    exit 0
-  fi
-  printf '%s\n' "$ref"
+  prev_ref
   exit 0
 fi
 
@@ -351,7 +377,7 @@ pair_1() {
   note "pair 1 ($side)"
   import "$dir" "$srv"
   port=$(start server "$dir" "$srv/scion-server" port --data "$dir/server" serve \
-    --listen 127.0.0.1:0 --token matrix --ticket-key "$dir/ticket.key")
+    --listen 127.0.0.1:0 --ticket-key "$dir/ticket.key")
   story "$dir" "http://127.0.0.1:$port"
   stop "$dir"
 }
@@ -366,7 +392,7 @@ pair_2() {
   note "pair 2 ($side)"
   import "$dir" "$srv"
   sport=$(start server "$dir" "$srv/scion-server" port --data "$dir/server" serve \
-    --listen 127.0.0.1:0 --token matrix --ticket-key "$dir/ticket.key" \
+    --listen 127.0.0.1:0 --ticket-key "$dir/ticket.key" \
     --metrics-listen 127.0.0.1:0)
   mport=$(metrics_port "$dir/server.log")
   [ -n "$mport" ] || die "pair '$PAIR' ($SIDE): the server logged no metrics port"
@@ -387,25 +413,26 @@ pair_2() {
       --ticket-public-key "$(cat "$dir/ticket.pub")" > /dev/null
   fi
   # The read through the tier must match the direct read byte for byte.
-  # The ref and its ticket come from the server; the objects ride the
-  # cache, as cli.md documents the split.
+  # The read is a checkout, not a cat: cat reads the file at the server
+  # (ReadFile) and never reaches the tier, so a cat would prove nothing
+  # about the pair. The ref and its ticket come from the server; the
+  # objects ride the cache, as cli.md documents the split.
   "$SCN/scn" --server "http://127.0.0.1:$sport" \
-    --objects "http://127.0.0.1:$cport" cat main:README.md \
-    >"$dir/through.txt" ||
-    die "pair '$PAIR' ($SIDE): the read through the tier failed"
-  "$SCN/scn" --server "http://127.0.0.1:$sport" cat main:README.md \
-    >"$dir/direct.txt" ||
-    die "pair '$PAIR' ($SIDE): the direct read failed"
-  cmp -s "$dir/through.txt" "$dir/direct.txt" ||
-    die "pair '$PAIR' ($SIDE): the read through the tier differs from the direct read"
-  # The second read is the cache's: the server's GetObjects total stays.
+    --objects "http://127.0.0.1:$cport" checkout main --into "$dir/through" > /dev/null ||
+    die "pair '$PAIR' ($SIDE): the checkout through the tier failed"
+  "$SCN/scn" --server "http://127.0.0.1:$sport" checkout main --into "$dir/direct" > /dev/null ||
+    die "pair '$PAIR' ($SIDE): the direct checkout failed"
+  cmp -s "$dir/through/README.md" "$dir/direct/README.md" ||
+    die "pair '$PAIR' ($SIDE): the checkout through the tier differs from the direct checkout"
+  # The second checkout is the cache's: the server's GetObjects total
+  # stays.
   before=$(getobjects "http://127.0.0.1:$mport") ||
     die "pair '$PAIR' ($SIDE): the metrics scrape failed"
   "$SCN/scn" --server "http://127.0.0.1:$sport" \
-    --objects "http://127.0.0.1:$cport" cat main:README.md > /dev/null ||
-    die "pair '$PAIR' ($SIDE): the second read through the tier failed"
+    --objects "http://127.0.0.1:$cport" checkout main --into "$dir/again" > /dev/null ||
+    die "pair '$PAIR' ($SIDE): the second checkout through the tier failed"
   [ "$(getobjects "http://127.0.0.1:$mport")" = "$before" ] ||
-    die "pair '$PAIR' ($SIDE): the second read reached the server, the cache did not serve it"
+    die "pair '$PAIR' ($SIDE): the second checkout reached the server, the cache did not serve it"
   stop "$dir"
 }
 
@@ -423,7 +450,7 @@ pair_3() {
   sock="$SOCK-$side"
   rm -f "$sock"
   sport=$(start server "$dir" "$BIN/scion-server" port --data "$dir/server" serve \
-    --listen 127.0.0.1:0 --token matrix --ticket-key "$dir/ticket.key")
+    --listen 127.0.0.1:0 --ticket-key "$dir/ticket.key")
   start daemon "$dir" "$daemon/scion-daemon" serving --data "$dir/daemon-data" \
     --socket "$sock" --upstream "http://127.0.0.1:$sport"
   mkdir -p "$dir/out"
@@ -443,6 +470,115 @@ pair_3() {
   stop "$dir"
 }
 
+# pair_5 DIRECTION CACHE_BIN SRV_BIN: the ticket window, both
+# directions. The ticket one version's server signs must verify on the
+# tier of the other version; and a ticket of a key that is not the
+# server's must be refused by the other version's tier with the ticket
+# reason - the claims cross the window, not just the bytes.
+pair_5() {
+  local side=$1 cache=$2 srv=$3 dir sport cport
+  PAIR='ticket window' SIDE=$side SCN=$BIN
+  dir=$(mktemp -d "$WORK/pair5-$side.XXXXXX")
+  note "pair 5 ($side)"
+  import "$dir" "$srv"
+  # A key that is not the server's, made by the OTHER build's tool: if
+  # the two versions disagreed on the key format, the refusal below
+  # would catch it.
+  "$cache/scion-server" ticket-key --out "$dir/wrong.key" \
+    >"$dir/wrong.pub" || die "pair '$PAIR' ($SIDE): the second ticket-key failed"
+  sport=$(start server "$dir" "$srv/scion-server" port --data "$dir/server" serve \
+    --listen 127.0.0.1:0 --ticket-key "$dir/ticket.key")
+  # The positive: the server's ticket verifies on the other version's
+  # tier, and the read matches the source.
+  cport=$(start cache "$dir" "$cache/scion-cache" port --listen 127.0.0.1:0 \
+    --upstream "http://127.0.0.1:$sport" \
+    --ticket-public-key "$(cat "$dir/ticket.pub")")
+  if [ "$cport" = 0 ]; then
+    stop_one "$dir" cache
+    cport=$((sport + 1))
+    start cache "$dir" "$cache/scion-cache" port --listen "127.0.0.1:$cport" \
+      --upstream "http://127.0.0.1:$sport" \
+      --ticket-public-key "$(cat "$dir/ticket.pub")" > /dev/null
+  fi
+  "$SCN/scn" --server "http://127.0.0.1:$sport" \
+    --objects "http://127.0.0.1:$cport" checkout main --into "$dir/through" > /dev/null ||
+    die "pair '$PAIR' ($SIDE): the ticket of one version did not verify on the tier of the other"
+  cmp -s "$dir/through/README.md" "$dir/src/README.md" ||
+    die "pair '$PAIR' ($SIDE): the checkout through the tier read the wrong bytes"
+  stop_one "$dir" cache
+  # The negative: the wrong key, the other version's tier refuses with
+  # the ticket reason - not a crash, not a hang. The read is a checkout:
+  # it is GetObjects, the call the ticket gates.
+  start cache "$dir" "$cache/scion-cache" serving --listen "127.0.0.1:$((sport + 2))" \
+    --upstream "http://127.0.0.1:$sport" \
+    --ticket-public-key "$(cat "$dir/wrong.pub")" > /dev/null
+  if "$SCN/scn" --server "http://127.0.0.1:$sport" \
+    --objects "http://127.0.0.1:$((sport + 2))" checkout main --into "$dir/wrong" \
+    >"$dir/wrong.out" 2>"$dir/wrong.err"; then
+    die "pair '$PAIR' ($SIDE): the tier of the other version accepted a ticket of another key"
+  fi
+  grep -q 'a GetObjects ticket was refused' "$dir/cache.log" ||
+    die "pair '$PAIR' ($SIDE): the wrong-key refusal named no ticket reason"
+  stop "$dir"
+}
+
+# pair_6 DIRECTION CACHE_BIN DAEMON_BIN: the snapshot window, both
+# directions. The snapshot one version's cache writes opens as the
+# other version's daemon seed (operations.md's warm start), and a
+# checkout through that daemon reads the repo whole.
+pair_6() {
+  local side=$1 cache=$2 daemon=$3 dir sock sport tries
+  PAIR='snapshot window' SIDE=$side SCN=$BIN
+  dir=$(mktemp -d "$WORK/pair6-$side.XXXXXX")
+  note "pair 6 ($side)"
+  import "$dir" "$BIN"
+  sport=$(start server "$dir" "$BIN/scion-server" port --data "$dir/server" serve \
+    --listen 127.0.0.1:0 --ticket-key "$dir/ticket.key")
+  # The cache of one version writes the snapshot. Its memory store only
+  # holds what went through it, so a checkout through the cache first,
+  # then the file appears within an interval; one settle beat after it
+  # appears, because a half-written seed is not the window under test.
+  mkdir -p "$dir/snaps"
+  start cache "$dir" "$cache/scion-cache" serving --listen "127.0.0.1:$((sport + 1))" \
+    --upstream "http://127.0.0.1:$sport" \
+    --ticket-public-key "$(cat "$dir/ticket.pub")" \
+    --snapshot "$dir/snaps" --snapshot-repo main --snapshot-every 2 > /dev/null
+  "$SCN/scn" --server "http://127.0.0.1:$sport" \
+    --objects "http://127.0.0.1:$((sport + 1))" checkout main --into "$dir/warm" > /dev/null ||
+    die "pair '$PAIR' ($SIDE): the checkout that warms the cache failed"
+  tries=75
+  until [ -s "$dir/snaps/main.scnsnap" ]; do
+    sleep 0.2
+    tries=$((tries - 1))
+    [ "$tries" -gt 0 ] || die "pair '$PAIR' ($SIDE): the cache wrote no snapshot file"
+  done
+  sleep 1
+  stop_one "$dir" cache
+  # The daemon of the other version starts warm from it, and a checkout
+  # through it reads the repo whole. An older daemon seeds without the
+  # say-so flag: --seed-full-repo arrived with the refusal that needs
+  # it, and the stand-in commits predate it.
+  sock="$SOCK-snap-$side"
+  rm -f "$sock"
+  if "$daemon/scion-daemon" --help 2>&1 | grep -q -- '--seed-full-repo'; then
+    start daemon "$dir" "$daemon/scion-daemon" serving --data "$dir/daemon-data" \
+      --socket "$sock" --upstream "http://127.0.0.1:$sport" \
+      --seed "$dir/snaps/main.scnsnap" --seed-full-repo
+  else
+    note "the N-1 daemon predates --seed-full-repo: it seeds without the say-so"
+    start daemon "$dir" "$daemon/scion-daemon" serving --data "$dir/daemon-data" \
+      --socket "$sock" --upstream "http://127.0.0.1:$sport" \
+      --seed "$dir/snaps/main.scnsnap"
+  fi
+  mkdir -p "$dir/out"
+  "$SCN/scn" --server "http://127.0.0.1:$sport" --objects "unix://$sock" \
+    checkout main --into "$dir/out" > /dev/null ||
+    die "pair '$PAIR' ($SIDE): the checkout from the other version's snapshot failed"
+  cmp -s "$dir/out/README.md" "$dir/src/README.md" ||
+    die "pair '$PAIR' ($SIDE): the checkout from the snapshot read the wrong bytes"
+  stop "$dir"
+}
+
 # pair_4: the store pair, one direction by design. A server of N opens a
 # store of N-1, the migration runs forward, and reads and writes work on
 # the migrated store. A store of N on a server of N-1 is refused with
@@ -457,7 +593,7 @@ pair_4() {
   "$BIN/scion-server" --data "$dir/server" fsck >"$dir/fsck.log" 2>&1 ||
     die "pair '$PAIR' ($SIDE): the N server cannot open the N-1 store"
   port=$(start server "$dir" "$BIN/scion-server" port --data "$dir/server" serve \
-    --listen 127.0.0.1:0 --token matrix --ticket-key "$dir/ticket.key")
+    --listen 127.0.0.1:0 --ticket-key "$dir/ticket.key")
   story "$dir" "http://127.0.0.1:$port"
   stop "$dir"
 
@@ -485,19 +621,15 @@ command -v cargo > /dev/null || die "needs cargo"
 command -v git > /dev/null || die "needs git"
 command -v curl > /dev/null || die "needs curl"
 
-# The ref first: a run with nothing to compare against says so before it
-# builds anything.
+# The ref first: there is always one (PREV_REF, a release tag, or the
+# stand-in ladder), and a run that tests no pair is a failed run, never
+# a skip. A workflow that resolved an N-1 ref hands it to the run
+# through PREV_REF; the resolve step also leaves it in this file, which
+# no env wiring can lose: a run whose file is here but whose PREV_REF
+# is empty lost its wiring, and it must fail loud.
 ref=$(prev_ref)
-if [ -z "$ref" ]; then
-  # A workflow that resolved an N-1 ref hands it to the run through
-  # PREV_REF. The resolve step also leaves it in this file, which no env
-  # wiring can lose: a run that received no ref while the file is here
-  # tested nothing, and it must fail loud, never pass as a skip.
-  if [ -s version-matrix.prev-ref ]; then
-    die "the workflow resolved N-1 $(cat version-matrix.prev-ref), but this run never received it (PREV_REF was empty)"
-  fi
-  summary "skipped: no release tag yet"
-  exit 0
+if [ -z "${PREV_REF:-}" ] && [ -s version-matrix.prev-ref ]; then
+  die "the workflow resolved N-1 $(cat version-matrix.prev-ref), but this run never received it (PREV_REF was empty)"
 fi
 # The file has said all it can: the run has its ref, and a leftover
 # must not reach the next run on a reused runner.
@@ -522,5 +654,9 @@ pair_2 prev "$PREV_BIN" "$BIN"
 pair_3 cur "$BIN" "$PREV_BIN"
 pair_3 prev "$PREV_BIN" "$BIN"
 pair_4
+pair_5 cur "$BIN" "$PREV_BIN"
+pair_5 prev "$PREV_BIN" "$BIN"
+pair_6 cur "$BIN" "$PREV_BIN"
+pair_6 prev "$PREV_BIN" "$BIN"
 
-summary "version matrix passed: N-1 $ref against N $(git -C "$ROOT" rev-parse --short HEAD), all four pairs"
+summary "version matrix passed: N-1 $ref against N $(git -C "$ROOT" rev-parse --short HEAD), all six pairs (scn, tier, daemon, store, ticket window, snapshot window)"

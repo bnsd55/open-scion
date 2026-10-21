@@ -114,11 +114,37 @@ pub(crate) fn check_name(name: &[u8]) -> Result<(), &'static str> {
             return Err("it contains a bidirectional text control");
         }
     }
+    // The name as the disk reads it: NTFS drops trailing ASCII spaces and
+    // dots (git's ntfs check), and HFS+ ignores U+200C..U+200F,
+    // U+202A..U+202E, U+206A..U+206F and U+FEFF anywhere (git's hfs
+    // check). Both are in scope: scn checks out to any local disk
+    // (docs/support.md). The compare folds ASCII case, so `.GIT ` is the
+    // reserved name too.
+    let mut slim = String::with_capacity(name.len());
+    for chunk in name.utf8_chunks() {
+        slim.push_str(chunk.valid());
+        for _ in chunk.invalid() {
+            slim.push('\u{fffd}');
+        }
+    }
+    let slim: String = slim
+        .chars()
+        .filter(|c| {
+            !matches!(
+                c,
+                '\u{200c}'..='\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{206a}'..='\u{206f}'
+                    | '\u{feff}'
+            )
+        })
+        .collect();
+    let slim = slim.trim_end_matches([' ', '.']);
     if RESERVED
         .iter()
-        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+        .any(|reserved| slim.as_bytes().eq_ignore_ascii_case(reserved))
     {
-        return Err("it uses a reserved metadata name");
+        return Err("it names metadata a tool keeps, once the parts a disk folds are gone");
     }
     Ok(())
 }
@@ -1695,5 +1721,65 @@ mod tests {
         assert!(checkout.file(&path("a/.git/hooks/x"), true, b"x").is_err());
         assert!(checkout.symlink(&path("a/b\x1b"), b"x").is_err());
         assert_eq!(fs::read_dir(checkout.temp_path()).unwrap().count(), 0);
+    }
+
+    /// The pass-3 attack: a tree entry named like the metadata a tool
+    /// keeps, with a trailing dot or space — `.git `, `.scion.` — slips
+    /// past the reserved-name check, which compares the whole name. The
+    /// checkout writes it, and the checkout then holds a directory that
+    /// every tool reads as `.git` on a filesystem that trims the tail.
+    /// The check must trim before it compares.
+    #[test]
+    fn a_reserved_name_with_a_trailing_dot_or_space_is_refused() {
+        for name in [".git ", ".git.", ".scion ", ".scion.", ".GIT ", ".Git."] {
+            let why = check_name(name.as_bytes())
+                .expect_err(&format!("{name:?} must be refused as a reserved name"));
+            assert!(
+                why.contains("metadata"),
+                "{name:?}: the refusal must say why: {why}"
+            );
+        }
+        // The code points HFS+ ignores are gone before the compare: one
+        // from each range git's hfs check strips. U+202A is refused even
+        // earlier, by the bidirectional-control rule.
+        for name in [
+            ".g\u{200c}it", // U+200C
+            ".\u{206a}git", // U+206A
+            ".git\u{feff}", // U+FEFF
+        ] {
+            let why = check_name(name.as_bytes())
+                .expect_err(&format!("{name:?} must be refused as a reserved name"));
+            assert!(why.contains("metadata"), "{name:?}: {why}");
+        }
+        let why = check_name(".git\u{202a}".as_bytes()).expect_err(".git<U+202A> must be refused");
+        assert!(why.contains("bidirectional"), "{why}");
+        // A name that only starts like a reserved name stays allowed.
+        for name in [".gitignore", ".gitignore ", ".gitmodules", ".github"] {
+            check_name(name.as_bytes())
+                .unwrap_or_else(|why| panic!("{name:?} must stay allowed: {why}"));
+        }
+    }
+
+    /// The pass-3 attack, for real on this disk: two tree entries whose
+    /// names fold to one name (README and readme). The checkout must
+    /// refuse the fold and lose nothing — the first file stays what the
+    /// tree said it was. Runs where the fold is real.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn two_tree_names_that_fold_are_refused_before_any_loss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let mut checkout = Checkout::start(&dest).unwrap();
+        checkout.file(&path("README"), false, b"upper\n").unwrap();
+        let err = checkout
+            .file(&path("readme"), false, b"lower\n")
+            .expect_err("two names that fold to one file must be refused");
+        assert!(
+            format!("{err:#}").contains("collides"),
+            "the refusal must name the fold: {err:#}"
+        );
+        // The first file is what it was: the refusal did not touch it.
+        let staged = checkout.temp_path();
+        assert_eq!(fs::read(staged.join("README")).unwrap(), b"upper\n");
     }
 }

@@ -85,6 +85,7 @@ fn start_stack(
             TOKEN,
             service::ServeOptions {
                 data,
+                audit: scion_server::test_support::audit::Audit::off(),
                 limits: Limits::default(),
                 quotas: scion_server::Quotas::off(),
                 pending_lands: None,

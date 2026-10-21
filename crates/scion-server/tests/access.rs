@@ -89,6 +89,28 @@ fn no_rules() -> Access {
     Access::parse(&format!("token\tmallory\t{}\n", hex("mallory"))).unwrap()
 }
 
+/// A line the parser does not know is refused at load: the access
+/// file's keys are additive-only in 1.x, and an unknown key is an
+/// error, never a silent rule (docs/stability.md, the file-format
+/// row).
+#[test]
+fn an_unknown_line_is_refused() {
+    let text = format!("token\talice\t{}\ndelete\talice\tr\n", hex("alice"));
+    let error = Access::parse(&text).unwrap_err();
+    assert!(
+        error.contains("expected `token`, `read` or `write`"),
+        "{error}"
+    );
+    // An unknown key on a well-formed line is refused too: a fifth
+    // field is no rule the 0.x file promised.
+    let text = "read\talice\tr\textra\textra\n".to_string();
+    let error = Access::parse(&text).unwrap_err();
+    assert!(
+        error.contains("expected `token`, `read` or `write`"),
+        "{error}"
+    );
+}
+
 fn hex(token: &str) -> String {
     blake3::Hash::from(token_digest(token)).to_hex().to_string()
 }
@@ -165,6 +187,7 @@ async fn serve(store: &Backend, dir: &std::path::Path, access: Access) -> (Stop,
         access,
         service::ServeOptions {
             data: dir.to_path_buf(),
+            audit: scion_server::test_support::audit::Audit::off(),
             limits: Limits::default(),
             quotas: scion_server::Quotas::off(),
             pending_lands: None,
@@ -1026,6 +1049,7 @@ async fn serve_keys(
         access,
         service::ServeOptions {
             data: dir.to_path_buf(),
+            audit: scion_server::test_support::audit::Audit::off(),
             limits: Limits::default(),
             quotas: scion_server::Quotas::off(),
             pending_lands: None,
