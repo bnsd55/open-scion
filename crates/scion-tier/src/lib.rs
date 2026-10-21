@@ -568,7 +568,13 @@ impl<S: Store> Tier<S> {
     ) -> Result<(), tonic::transport::Error>
     where
         I: Stream<Item = io::Result<IO>> + Send + 'static,
-        IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
+        IO: scion_proto::runtime::listen::PeerOf
+            + AsyncRead
+            + AsyncWrite
+            + Connected
+            + Unpin
+            + Send
+            + 'static,
     {
         // Outside the token check, so a refused call counts too.
         let metrics = Arc::clone(&self.inner.metrics);
@@ -583,8 +589,10 @@ impl<S: Store> Tier<S> {
         // The health service answers `grpc.health.v1.Check` and `Watch` on
         // the same port, without a token: a probe carries none. The store
         // and the upstream channel opened before this call, so the tier
-        // starts serving.
-        let (health, shutdown) = listen::health(&["scion.v1.Objects"], shutdown).await;
+        // starts serving. The tier has no audit log: its readiness
+        // watch never flips on its own.
+        let (_ready, ready) = tokio::sync::watch::channel(true);
+        let (health, shutdown) = listen::health(&["scion.v1.Objects"], shutdown, ready).await;
         let router = |mut server: Server| server.add_service(health).add_service(objects);
         limits
             .serve(
