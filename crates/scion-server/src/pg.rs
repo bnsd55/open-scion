@@ -48,6 +48,10 @@ use crate::land::{
 use crate::meta::{FsckDerivedRow, Meta, MetaTx, RefState, RepoChangeset, RepoId};
 use crate::store::Blobs;
 
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "test_support/pg.rs"]
+pub(crate) mod test_hooks;
+
 /// The schema version this build makes and reads.
 pub(crate) const PG_SCHEMA_VERSION: u32 = 4;
 
@@ -117,6 +121,7 @@ impl Fence {
 
 /// Handle to one Postgres database. Cheap to clone.
 #[derive(Clone)]
+
 pub(crate) struct Pg {
     inner: Arc<PgInner>,
 }
@@ -146,7 +151,7 @@ struct PgInner {
     /// The import's test hooks and busy-retry count, as the SQLite store
     /// keeps its own.
     #[cfg(any(test, feature = "test-hooks"))]
-    hooks: crate::store::ImportHooks,
+    hooks: crate::store::test_hooks::ImportHooks,
     /// The operator metrics, set once by the server before it serves: a
     /// commit's wait for the collector's advisory key records how long
     /// it waited. Empty in import, fsck and gc, which export none.
@@ -590,30 +595,6 @@ impl PgClient {
         Self { jobs }
     }
 
-    /// Runs one closure with the client on the worker thread. The sync
-    /// client must never be touched from a tokio thread, which this
-    /// keeps true for the few setup statements a caller needs. Only the
-    /// test schema's preparation calls it.
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn as_raw(&self, f: impl FnOnce(&mut Client) -> Result<()> + Send + 'static) -> Result<()> {
-        let (reply, rx) = std::sync::mpsc::channel();
-        self.jobs
-            .send(Job {
-                sql: String::new(),
-                params: Vec::new(),
-                kind: Kind::Raw,
-                reply,
-                raw: Some(Box::new(f)),
-            })
-            .map_err(|_| Error::Corrupt("the database worker stopped".into()))?;
-        match rx.recv() {
-            Ok(Ok(Reply::Count(_))) => Ok(()),
-            Ok(Ok(_)) => unreachable!("a raw job replies with a count"),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(Error::Corrupt("the database worker stopped".into())),
-        }
-    }
-
     /// Runs one statement and waits for its reply.
     fn ask(&self, sql: &str, params: Vec<Param>, kind: Kind) -> Result<Reply> {
         let (reply, rx) = std::sync::mpsc::channel();
@@ -659,64 +640,6 @@ impl PgClient {
         }
     }
 }
-
-/// Drops the test schemas whose tests ended minutes ago: a test run
-/// leaves them behind, because a server holds its schema while it runs.
-/// One process at a time holds the cleanup lock, so the test binaries
-/// that run in parallel clean nothing under each other's feet. A schema
-/// whose owner still runs is named in `pg_stat_activity` under its
-/// `application_name`, and registered with its start time, so the
-/// schema of a test that just began is never dropped.
-#[cfg(any(test, feature = "test-hooks"))]
-fn drop_stale_schemas(maker: &PgClient) {
-    let got = maker.query_opt("SELECT pg_try_advisory_lock($1)", &[P::i64(CLEAN_LOCK)]);
-    let Ok(got) = got else {
-        // This connection cannot even ask: another open's cleanup runs, or
-        // the database is in trouble. The next open tries again.
-        return;
-    };
-    // The answer is a row that holds the verdict: a `false` row means
-    // another cleanup runs, and this one stands down.
-    if !got.is_some_and(|row| row.get::<_, bool>(0)) {
-        return;
-    }
-    // The registry names every test schema with its start time, in
-    // `public`, spelled in full: the maker's search path is the
-    // database's default, and no test schema holds the table.
-    if let Ok(rows) = maker.query(
-        "SELECT r.schema FROM public.scion_test_schemas AS r
-         JOIN pg_catalog.pg_namespace AS n ON n.nspname = r.schema
-         WHERE r.started < extract(epoch from now())::bigint - 600
-           AND r.schema NOT IN (
-               SELECT application_name FROM pg_catalog.pg_stat_activity
-               WHERE application_name LIKE 'scion_test_%')",
-        &[],
-    ) {
-        for row in rows {
-            let name: String = row.get(0);
-            // Only the names this backend makes: no other schema drops,
-            // whatever a row of the registry names.
-            if !name.starts_with("scion_test_") {
-                continue;
-            }
-            if let Err(why) = maker.batch(&format!(
-                "DROP SCHEMA IF EXISTS {name} CASCADE;
-                 DELETE FROM public.scion_test_schemas WHERE schema = '{name}'"
-            )) {
-                tracing::warn!(schema = %name, error = %why, "cannot drop a stale test schema");
-            }
-        }
-    }
-    // The lock frees when this connection closes: a failed unlock needs
-    // nothing but the drop of the maker.
-    if let Err(why) = maker.query_opt("SELECT pg_advisory_unlock($1)", &[P::i64(CLEAN_LOCK)]) {
-        tracing::warn!(error = %why, "cannot unlock the test-schema cleanup");
-    }
-}
-
-/// The advisory lock of the test-schema cleanup.
-#[cfg(any(test, feature = "test-hooks"))]
-const CLEAN_LOCK: i64 = 0x5343_494F_4E53_5445;
 
 /// The libpq options of every connection of this backend. The commit of
 /// a transaction reaches the drive before it returns, and no statement
@@ -780,44 +703,6 @@ impl Pg {
         marker: Marker,
     ) -> Result<Self> {
         Self::open_in(url, ca, readers, data, None, true, marker)
-    }
-
-    /// [`Pg::open`], in `schema` instead of the database's default one, for
-    /// tests: each data directory gets its own corner of one database. The
-    /// schema is created if missing, and the migrations run in it.
-    ///
-    /// # Errors
-    ///
-    /// As [`Pg::open`].
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn open_test(
-        url: &str,
-        schema: &str,
-        readers: usize,
-        data: &Path,
-        marker: Marker,
-    ) -> Result<Self> {
-        prepare_test_schema(url, schema)?;
-        // The test store is the one server of its schema: it takes the
-        // per-schema one-server lock, and its loss fences the process,
-        // exactly as a serve does on the database key.
-        Self::open_in(url, None, readers, data, Some(schema), true, marker)
-    }
-
-    /// [`Pg::open_test`], as a process that does not land: it makes the
-    /// schema the same way and takes no one-server lock, and its loss
-    /// fences nothing, like a `gc`, `fsck` or `import` beside a live
-    /// server.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn open_test_shared(
-        url: &str,
-        schema: &str,
-        readers: usize,
-        data: &Path,
-        marker: Marker,
-    ) -> Result<Self> {
-        prepare_test_schema(url, schema)?;
-        Self::open_in(url, None, readers, data, Some(schema), false, marker)
     }
 
     /// [`Pg::open`], in the search path of `schema` when it is set.
@@ -928,7 +813,7 @@ impl Pg {
             write_woken: Condvar::new(),
             derive: crate::derived::DeriveFlights::new(crate::store::DERIVE_WALKS_CAP),
             #[cfg(any(test, feature = "test-hooks"))]
-            hooks: crate::store::ImportHooks::default(),
+            hooks: crate::store::test_hooks::ImportHooks::default(),
             metrics: std::sync::OnceLock::new(),
         });
         // The probe of a server that lost its lock: once a minute the
@@ -1171,13 +1056,6 @@ impl Pg {
     /// The walks in flight of this backend's derivations.
     pub(crate) fn derive_flights(&self) -> &crate::derived::DeriveFlights {
         &self.inner.derive
-    }
-
-    /// The import's test hooks and busy-retry count.
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[must_use]
-    pub(crate) fn hooks(&self) -> &crate::store::ImportHooks {
-        &self.inner.hooks
     }
 
     /// How many writers wait for the write client right now.
@@ -1659,12 +1537,6 @@ fn server_lock_raw(client: &mut Client, key: i64) -> bool {
         .is_ok_and(|row| row.is_some_and(|row| row.get::<_, bool>(0)))
 }
 
-/// A plain connection. Only the test schema's preparation calls it.
-#[cfg(any(test, feature = "test-hooks"))]
-fn connect(url: &str, ca: Option<&Path>) -> Result<PgClient> {
-    connect_with(url, ca, "", None)
-}
-
 /// Connects one client of `url`, with libpq `options` added. The connect
 /// runs on a plain thread: `postgres` drives its own runtime, which must
 /// not start inside the server's tokio one.
@@ -1957,14 +1829,6 @@ fn load_tree(c: &PgClient, id: TreeId) -> Result<(Tree, Vec<u8>)> {
     Ok((tree, body))
 }
 
-/// The error of a graph walk that reached its bound.
-#[cfg(any(test, feature = "test-hooks"))]
-fn too_deep(max_visits: usize) -> Error {
-    Error::ResourceExhausted(format!(
-        "the history is too deep: the answer needs more than {max_visits} changesets"
-    ))
-}
-
 fn to_id(bytes: &[u8]) -> Result<ChangesetId> {
     ChangesetId::try_from(bytes).map_err(|e| Error::Corrupt(format!("stored changeset ID: {e}")))
 }
@@ -2202,7 +2066,7 @@ impl MetaTx for PgTx<'_> {
                 continue;
             }
             if seen.len() > max_visits {
-                return Err(too_deep(max_visits));
+                return Err(test_hooks::too_deep(max_visits));
             }
             stack.extend(self.parents(id, id_gen)?);
         }
@@ -3119,43 +2983,6 @@ impl Meta for Pg {
     }
 }
 
-/// Makes the test schema, and registers it, before any connection
-/// narrows its search path to it. One maker at a time: two concurrent
-/// `CREATE TABLE IF NOT EXISTS` of the registry race on the type
-/// catalog, and the loser dies.
-#[cfg(any(test, feature = "test-hooks"))]
-fn prepare_test_schema(url: &str, schema: &str) -> Result<()> {
-    let preparer = connect(url, None)?;
-    preparer.as_raw({
-        let name = schema.to_owned();
-        move |client| {
-            client
-                .batch_execute(&format!("SET application_name TO '{name}'"))
-                .map_err(map_pg_error)
-        }
-    })?;
-    drop_stale_schemas(&preparer);
-    preparer.as_raw({
-        let name = schema.to_owned();
-        move |client| {
-            client
-                .batch_execute(&format!(
-                    "SELECT pg_advisory_xact_lock({CLEAN_LOCK});
-                         CREATE SCHEMA IF NOT EXISTS {name};
-                         CREATE TABLE IF NOT EXISTS public.scion_test_schemas (
-                             schema  TEXT PRIMARY KEY,
-                             started BIGINT NOT NULL
-                         );
-                         INSERT INTO public.scion_test_schemas (schema, started)
-                         VALUES ('{name}', extract(epoch from now())::bigint)
-                         ON CONFLICT (schema) DO UPDATE SET started = excluded.started"
-                ))
-                .map_err(map_pg_error)
-        }
-    })?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Client, NoTls, P, merged_options};
@@ -3200,9 +3027,9 @@ mod tests {
         if !crate::Backend::test_is_postgres() {
             return;
         }
-        let url = crate::backend::test_url().unwrap();
+        let url = crate::backend::test_hooks::test_url().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let schema = crate::backend::test_schema(dir.path());
+        let schema = crate::backend::test_hooks::test_schema(dir.path());
         // The blob files, made by this build's writer and copied into the
         // old store's object folder: blob files carry no schema.
         let (blob_a, blob_b) = {
@@ -3346,9 +3173,9 @@ mod tests {
         if !crate::Backend::test_is_postgres() {
             return;
         }
-        let url = crate::backend::test_url().unwrap();
+        let url = crate::backend::test_hooks::test_url().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let schema = crate::backend::test_schema(dir.path());
+        let schema = crate::backend::test_hooks::test_schema(dir.path());
         let metrics = std::sync::Arc::new(crate::metrics::Metrics::default());
         let pg = Pg::open_test(
             &url,
