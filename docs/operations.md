@@ -729,6 +729,160 @@ of one operation.
 A ticket refusal, an access refusal, or a corrupt blob each log one line
 per event, never the bytes or the token that caused them.
 
+### Latency p99 high
+
+`LatencyP99High` fires when one RPC's 99th-percentile duration has sat
+over 4 s for 15 minutes. One slow RPC is that call's path; every RPC
+slow at once is the machine or the store under everything.
+
+Find the RPC and the bucket its p99 sits in — the first `le` whose
+cumulative count reaches 99% of the RPC's calls:
+
+```sh
+curl -s 127.0.0.1:9100/metrics | awk '
+  /^scion_request_seconds_bucket/ {
+    match($0, /rpc="[^"]*"/); rpc = substr($0, RSTART + 5, RLENGTH - 6)
+    match($0, /le="[^"]*"/);  le  = substr($0, RSTART + 4, RLENGTH - 5)
+    n[rpc]++; b[rpc, n[rpc]] = le; c[rpc, n[rpc]] = $NF
+  }
+  END {
+    for (r in n) {
+      total = c[r, n[r]] + 0
+      for (i = 1; i <= n[r]; i++)
+        if (c[r, i] + 0 >= 0.99 * total) { print r, "p99 in", b[r, i]; break }
+    }
+  }'
+```
+
+Tell the causes apart by which RPC is slow:
+
+- A write RPC (`Scion/Land`, `Scion/CreateChangeset`): the store's
+  fsyncs. `BlobSyncSlow` fires beside it when the mean fsync passes 2 s;
+  if it does, the drive is the cause, and the fix is faster storage or
+  fewer imports beside serving (section 5's import routine).
+- A read RPC (`Objects/GetObjects`, `Objects/ReadFile`):
+  `scion_cache_misses_total` rising on the tier in front points at cache
+  misses (the tier miss rate runbook below); `scion_pg_pool_wait_seconds`
+  with a rising tail (Postgres) points at readers held by long walks
+  (the pool metrics above); a partial reader's slow first read of a rule
+  set is the view memo warming (the runbook below).
+- Every RPC: the host is short of CPU, memory or disk headroom; the
+  fixes are off the server (move imports, scale out, add a cache).
+
+Escalate when a read RPC's p99 stays over 4 s with the caches warm and
+the drive quiet: that is a store shape a restart does not fix, and it
+needs the store's owner.
+
+Proof: crates/scion-server/tests/docs_alerts.rs::latency_p99_names_the_slow_rpc_from_the_served_histogram
+
+### View memo bypassed
+
+`ViewMemoBypassed` fires when the rate of `scion_view_trees_walked_total`
+stays over 5 per second for 30 minutes: partial readers' view
+derivations keep opening real trees instead of finding the per-tree
+memo rows the derivation cached before (the `view_trees` table).
+
+Read the counter twice, a minute apart, and subtract:
+
+```sh
+curl -s 127.0.0.1:9100/metrics | grep '^scion_view_trees_walked_total'
+```
+
+Tell the causes apart:
+
+- The rate is high but falling, and the repo's tip moves fast: every new
+  changeset re-derives the folders its changes touched. That is the
+  design working — a new changeset walks only what moved — and no fix
+  applies. The alert's 30-minute `for` exists so this warmup does not
+  fire it.
+- The rate is high and steady: the same (tree, context) pairs derive
+  again and again. The memo rows were swept: rows of a rule-set digest
+  that no grant hashes to any more die in bounded steps, so a recent
+  change to the access file's read rules (or a projection upgrade) makes
+  every read walk until the rows rebuild. Restore the rules, or let the
+  first reads pay and the rate falls.
+- The rate is high, steady, and `LatencyP99High` fires on a read RPC
+  with it: the derivations hold the store's readers. On Postgres,
+  `scion_pg_readers_busy` pinned at 8 with a growing
+  `scion_pg_tx_age_seconds` says the walks hold the pool; raise the pool
+  or stagger the readers.
+
+Escalate when steady high walks and read latency land together and the
+access file has not changed for days: the working set outgrew the
+memo's shape, and it needs the store's owner.
+
+Proof: crates/scion-server/tests/docs_alerts.rs::view_memo_serves_the_second_read_of_one_changeset
+
+### Stalled replies high
+
+`StalledRepliesHigh` fires when `scion_stalled_reply_bytes` has sat over
+48 MiB for 15 minutes: replies whose clients stopped reading mid-reply
+hold their buffers in the server. The cap is `--max-stalled-bytes`
+(default 64 MiB) per connection; a connection over it is closed with
+everything it holds, and the server logs
+`closing a connection: its stalled replies hold too much` once, with the
+bytes it held.
+
+Read the gauge and find the client that stopped:
+
+```sh
+curl -s 127.0.0.1:9100/metrics | grep '^scion_stalled_reply_bytes'
+grep 'closing a connection' server.log
+```
+
+Tell the causes apart:
+
+- One client, once: a crashed reader or a paused consumer. The cap
+  already handled it — the buffers went with the connection. No fix.
+- The same client, again and again: its reader is slower than the
+  server's producer. Fix the client (read the reply as it streams; the
+  request's `request_id` names it in both logs).
+- Many clients, bytes near the cap on several connections: the replies
+  are large and the clients are many — raise
+  `--max-stalled-bytes` only if the box has the memory for it, or add a
+  cache tier so the large replies do not all reach the server.
+
+Escalate when the close notice repeats for one principal and the client
+is not yours to fix: the client's owner stops the waste, not the
+server.
+
+Proof: crates/scion-server/tests/log_stream.rs::a_stalled_log_reply_is_counted_and_closes_the_connection
+
+### Tier miss rate
+
+`TierMissRate` fires when a tier's misses have held over half its reads
+for 30 minutes: the tier fetches from upstream what it should have
+served from its own store.
+
+Read the two counters and divide — misses over all reads:
+
+```sh
+curl -s 127.0.0.1:9100/metrics \
+  | awk '/^scion_cache_hits_total/ {h = $NF}
+         /^scion_cache_misses_total/ {m = $NF}
+         END {if (h + m > 0) print m / (h + m)}'
+```
+
+Tell the causes apart:
+
+- The ratio falls over the first minutes after a tier restart: the
+  memory store is warming. No fix; a tier with `--snapshot` refills from
+  its snapshot file instead of its upstream, which is why the snapshot
+  flag exists (section 1).
+- The ratio is steady high and `CacheDown` is not firing: the working
+  set does not fit the tier's memory. Raise `--max-bytes` (and
+  `--snapshot-bytes`, so the snapshot can hold it), or put a tier near
+  each group of users instead of one tier for all.
+- The ratio is 1: nothing ever hits. The tier's store never sees a
+  second read of the same object — the clients are cold readers of
+  disjoint data, and a cache is the wrong tool for them; point the
+  clients at the server or accept the misses.
+
+Escalate when the ratio stays high with the caps raised and the box's
+memory free: the tier's placement or shape needs its owner.
+
+Proof: crates/scion-server/tests/docs_alerts.rs::tier_miss_ratio_falls_when_the_store_serves_the_second_read
+
 ## 7. Capacity
 
 What one server takes, measured on one named machine, so the numbers have
