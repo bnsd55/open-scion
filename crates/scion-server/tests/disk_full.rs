@@ -637,7 +637,7 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
     let data = dir.path().join("data");
     let store = Backend::open_test(&data).expect("the store opens");
     let _repo = store
-        .write(|c| c.create_repo("filler"))
+        .write(|c| c.create_repo(REPO))
         .expect("the repo lands");
     let outcome = loop {
         // A backstop: lands that never stop mean the fill was not full,
