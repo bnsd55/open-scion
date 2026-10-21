@@ -241,3 +241,94 @@ fn a_kill_during_a_schema_upgrade_leaves_the_old_schema_or_the_new_one() {
         assert_eq!(root_tree(&mut objects, root).await, Tree::default().id());
     });
 }
+
+/// The failed-migration runbook (docs/operations.md, "A failed
+/// migration"), step by step: an open of a database whose schema is
+/// newer than the build refuses, with both versions named; the fix is
+/// the old binary, or the restore of a backup per section 3; and the
+/// restored store serves. `user_version` is never edited by hand in
+/// the runbook - the test edits it only to forge the newer schema the
+/// error talks about.
+#[test]
+fn a_newer_schema_refuses_the_open_and_a_restore_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, log) = (dir.path().join("data"), dir.path().join("server.log"));
+    create_repo(&data);
+    let server = Server::start(&data, &log);
+    drop(server);
+
+    // The backup the runbook restores from: the server is stopped, so
+    // the copy of the directory is exact (section 3).
+    let backup = dir.path().join("backup");
+    fs::create_dir_all(&backup).unwrap();
+    for entry in fs::read_dir(&data).unwrap() {
+        let entry = entry.unwrap();
+        let target = backup.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+
+    // The database is ahead of the binary: the runbook's error case,
+    // forged the only way a test can - the version of a future schema.
+    let version = schema(&data).version;
+    let c = rusqlite::Connection::open(data.join("scion.db")).unwrap();
+    c.execute_batch(&format!("PRAGMA user_version = {}", version + 1))
+        .unwrap();
+    drop(c);
+
+    // The operator's start: the server refuses to open, and the error
+    // names both versions - the data's and the build's.
+    let mut refused = Server::spawn(&data, &log);
+    let started = Instant::now();
+    loop {
+        if let Some(status) = refused.try_wait() {
+            assert!(!status.success(), "the server served a newer schema");
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the server neither served nor refused"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let text = fs::read_to_string(&log).unwrap();
+    // The refusal names both versions, the whole phrase the code writes:
+    // the data's (the forged version+1) and the build's.
+    assert!(
+        text.contains(&format!(
+            "database schema version {} is newer than this build ({})",
+            version + 1,
+            version
+        )),
+        "the refusal names both versions: {text}"
+    );
+
+    // The fix, the restore arm: the backup's database replaces the
+    // forged one (the WAL of the refused open goes with it), and the
+    // server starts and serves.
+    fs::remove_file(data.join("scion.db-wal")).ok();
+    fs::remove_file(data.join("scion.db-shm")).ok();
+    fs::copy(backup.join("scion.db"), data.join("scion.db")).unwrap();
+    let server = Server::start(&data, &log);
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let (_, mut objects) = connect(&server.url).await.unwrap();
+        let _ = resolve_ref(&mut objects, "main").await.unwrap();
+    });
+}
+
+/// A recursive copy of one directory tree, for the runbook's backup.
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}

@@ -536,6 +536,26 @@ schema 4 walks every repo's changesets). Two rules:
   migration waits for them to stop: the error says `stop the other processes
   that use ...`. One process at a time migrates.
 
+### A failed migration
+
+A migration that cannot finish leaves the database at one whole step, so
+the two failures an operator sees are the two rules above, and the runbook
+is the rule that names the case:
+
+1. The open refuses with `schema version N is newer than this build`:
+   the data ran on a newer build than this binary. The fix is the old
+   binary, or the restore of section 3. Never edit `user_version` by
+   hand: the version is the migration's bookmark, and a hand-moved one
+   leaves the database half-migrated in a way no migration can finish.
+2. The start waits with `stop the other processes that use ...`: another
+   process holds the directory. Stop it; the migration runs on the next
+   start.
+
+After the fix, the server starts and serves; `fsck` says the store is
+whole.
+
+Proof: crates/scion-server/tests/crash.rs::a_newer_schema_refuses_the_open_and_a_restore_serves
+
 An import reads git revision `--rev` (default `HEAD`) into scion repo
 `--repo` (default `main`), and points scion ref `--ref` (default `main`)
 at the imported tip. Besides every root and merge, it re-checks `--verify`
@@ -564,6 +584,14 @@ The routines are these:
 - `fsck` on a schedule (it is read-only, so it can run beside a live
   server), and always on a fresh backup copy. Exit 1 with the problem lines
   is the signal to restore from a backup; there is no automatic repair.
+
+  An fsck failure (exit 1) is the restore runbook of section 3, and the
+  test that proves it is the failing-disk runbook's: damage on disk,
+  the `fsck` command to its exit 1 with the problem named, the restore
+  into a fresh directory, and fsck clean on the restored copy before
+  the server starts.
+
+  Proof: crates/scion-server/tests/storage.rs::a_failing_disk_runbook_fscks_restores_and_serves
 - `tmp/` needs no attention: every open removes the staging folders of dead
   processes, and a lone open also removes files a build older than the
   schema left there.
@@ -617,6 +645,74 @@ in the scrape.
   versions itself.
 - A cache is stateless except its snapshots: its whole state is memory plus
   the snapshot files, so restart it whenever you like.
+
+### Disk full
+
+The disk the data directory sits on has two alerts: `DiskNearlyFull` at
+10 GiB free and `DiskFull` at 1 GiB free. At either one:
+
+1. Run the gc routine (above): first a `--dry-run` to see what it would
+   collect, then a real run. The collector is safe beside a live server,
+   and on a store whose repos grew by accident (a forgotten import, a
+   test repo nobody removed), this alone frees the space.
+2. Run `fsck` when the run ends. A full disk can leave a write that
+   failed mid-way; fsck tells you whether anything was damaged (there
+   is no repair: restore from a backup, section 3, when it reports one).
+3. If gc collected too little, the data is bigger than the disk: grow
+   the volume, or move the data directory to a bigger one (a stop, a
+   copy per section 3, a start at the new path). Growing a mounted
+   volume needs no restart: the next write sees the new size.
+
+Nothing in the store needs repair because the disk filled: a write that
+failed out-of-space left no torn file, and when space is back, writes
+resume with no restart. A blob whose upload was refused must be uploaded
+again by the client; the server never kept half of it.
+
+Proof: crates/scion-server/tests/disk_full.rs::a_disk_full_runbook_gcs_then_writes_resume
+
+### A failing disk
+
+A disk that fails reads does not fail writes: a read whose file the disk
+cannot serve answers an internal error (the client retries into the same
+device, so do not loop), and the rest of the store keeps serving. On the
+first internal error from a read:
+
+1. Run `fsck` (it is read-only, so it can run beside the live server).
+   Exit 1 with the problem lines names the damage; the store has no
+   repair.
+2. If fsck reports damage, restore from a backup (section 3): a fresh
+   directory gets the metadata snapshot and the objects copy, fsck runs
+   on it, and the server starts at the new path. A read that failed and
+   later succeeds means the disk recovered, not that the damage was
+   never there: run fsck anyway.
+
+Proof: crates/scion-server/tests/storage.rs::a_failing_disk_runbook_fscks_restores_and_serves
+
+### A Postgres restart
+
+A Postgres-backed server keeps running when the database restarts under
+it: the calls that touch the database answer while it is down (a write
+answers the busy error a client retries against), the store does not
+fence itself (an unreachable database is no proof that another process
+took the data), and no server restart is part of the fix. When the
+database is back, the next write reconnects, takes the advisory lock
+again, and runs; nothing needs cleaning up by hand. The runbook is:
+
+1. Watch `scion_pg_pool_wait_seconds` and the busy errors: they tell a
+   database that is down from one that is slow.
+2. Fix the database (restart the container or the service); the server
+   needs nothing.
+3. After the restart, one write is the check: it runs, and the reads
+   behind it see the data. If a write keeps failing after the database
+   is back, the fence is the suspect: the fence is section 1's "One
+   server process serves one database" - a fenced server exits 70, and
+   a supervisor restart of it takes the lock back or refuses.
+
+The one thing not to do: do not restart the server while the database
+is down. A start against an unreachable database fails, and a restart
+throws away the sessions that would reconnect on their own.
+
+Proof: crates/scion-server/tests/backend_refusals.rs::an_unreachable_database_is_not_a_takeover
 
 ## 6. What to watch
 

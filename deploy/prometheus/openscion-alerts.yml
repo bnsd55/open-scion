@@ -73,8 +73,8 @@ groups:
           severity: high
         annotations:
           response: >-
-            Run the gc routine (docs/operations.md section 5) and check
-            the backup (section 3).
+            Run the disk-full runbook (docs/operations.md#disk-full) and
+            check the backup (section 3).
       - alert: DiskFull
         expr: scion_data_free_bytes < 1 * 1024 * 1024 * 1024
         for: 5m
@@ -82,7 +82,8 @@ groups:
           severity: critical
         annotations:
           response: >-
-            Writes fail soon (docs/operations.md sections 5 and 3).
+            Writes fail soon (docs/operations.md#disk-full); restore
+            from a backup (section 3) when fsck reports damage.
       - alert: BlobSyncSlow
         expr: >-
           sum(rate(scion_blob_sync_seconds_sum[10m]))

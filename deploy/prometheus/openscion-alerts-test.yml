@@ -204,8 +204,8 @@ tests:
               severity: high
             exp_annotations:
               response: >-
-                Run the gc routine (docs/operations.md section 5) and
-                check the backup (section 3).
+                Run the disk-full runbook (docs/operations.md#disk-full)
+                and check the backup (section 3).
       - eval_time: 3m
         alertname: DiskNearlyFull
         exp_alerts: []
@@ -231,7 +231,8 @@ tests:
               severity: critical
             exp_annotations:
               response: >-
-                Writes fail soon (docs/operations.md sections 5 and 3).
+                Writes fail soon (docs/operations.md#disk-full); restore
+                from a backup (section 3) when fsck reports damage.
   - interval: 1m
     input_series:
       - series: "scion_data_free_bytes"
