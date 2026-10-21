@@ -9,6 +9,9 @@ itself: each step is run by a person.
 
 ## Before a release
 
+- Run the drills of docs/drills/ that the release's milestone lists on
+  the release candidate, and record each run beside the template there
+  (a drill is the proof of a runbook step no CI test can run).
 - Every required check is green on the release commit. A red check
   blocks the release; `gh pr checks` on the release PR lists them.
 - The milestone for the version has no open issues but the release's
