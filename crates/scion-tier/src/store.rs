@@ -1521,8 +1521,7 @@ impl DiskStore {
         // An in-memory connection takes the index's place, so the real
         // one closes here, as the death of the process closes it. The
         // stand-in closes with the store.
-        disk.conn = rusqlite::Connection::open_in_memory()
-            .expect("the stand-in connection opens");
+        disk.conn = rusqlite::Connection::open_in_memory().expect("the stand-in connection opens");
         disk.pending.clear();
         disk.pending_bytes = 0;
         disk.newest.clear();
