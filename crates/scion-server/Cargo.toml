@@ -48,7 +48,6 @@ tonic-health.workspace = true
 tokio-rustls.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-serde_json.workspace = true
 zstd.workspace = true
 postgres = "0.19"
 tokio-postgres-rustls = "0.14"
