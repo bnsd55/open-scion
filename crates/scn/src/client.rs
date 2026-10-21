@@ -37,11 +37,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// plus its timeout, not at this client's 600 s deadline.
 fn live(endpoint: Endpoint) -> Endpoint {
     use scion_proto::runtime::listen as keepalive;
+    let (interval, timeout) = keepalive::client_keepalive();
     endpoint
-        .http2_keep_alive_interval(keepalive::CLIENT_KEEPALIVE_INTERVAL)
-        .keep_alive_timeout(keepalive::CLIENT_KEEPALIVE_TIMEOUT)
+        .http2_keep_alive_interval(interval)
+        .keep_alive_timeout(timeout)
         .keep_alive_while_idle(true)
-        .tcp_keepalive(Some(keepalive::CLIENT_TCP_KEEPALIVE))
+        .tcp_keepalive(Some(keepalive::client_tcp_keepalive()))
 }
 
 /// Most bytes that the parts of one streamed reply may join to. The server

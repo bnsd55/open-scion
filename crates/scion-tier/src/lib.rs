@@ -497,11 +497,12 @@ impl<S: Store> Tier<S> {
         // that died without a FIN or RST is noticed in about
         // `CLIENT_KEEPALIVE_INTERVAL` plus its timeout, not at the tier's
         // upstream timeout of a whole call.
+        let (interval, answer) = scion_proto::runtime::listen::client_keepalive();
         let channel = endpoint
-            .http2_keep_alive_interval(scion_proto::runtime::listen::CLIENT_KEEPALIVE_INTERVAL)
-            .keep_alive_timeout(scion_proto::runtime::listen::CLIENT_KEEPALIVE_TIMEOUT)
+            .http2_keep_alive_interval(interval)
+            .keep_alive_timeout(answer)
             .keep_alive_while_idle(true)
-            .tcp_keepalive(Some(scion_proto::runtime::listen::CLIENT_TCP_KEEPALIVE))
+            .tcp_keepalive(Some(scion_proto::runtime::listen::client_tcp_keepalive()))
             .connect_lazy();
         let bearer = if upstream_token.is_empty() {
             None

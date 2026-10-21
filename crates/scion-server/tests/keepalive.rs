@@ -19,7 +19,7 @@ use scion_server::test_support::meta::MetaTx as _;
 /// deadline of a call. The frozen server holds the socket open and
 /// answers nothing, which is what a kill without a FIN or RST leaves:
 /// the process gone, the connection half-dead.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn a_call_to_a_frozen_server_ends_within_the_keepalive_window() {
     let dir = tempfile::tempdir().unwrap();
     let (data, log) = (dir.path().join("data"), dir.path().join("server.log"));
@@ -27,7 +27,12 @@ async fn a_call_to_a_frozen_server_ends_within_the_keepalive_window() {
     let mut server = Server::start(&data, &log);
 
     // The product client, as `scn` builds it: the same deadlines and the
-    // same keepalive every command uses.
+    // same keepalive every command uses. The keepalive is the seam's:
+    // the channel was already connected before the freeze, so a ping
+    // goes to a peer that answers nothing, and the shortened keepalive
+    // (1 s, 1 s) proves the same dead-peer failure in seconds.
+    scion_proto::runtime::listen::CLIENT_KEEPALIVE_OVERRIDE
+        .with(|keepalive| keepalive.set(Some((Duration::from_secs(1), Duration::from_secs(1)))));
     let mut client =
         open_scion::client::Ctx::connect(&server.url, None, TOKEN, None, "r".to_owned(), false)
             .await
@@ -46,12 +51,14 @@ async fn a_call_to_a_frozen_server_ends_within_the_keepalive_window() {
         "the failure says the peer is gone, not something else: {why}"
     );
     assert!(
-        waited < Duration::from_secs(60),
-        "the call took {waited:?}: that is the deadline, not the keepalive"
+        waited < Duration::from_secs(30),
+        "the call took {waited:?}: that is the product's keepalive, so the \
+         seam did not shorten it"
     );
 
     // The frozen server wakes, and the test's own drop of it stops it:
     // the client's error must not depend on the server staying frozen.
+    scion_proto::runtime::listen::CLIENT_KEEPALIVE_OVERRIDE.with(|keepalive| keepalive.set(None));
     kill_process(
         rustix::process::Pid::from_raw(server.pid().cast_signed()).unwrap(),
         Signal::CONT,
@@ -61,7 +68,7 @@ async fn a_call_to_a_frozen_server_ends_within_the_keepalive_window() {
 
 /// The store a stopped server was serving stays readable: the freeze
 /// broke no data.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn the_store_of_a_frozen_server_is_intact() {
     let dir = tempfile::tempdir().unwrap();
     let (data, log) = (dir.path().join("data"), dir.path().join("server.log"));

@@ -17,3 +17,9 @@ connection half-dead: the socket is open and nothing answers. The
 server already closed its side of such connections; the clients now
 see the same thing from their side, and the values are named
 constants beside the server's own, so the pair stays a pair.
+
+A test that proves the dead-peer failure needs no 40 s of its own:
+the `test-hooks` feature of the protocol crate shortens the keepalive
+for the test's connection, the same failure is proved in seconds, and
+compile-time asserts pin the product constants at their documented
+values.

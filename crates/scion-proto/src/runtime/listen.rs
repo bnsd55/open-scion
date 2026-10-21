@@ -109,6 +109,39 @@ pub const CLIENT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// HTTP/2 interval, so a dead connection is visible below HTTP/2 too.
 pub const CLIENT_TCP_KEEPALIVE: Duration = Duration::from_secs(15);
 
+const _: () = assert!(CLIENT_KEEPALIVE_INTERVAL.as_secs() == 30);
+const _: () = assert!(CLIENT_KEEPALIVE_TIMEOUT.as_secs() == 10);
+const _: () = assert!(CLIENT_TCP_KEEPALIVE.as_secs() == 15);
+
+thread_local! {
+    /// A test's shorter keepalive, as `(interval, timeout)`: the same
+    /// dead-peer failure is proved in seconds, and the product
+    /// constants above stay the documented ones. `None` is the product.
+    /// Thread-local, and it applies only to connections built on the
+    /// thread that set it.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub static CLIENT_KEEPALIVE_OVERRIDE: std::cell::Cell<Option<(Duration, Duration)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The keepalive a client of a scion server runs: the interval it pings
+/// at, and the time an answer gets, as `(interval, timeout)`.
+#[must_use]
+pub fn client_keepalive() -> (Duration, Duration) {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if let Some(keepalive) = CLIENT_KEEPALIVE_OVERRIDE.with(std::cell::Cell::get) {
+        return keepalive;
+    }
+    (CLIENT_KEEPALIVE_INTERVAL, CLIENT_KEEPALIVE_TIMEOUT)
+}
+
+/// The TCP keepalive probe interval of a client connection.
+#[must_use]
+pub fn client_tcp_keepalive() -> Duration {
+    CLIENT_TCP_KEEPALIVE
+}
+
 /// A connection that was asked to close is closed this long later, with any
 /// call still in it. At least the server's longest call (600 s).
 pub const CONNECTION_GRACE: Duration = Duration::from_secs(600);
