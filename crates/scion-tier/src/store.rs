@@ -2268,7 +2268,7 @@ mod tests {
         fs::create_dir_all(stray_path.parent().unwrap()).unwrap();
         fs::write(&stray_path, &stray.1).unwrap();
         {
-        let store = reopen(&data, 1 << 20);
+            let store = reopen(&data, 1 << 20);
             assert_eq!(store.size(a.0).unwrap(), Some(a.1.len()));
             assert_eq!(store.size(stray.0).unwrap(), None);
             assert!(store.walk_state().is_none());
@@ -2278,7 +2278,7 @@ mod tests {
         // never reached a committed batch. The next start walks, and
         // adopts the stray, and nothing else.
         {
-        let store = reopen(&data, 1 << 20);
+            let store = reopen(&data, 1 << 20);
             store.put(a.0, &a.1).unwrap();
             store.crash();
         }
@@ -2345,7 +2345,7 @@ mod tests {
         {
             // The crash loses what was not committed: `c` dropped `a` and
             // its put was committed at once; the use of `b` was not.
-        let store = reopen(&data, limit);
+            let store = reopen(&data, limit);
             store.put(c.0, &c.1).unwrap();
             assert!(!store.path(a.0).exists());
             assert_eq!(store.size(b.0).unwrap(), Some(n));
@@ -2461,7 +2461,7 @@ mod tests {
         ] {
             remove_db(&data);
             put_old_back(&data, index);
-        let store = reopen(&data, 1 << 20);
+            let store = reopen(&data, 1 << 20);
             let found = store.size(stray.0).unwrap().is_some();
             assert_eq!(found, scans, "{case}");
             assert_eq!(store.size(b.0).unwrap(), Some(b.1.len()), "{case}");
@@ -2598,7 +2598,7 @@ mod tests {
         let limit = 2 * n + n / 2;
         {
             // The crash: a stop never came, so the next start walks.
-        let store = reopen(&data, limit);
+            let store = reopen(&data, limit);
             store.put(a.0, &a.1).unwrap();
             store.put(b.0, &b.1).unwrap();
             // Their last uses are committed, so the files that the walk
@@ -2722,7 +2722,7 @@ mod tests {
             if scan {
                 remove_db(&data);
             }
-        let store = reopen(&data, 1 << 20);
+            let store = reopen(&data, 1 << 20);
             assert_eq!(store.size(key).unwrap(), Some(size));
             assert_eq!(store.get(key, size).unwrap(), None);
             assert_eq!(store.size(key).unwrap(), None);
