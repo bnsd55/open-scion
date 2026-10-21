@@ -1043,3 +1043,19 @@ container's, not a file tree the script can measure. RSS is the server's
 at the end of the cell: a capacity cell is minutes long, not the hours a
 warm-up would need, so it is a level, not a leak bound - the leak bound
 is the soak's.
+
+Recovery is a measured time too, not a promise: the `recovery-bench`
+workflow (a run on `main` or a dispatch, on the fixed `ubuntu-24.04`
+runner, never a local machine) builds a stated store - 20 repos, 1000
+changesets, 31 MiB of raw blob content in files of about 32 KiB, and 5
+lands recorded pending - starts a server on it, flies lands through the
+wire for two seconds, kills the server with SIGKILL mid-land, and then
+measures from the restart's command until readiness answers `SERVING`
+and the first read resolves a ref. It prints the seconds and fails past
+a 60 s bound. The kill is the runbook's crash: no flush, no drain -
+whatever the write-ahead log holds is what recovery starts from. The
+current numbers live in the workflow's run log on `main`, and a run
+that drifts far from them is a regression to look at, not a promise to
+restate here.
+
+Proof: crates/scion-server/tests/recovery_bench.rs::a_restart_after_a_kill_recovers_in_a_stated_time
