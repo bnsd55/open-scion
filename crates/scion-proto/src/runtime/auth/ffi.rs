@@ -26,6 +26,10 @@ const ACL_EXTENDED_DENY: c_int = 0x0002;
 /// `ENOENT`: the errno `acl_get_fd_np` sets when the descriptor carries
 /// no ACL at all.
 const ENOENT: c_int = 2;
+/// `EINVAL`: the errno `acl_get_entry` sets when `entry_id` is
+/// `ACL_NEXT_ENTRY` and the last entry has already been returned — the
+/// walk's end (`sys/acl.h`, the `acl_get_entry` man page).
+const EINVAL: c_int = 22;
 
 /// `ACL_UNDEFINED_ID`: the qualifier of an entry that names everyone
 /// (`sys/acl.h`).
@@ -90,6 +94,30 @@ fn entry_who(entry: *mut c_void) -> Option<u32> {
     (freed == 0 && named != ACL_UNDEFINED_ID).then_some(named)
 }
 
+/// What one `acl_get_entry` call did: returned an entry, ended the
+/// walk, or failed. macOS signals the walk's end with -1 and `EINVAL`
+/// (`entry_id` is `ACL_NEXT_ENTRY` and the last entry has already been
+/// returned). The handle was obtained and the walk started at
+/// `ACL_FIRST_ENTRY`, so `EINVAL` on a `ACL_NEXT_ENTRY` call can only
+/// mean the end; any other failure must not pass for it.
+fn walk_step(entry_id: c_int, got: c_int, errno: c_int) -> Step {
+    if got == 0 {
+        return Step::Entry;
+    }
+    if entry_id == ACL_NEXT_ENTRY && errno == EINVAL {
+        return Step::End;
+    }
+    Step::Failed
+}
+
+/// One step of the `fd_acl` walk.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Step {
+    Entry,
+    End,
+    Failed,
+}
+
 pub(crate) fn fd_acl(fd: std::os::fd::RawFd) -> Verdict {
     // SAFETY: `acl_get_fd_np` reads the descriptor's ACL and returns a
     // handle the caller must release with `acl_free`; it writes nothing
@@ -117,13 +145,19 @@ pub(crate) fn fd_acl(fd: std::os::fd::RawFd) -> Verdict {
         // `ACL_NEXT_ENTRY` until the header says it is over.
         let mut entry: *mut c_void = std::ptr::null_mut();
         let got = unsafe { acl_get_entry(acl, entry_id, &raw mut entry) };
-        if got != 0 {
-            // The walk is over, or it failed: both end it. An ACL whose
-            // entries were all read and typed named no grant, so the
-            // verdict stands; a failed walk cannot vouch for the rest.
-            let failed = entry_id != ACL_FIRST_ENTRY && got != 1 && !entry.is_null();
-            let _ = failed;
-            break;
+        // The errno the call just set: read it now, before anything
+        // else can clobber it.
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        match walk_step(entry_id, got, errno) {
+            Step::Entry => {}
+            Step::End => break,
+            // A walk that failed cannot vouch for the entries it did
+            // not read, so the ACL is treated as granting: this check
+            // never accepts what it cannot read whole.
+            Step::Failed => {
+                granting = Some(("an ACL whose walk failed", None));
+                break;
+            }
         }
         let mut tag: c_int = 0;
         // SAFETY: `entry` is the handle `acl_get_entry` just returned
@@ -144,8 +178,6 @@ pub(crate) fn fd_acl(fd: std::os::fd::RawFd) -> Verdict {
     }
     // SAFETY: `acl` is the same un-freed handle; `acl_free` releases it
     // exactly once on every path from here.
-    // SAFETY: `acl` is the same un-freed handle; `acl_free` releases it
-    // exactly once on every path from here.
     let freed = unsafe { acl_free(acl) };
     if freed != 0 {
         return Verdict::Granting("an ACL that could not be released", None);
@@ -153,5 +185,30 @@ pub(crate) fn fd_acl(fd: std::os::fd::RawFd) -> Verdict {
     match granting {
         Some((kind, who)) => Verdict::Granting(kind, who),
         None => verdict,
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_call_that_returns_is_an_entry() {
+        assert_eq!(walk_step(ACL_FIRST_ENTRY, 0, 0), Step::Entry);
+        assert_eq!(walk_step(ACL_NEXT_ENTRY, 0, 0), Step::Entry);
+    }
+
+    #[test]
+    fn the_walk_ends_on_einval_after_the_first_entry() {
+        assert_eq!(walk_step(ACL_NEXT_ENTRY, -1, EINVAL), Step::End);
+    }
+
+    #[test]
+    fn every_other_failure_fails_the_walk() {
+        // An error on the first call is not the end: no entry was read.
+        assert_eq!(walk_step(ACL_FIRST_ENTRY, -1, EINVAL), Step::Failed);
+        // Any other errno is a failure, wherever the walk stands.
+        assert_eq!(walk_step(ACL_NEXT_ENTRY, -1, ENOENT), Step::Failed);
+        assert_eq!(walk_step(ACL_FIRST_ENTRY, -1, 0), Step::Failed);
     }
 }
