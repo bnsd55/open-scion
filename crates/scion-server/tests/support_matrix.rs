@@ -337,3 +337,83 @@ fn matrix_rows() -> Vec<Row> {
     }
     rows
 }
+
+/// The release pipeline (`.github/workflows/release.yml`) reads its
+/// cells from `.github/release-cells.json`, and that file must say
+/// exactly what the matrix promises: a cell is a release cell when
+/// every shipped binary (server, cache, daemon, scn) is `supported` on
+/// that OS and architecture. A cell the release builds but the matrix
+/// does not back, or a supported cell the release omits, fails here —
+/// so coder1's support-matrix flip (#418) must move both files in one
+/// change.
+#[test]
+fn release_cells_are_exactly_the_fully_supported_ones() {
+    let path = Path::new(ROOT).join(".github/release-cells.json");
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} opens: {e}", path.display()));
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_str(&text).expect("release-cells.json is a JSON array");
+    let rows = matrix_rows();
+    let mut listed: Vec<(String, String)> = Vec::new();
+    for entry in &entries {
+        let cell = entry["cell"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a release cell has no name"));
+        let target = entry["target"]
+            .as_str()
+            .unwrap_or_else(|| panic!("release cell {cell} has no target"));
+        let (os, arch) = release_cell_of(target).unwrap_or_else(|| {
+            panic!("release cell {cell} has target {target}, which names no matrix OS and arch")
+        });
+        assert!(
+            !listed.contains(&(os.to_owned(), arch.to_owned())),
+            "release cell {cell} ({target}) is listed twice"
+        );
+        listed.push((os.to_owned(), arch.to_owned()));
+    }
+
+    // The shipped binaries, the four bins the release workflow builds.
+    // A cell belongs in release-cells.json exactly when every shipped
+    // binary is `supported` there. Sweep every (OS, arch) the matrix
+    // names: a cell the release builds but the matrix does not support
+    // fails, and so does a supported cell the release omits.
+    let shipped = ["scion-server", "scion-cache", "scion-daemon", "scn"];
+    let mut vocabulary: Vec<(String, String)> = Vec::new();
+    for row in &rows {
+        let pair = (row.os.clone(), row.arch.clone());
+        if shipped.contains(&row.component.as_str()) && !vocabulary.contains(&pair) {
+            vocabulary.push(pair);
+        }
+    }
+    for (os, arch) in &vocabulary {
+        let fully_supported = shipped.iter().all(|component| {
+            rows.iter().any(|row| {
+                row.component == *component
+                    && row.os == *os
+                    && row.arch == *arch
+                    && row.status == "supported"
+            })
+        });
+        let is_release_cell = listed.contains(&((*os).clone(), (*arch).clone()));
+        assert_eq!(
+            fully_supported, is_release_cell,
+            "{os} {arch}: the matrix says fully_supported={fully_supported} but \
+                release-cells.json says {is_release_cell}"
+        );
+    }
+    assert!(
+        listed.iter().all(|pair| vocabulary.contains(pair)),
+        "release-cells.json names an (OS, arch) the matrix has no shipped row for: {listed:?}"
+    );
+}
+
+/// The (OS, arch) a release target names, in the matrix's vocabulary.
+fn release_cell_of(target: &str) -> Option<(&'static str, &'static str)> {
+    match target {
+        "x86_64-unknown-linux-gnu" => Some(("Linux", "x64")),
+        "aarch64-unknown-linux-gnu" => Some(("Linux", "arm64")),
+        "aarch64-apple-darwin" => Some(("macOS", "arm64")),
+        "x86_64-pc-windows-msvc" => Some(("Windows", "x64")),
+        _ => None,
+    }
+}
