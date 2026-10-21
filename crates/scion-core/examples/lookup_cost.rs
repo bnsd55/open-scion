@@ -100,17 +100,21 @@ fn main() {
     let start = Instant::now();
     for _ in 0..rounds {
         if what == "old" {
-            assert!(Tree::decode(&body)
-                .unwrap()
-                .entries()
-                .clone()
-                .remove(&PathElem::new("f90000a".to_string()).unwrap())
-                .is_none());
+            assert!(
+                Tree::decode(&body)
+                    .unwrap()
+                    .entries()
+                    .clone()
+                    .remove(&PathElem::new("f90000a".to_string()).unwrap())
+                    .is_none()
+            );
         } else {
             assert!(Tree::find_entry(&body, near_end_miss).unwrap().is_none());
         }
     }
     let near_end_us = start.elapsed().as_micros() / rounds;
 
-    println!("{what}: a hit costs {hit_us} us, a near-end miss {near_end_us} us, a miss past the last name {miss_us} us, per lookup");
+    println!(
+        "{what}: a hit costs {hit_us} us, a near-end miss {near_end_us} us, a miss past the last name {miss_us} us, per lookup"
+    );
 }
