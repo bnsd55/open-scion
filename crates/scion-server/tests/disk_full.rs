@@ -11,7 +11,7 @@
 //! `mount`, `remount`, and `umount` commands themselves.
 mod common;
 
-use scion_core::{Changeset, IdentityTime, RepoPath};
+use scion_core::{Changeset, FileState, RepoPath};
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::tree;
 use scion_server::test_support::write;
@@ -531,25 +531,37 @@ fn fill(client: &mut postgres::Client, chunk_len: usize) -> Option<postgres::Err
 
 /// A changeset whose rows are wide: many entries, each naming a path,
 /// so one land's metadata write must grow the database.
-fn wide_changeset(store: &Backend, name: &str) -> Changeset {
+/// The paths the lands rewrite: the root creates them, and each land
+/// either deletes or re-creates the set, so one land's metadata write
+/// is wide and the next land applies onto it.
+const WIDE_PATHS: usize = 400;
+
+fn wide_changeset(
+    store: &Backend,
+    name: &str,
+    create: bool,
+    blob: scion_core::BlobId,
+) -> Changeset {
     let base = store
         .read(|c| {
             let repo = c.repo_id(REPO)?;
             Ok(c.get_ref(repo, "main")?.expect("main exists").target)
         })
         .unwrap();
-    let author = IdentityTime::new(
-        b"Ada".to_vec(),
-        b"ada@example.com".to_vec(),
-        1_700_000_000,
-        0,
-    )
-    .expect("identity fits the format");
-    let puts: std::collections::BTreeMap<_, _> = (0..400)
+    let author = crate::common::author();
+    let entries: std::collections::BTreeMap<_, _> = (0..WIDE_PATHS)
         .map(|i| {
+            let state = if create {
+                Some(FileState::Regular {
+                    content: blob,
+                    executable: false,
+                })
+            } else {
+                None
+            };
             (
-                RepoPath::new(format!("d/{name}/f{i}.txt").as_str()).unwrap(),
-                None,
+                RepoPath::new(format!("d/wide/f{i}.txt").as_str()).unwrap(),
+                state,
             )
         })
         .collect();
@@ -558,7 +570,7 @@ fn wide_changeset(store: &Backend, name: &str) -> Changeset {
         author,
         None,
         format!("{name}\n").into_bytes(),
-        puts,
+        entries,
     )
     .expect("changeset fits the format")
 }
@@ -657,12 +669,13 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
             Ok(())
         })
         .expect("the repo and its main land");
+    let blob = store.blobs().put(&incompressible(64)).unwrap();
     let outcome = loop {
         // A backstop: lands that never stop mean the fill was not full,
         // which is this test's own failure, not the server's.
         assert!(landed < 5000, "the lands never hit the database's limit");
         landed += 1;
-        let cs = wide_changeset(&store, &format!("fill{landed}"));
+        let cs = wide_changeset(&store, &format!("fill{landed}"), landed % 2 == 1, blob);
         match write::create_changeset(&store, REPO, &cs.encode()) {
             Ok(_) => {}
             Err(e) => break e,
