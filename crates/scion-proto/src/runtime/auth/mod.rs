@@ -261,6 +261,15 @@ pub fn read_secret_file(file: &Path) -> io::Result<Vec<u8>> {
     read_checked_file(file, true)
 }
 
+/// The most bytes [`read_secret_file`] and [`read_shared_file`] take
+/// whole. The largest legitimate caller is the access file's worst
+/// case — 32 rule sets of 256 prefixes, about 800 KB — so 1 MiB covers
+/// every token, URL, key and access file with room, and anything past
+/// it is refused without a read. The snapshot reader streams through
+/// [`open_checked_file`](Self::open_checked_file) instead and holds no
+/// cap: a snapshot is the size of a disk by design.
+pub(crate) const MAX_CHECKED_FILE: u64 = 1024 * 1024;
+
 /// Reads `file` that is public but must stay whole, such as the public key
 /// that a ticket rotation keeps alive: the same one-descriptor check as
 /// [`read_secret_file`], except the mode rule is write, not read - no group
@@ -293,8 +302,28 @@ pub fn checked_read_error(file: &Path, why: io::Error) -> anyhow::Error {
 
 /// [`read_secret_file`] and [`read_shared_file`]: `secret` picks the mode
 /// rule (no group or others read, or no write).
+///
+/// The whole file is taken into memory, so the size cap
+/// ([`MAX_CHECKED_FILE`]) refuses anything past it before a byte is
+/// read: the largest legitimate caller is the access file's worst case
+/// (32 rule sets of 256 prefixes, about 800 KB), a token or a URL is a
+/// few KiB, and 1 MiB covers both with room — a file past the cap is
+/// an attacker's, or an operator's, mistake worth naming, not memory.
+/// The snapshot reader streams instead and holds no cap by design.
 fn read_checked_file(file: &Path, secret: bool) -> io::Result<Vec<u8>> {
     let mut opened = open_checked_file(file, secret)?;
+    let size = opened.metadata()?.len();
+    if size > MAX_CHECKED_FILE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} is {} bytes, past the {} MiB cap for a checked file",
+                file.display(),
+                size,
+                MAX_CHECKED_FILE / (1024 * 1024)
+            ),
+        ));
+    }
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut opened, &mut bytes)?;
     Ok(bytes)
@@ -315,7 +344,11 @@ pub fn open_checked_file(file: &Path, secret: bool) -> io::Result<std::fs::File>
     let resolved = check_ancestors(file, me)?;
     let opened = rustix::fs::open(
         &resolved,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        // NONBLOCK: a FIFO would otherwise block the open until a
+        // writer shows up, and a planted FIFO would hang the server at
+        // startup. A regular file ignores it; a FIFO fails the file-
+        // type check below, on the descriptor, before any read.
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
         rustix::fs::Mode::empty(),
     )
     .map_err(|why| {
