@@ -307,6 +307,21 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
   session checks itself once a minute, so a loss is seen even while no
   client calls: the check runs on the server's own session, through the
   same queue as every statement, never on a second connection.
+- A start after an unclean kill can refuse its open with "another
+  server holds this database": the dead server's session is still in
+  the database, and the one-server lock dies only when Postgres ends
+  that session. On the same host that is at once - the kernel closes a
+  dead process's sockets - so the service manager's restart
+  (`Restart=on-failure`) is the whole recovery: the first start exits,
+  the next takes the lock. A server whose host vanished without a
+  packet is another matter: Postgres learns of that death only through
+  TCP keepalives, whose clock is the database's `tcp_keepalives_idle`
+  (unset, it falls back to the system default, often 2 hours), so end
+  the dead session by hand (`pg_terminate_backend`) or lower that
+  clock where a lost host must free the lock sooner. The server's own
+  connections carry the tighter bounds (`keepalives_idle` 30 s, a 30 s
+  TCP user timeout), so the reverse - this server noticing a dead
+  database - is bounded by the server, not the database.
 - The SQLite store has none of this: one file is opened by one process at
   the kernel level, so there is no lock to lose and no fence. The notes
   above that name the one-server lock and the fence are Postgres only.
