@@ -25,8 +25,15 @@ fuzz_target!(|data: &[u8]| {
     std::fs::write(&file, data).expect("write the seed file");
     let store = DiskStore::open(&work.path().join("store"), usize::MAX).expect("an empty store");
     if let Ok(Some(seeded)) = snapshot::seed(&store, &file) {
-        // Whatever the file held, the store keeps only objects whose bytes
-        // match their ID: seed checked each one before the put.
-        assert!(seeded.stored + seeded.skipped + usize::from(seeded.damaged) >= 1);
-    }
-});
+        // Whatever the file held, the store keeps only objects whose
+        // bytes match their ID: seed checked each one before the put.
+        // A snapshot whose header and repo name parse but that holds no
+        // records seeds an all-zero report - that is a calm take, not a
+        // failure. Any file with at least one record lands in one of
+        // the three buckets.
+        let zero_records = data.len() == 9 + 2 + u16::from_le_bytes([data[9], data[10]]) as usize;
+        assert!(
+            zero_records || seeded.stored + seeded.skipped + usize::from(seeded.damaged) >= 1,
+            "a snapshot with records seeds at least one bucket: {seeded:?}"
+        );
+    }});

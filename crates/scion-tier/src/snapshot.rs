@@ -208,6 +208,31 @@ mod tests {
     use scion_proto::ticket::{self, now};
     use scion_proto::v1::objects_server::Objects as _;
     use scion_proto::v1::{Encoding, GetObjectsRequest};
+
+    /// A snapshot whose header and repo name parse but that holds no
+    /// records seeds an all-zero report: the reader takes it calmly.
+    /// The fuzz target's first assertion said `>= 1` and a fuzzer
+    /// found this file class.
+    #[test]
+    fn a_zero_record_snapshot_seeds_nothing() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let file = dir.path().join("r.scnsnap");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.push(b'r');
+        fs::write(&file, &bytes).unwrap();
+        let store = DiskStore::open(&dir.path().join("store"), usize::MAX).unwrap();
+        let seeded = seed(&store, &file).unwrap();
+        assert!(seeded.is_some(), "a zero-record snapshot is a snapshot");
+        let seeded = seeded.unwrap();
+        assert_eq!(seeded.stored, 0);
+        assert_eq!(seeded.skipped, 0);
+        assert!(!seeded.damaged);
+    }
     use tokio_stream::StreamExt as _;
     use tonic::Request;
 
