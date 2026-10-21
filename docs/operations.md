@@ -77,6 +77,29 @@ pending lands sweep themselves after `--land-stale-secs` (see the quotas
 above). The metrics gauge `scion_calls_in_flight` counts the calls the
 drain still waits for.
 
+#### One server, and no automatic failover
+
+There is no automatic failover. One active server holds the store: a
+second server on the same data directory (or the same Postgres database)
+refuses to start, and a running server whose lock the database gave to
+another process is fenced — it answers `FailedPrecondition` to every call
+and exits. That is the guard against two servers taking one store, not a
+failover path.
+
+When the one server dies, every client's calls fail until it is back.
+Nothing takes over by itself: no standby, no leader election, no routing.
+The operator restarts the server on the same data directory (`systemctl
+restart scion`, or the container's restart policy); a restart retakes the
+store and serves the writes that were acknowledged before the death, and
+the calls that were in flight are the client's to retry. While the server
+is down, the tiers and daemons in front of it serve what they have cached
+and refuse the rest. If the directory itself is lost, the recovery is a
+restore from backup (section 3).
+
+Proof: crates/scion-server/tests/backend_refusals.rs::a_lost_server_lock_fences_the_backend
+Proof: crates/scion-server/tests/backend_refusals.rs::an_unreachable_database_is_not_a_takeover
+Proof: crates/scion-server/tests/crash.rs::every_reply_survives_a_kill_of_the_server
+
 ### Server and a regional cache
 
 A cache serves object reads to a region and refuses every other call
@@ -369,6 +392,48 @@ Proof: crates/scn/tests/rotation.rs::ticket_key_rotation_while_a_checkout_reads
 
 ## 3. Backup and restore
 
+### The durability point
+
+What an acknowledged write has survived, before you need a backup:
+
+- A **blob put** is answered after the blob's temp file was fsynced, the
+  file was renamed into `objects/`, the directories of every new file were
+  fsynced, and the drive's write cache was flushed. The server does not
+  answer from its page cache: a power cut after the reply can lose nothing
+  the caller was told was stored, on either backend — the blob path is the
+  data directory's in both.
+- A **land** is answered after its blobs were synced as above and its
+  metadata commit was made durable. On SQLite, the commit fsyncs the WAL
+  (`synchronous = FULL`); on Postgres, every connection runs
+  `synchronous_commit = on`, and the server refuses to open a database
+  that turned it off. A land's reply therefore names a commit the
+  database will not lose, and the database's own durability rules carry
+  it from there.
+- What the above does **not** survive: the loss of the drive itself, or
+  the loss of the machine. That is what the backup below is for.
+
+Proof: crates/scion-server/tests/power.rs::every_reply_survives_a_power_cut
+Proof: crates/scion-server/tests/dm_log_writes.rs::an_acknowledged_blob_survives_a_cut_at_the_last_barrier_before_its_reply
+Proof: crates/scion-server/tests/crash.rs::every_reply_survives_a_kill_of_the_server
+Proof: crates/scion-server/tests/storage.rs::a_retry_after_a_failed_dir_fsync_makes_the_kept_file_durable
+
+The Postgres metadata half of the first two rules is Postgres's own
+contract (`synchronous_commit = on`), which the server checks at every
+open (`crates/scion-server/src/pg.rs`, the `SHOW synchronous_commit`
+check): a test of the database's fsync would test Postgres, not Scion.
+
+A backup (data taken outside the server) has a wider point: the
+**recovery point** of a backup is the moment of its metadata snapshot.
+Every write acknowledged after the snapshot began may be lost — a backup
+run every N minutes has a recovery point of about N minutes of
+acknowledged writes, plus the write in flight while the snapshot ran.
+Writes acknowledged **before** the snapshot read back whole after a
+restore, whatever was happening in the meantime.
+
+Proof: crates/scion-server/tests/backup.rs::a_backup_taken_while_serving_restores_whole
+Proof (open, #411): the live-backup test of that PR pins what a backup taken while
+the server keeps writing may and may not hold
+
 A data directory is `scion.db` plus `objects/`; the lock files and `tmp/`
 are process state, not data. A copy of the directory is a backup:
 
@@ -441,6 +506,18 @@ new database), the marker, and `objects/` into a fresh directory; run
 `fsck` on it; start the server. `fsck` catches the gap a torn or
 gc-raced backup left, so run it after every restore, before the server
 serves.
+
+The restore takes a measured time, not a promise: the `restore-bench`
+workflow (a run on `main` or a dispatch, on the fixed `ubuntu-24.04`
+runner, never a local machine) restores a stated store — 20 repos, 1000
+changesets, about 32 MiB of raw blob content in files of about 32 KiB —
+with `fsck`, an open and a read, prints the seconds, and fails past a
+600 s bound. The measured number lives in the workflow's run log and
+this section names it once the first run has printed it.
+
+Proof: crates/scion-server/tests/restore_bench.rs::a_restore_of_a_stated_store_takes_a_stated_time
+
+Proof: crates/scion-server/tests/backup.rs::a_backup_taken_while_serving_restores_whole
 
 Proof: crates/scion-server/tests/backup.rs::a_backup_taken_while_serving_restores_whole
 
@@ -651,3 +728,60 @@ of one operation.
 
 A ticket refusal, an access refusal, or a corrupt blob each log one line
 per event, never the bytes or the token that caused them.
+
+## 7. Capacity
+
+What one server takes, measured on one named machine, so the numbers have
+a bottom. The table below is the published envelope
+([#387](https://github.com/bnsd55/openscion/issues/387)): every cell is a
+run of [`scripts/capacity.sh`](../scripts/capacity.sh) on a GitHub-hosted
+runner of the class named in the caption, with the dataset of
+[benchmarks.md](benchmarks.md) (tokio at a pinned commit), SQLite or
+Postgres behind the server, `scn bench` landing through it and readers
+checking out through a cache and a daemon beside it.
+
+| | |
+|---|---|
+| Commit | the `git rev-parse HEAD` of the run that produced the table |
+| Runner | the hosted runner class, by its public label and spec |
+| Repetitions | 2 per cell; the table reports the cell's whole run, and the run's raw samples are the workflow run's `capacity.csv` artifact |
+
+| backend | writers | readers | lands/min | land p99 ms | checkout p50 ms | checkout p99 ms | errors | server RSS MiB | store KiB per 1k lands |
+|---|---|---|---|---|---|---|---|---|---|
+| sqlite | 2 | 0 | - | - | - | - | - | - | - |
+| sqlite | 2 | 5 | - | - | - | - | - | - | - |
+| sqlite | 2 | 20 | - | - | - | - | - | - | - |
+| sqlite | 50 | 0 | - | - | - | - | - | - | - |
+| sqlite | 50 | 5 | - | - | - | - | - | - | - |
+| sqlite | 50 | 20 | - | - | - | - | - | - | - |
+| sqlite | 200 | 0 | - | - | - | - | - | - | - |
+| sqlite | 200 | 5 | - | - | - | - | - | - | - |
+| sqlite | 200 | 20 | - | - | - | - | - | - | - |
+| postgres | 2 | 0 | - | - | - | - | - | - | - |
+| postgres | 2 | 5 | - | - | - | - | - | - | - |
+| postgres | 2 | 20 | - | - | - | - | - | - | - |
+| postgres | 50 | 0 | - | - | - | - | - | - | - |
+| postgres | 50 | 5 | - | - | - | - | - | - | - |
+| postgres | 50 | 20 | - | - | - | - | - | - | - |
+| postgres | 200 | 0 | - | - | - | - | - | - | - |
+| postgres | 200 | 5 | - | - | - | - | - | - | - |
+| postgres | 200 | 20 | - | - | - | - | - | - | - |
+
+The cells with `-` are the ones no run has filled yet. The errors column
+is part of the data, not a failure of the run: the envelope's edge IS
+where errors start, so a cell whose clients failed is recorded with its
+error count and stands in the table. The edge, the point where a cell
+stops being an answer: a checkout p99 over 5 seconds, a land p99 over
+5 seconds, or a client error outside the accepted classes of the soak -
+in the table, that is a cell with errors above 0. A reader who wants a
+different edge applies it to the run's `capacity.csv` artifact, which
+the footer's workflow run keeps. A cell whose bench died names no land
+percentile (`-` there); its lands per minute still come from the
+server's counter.
+
+The store growth column is the SQLite store's only; the Postgres cells
+name no store growth, because the database's disk is its service
+container's, not a file tree the script can measure. RSS is the server's
+at the end of the cell: a capacity cell is minutes long, not the hours a
+warm-up would need, so it is a level, not a leak bound - the leak bound
+is the soak's.
