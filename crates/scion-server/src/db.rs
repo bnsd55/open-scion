@@ -574,14 +574,11 @@ impl MetaTx for SqliteTx<'_> {
             )
             .map_err(crate::error::from_sqlite)?;
         let rows = stmt
-            .query_map(
-                params![start.as_bytes(), limit, kind, version],
-                |row| {
-                    let cs: Vec<u8> = row.get(0)?;
-                    let value: Vec<u8> = row.get(1)?;
-                    Ok((cs, value))
-                },
-            )
+            .query_map(params![start.as_bytes(), limit, kind, version], |row| {
+                let cs: Vec<u8> = row.get(0)?;
+                let value: Vec<u8> = row.get(1)?;
+                Ok((cs, value))
+            })
             .map_err(crate::error::from_sqlite)?;
         rows.map(|row| {
             let (cs, value) = row.map_err(crate::error::from_sqlite)?;
