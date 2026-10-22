@@ -10,8 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use gix::ObjectId;
-use scion_core::{BlobId, Changeset, FileState, IdentityTime, RepoPath};
+use scion_core::{BlobId, Changeset, FileState, RepoPath};
 
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::tree;

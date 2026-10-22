@@ -349,20 +349,28 @@ fn store_batch(
                     .map(|(_, blob)| blob),
             )?;
             let result = store.write(|c| {
+                // The provenance of the commits this transaction took, for
+                // the one batch write at its end: a crash then loses whole
+                // commits, never a changeset without its provenance row,
+                // and the busy retry reruns the closure whole, as today.
+                let mut provenance = Vec::new();
                 for (commit, cs, git_tree) in rest {
                     #[cfg(test)]
                     if !slow_record.is_zero() {
                         std::thread::sleep(slow_record);
                     }
-                    let root = record(c, repo_id, *commit, cs, &mut crate::tree::lens_from(&lens))?;
+                    let (id, root) =
+                        record(c, repo_id, *commit, cs, &mut crate::tree::lens_from(&lens))?;
                     if plan.verify.contains(commit) {
                         checker.check(c, *commit, *git_tree, root)?;
                     }
+                    provenance.push((*commit, id));
                     taken += 1;
                     if shared && started_tx.elapsed() >= TX_BUDGET {
                         break;
                     }
                 }
+                c.put_git_imports(repo_id, &provenance)?;
                 Ok(taken)
             });
             match result {
@@ -479,23 +487,23 @@ fn plan(
     })
 }
 
-/// Records that a git commit became the changeset `cs` whose changes build
-/// the tree `root`. Safe to repeat.
+/// Stores the changeset `cs` whose changes build the tree `root`, and
+/// gives the changeset's id with the tree: the caller writes the git
+/// provenance in one batch for the whole transaction.
 fn record(
     c: &mut dyn MetaTx,
     repo: RepoId,
     commit: ObjectId,
     cs: &Changeset,
     lens: crate::tree::BlobLens<'_>,
-) -> Result<TreeId> {
+) -> Result<(ChangesetId, TreeId)> {
     let (id, root) = tree::store_changeset(c, repo, cs, lens).map_err(|e| match e {
         Error::Apply(e) => Error::Corrupt(format!(
             "commit {commit}: changes do not apply to the first parent: {e}"
         )),
         other => other,
     })?;
-    c.put_git_import(repo, commit, id)?;
-    Ok(root)
+    Ok((id, root))
 }
 
 /// Points `name` at `tip`, creating it if missing. Leaves it alone if it is
