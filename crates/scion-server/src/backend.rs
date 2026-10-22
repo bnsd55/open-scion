@@ -584,6 +584,16 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn parents_many(
+        &mut self,
+        merges: &[(ChangesetId, i64)],
+    ) -> Result<Vec<Vec<(ChangesetId, i64)>>> {
+        match self {
+            Self::Sqlite(tx) => tx.parents_many(merges),
+            Self::Postgres(pg) => pg.parents_many(merges),
+        }
+    }
+
     fn get_ref(&mut self, repo: RepoId, name: &str) -> Result<Option<RefState>> {
         match self {
             Self::Sqlite(tx) => tx.get_ref(repo, name),

@@ -390,6 +390,17 @@ impl MetaTx for SqliteTx<'_> {
         .collect()
     }
 
+    fn parents_many(
+        &mut self,
+        merges: &[(ChangesetId, i64)],
+    ) -> Result<Vec<Vec<(ChangesetId, i64)>>> {
+        // Local, no round trip: one prepared statement over the batch.
+        merges
+            .iter()
+            .map(|&(id, id_gen)| self.parents(id, id_gen))
+            .collect()
+    }
+
     /// Whether `ancestor` is `descendant` or reachable from it through parents.
     ///
     /// Walks every parent, not only first parents. A parent's generation is

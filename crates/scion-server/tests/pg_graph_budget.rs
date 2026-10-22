@@ -5,13 +5,19 @@
 //! it can only fall. The formulas:
 //!
 //! - the bulk seed: a handful of 1,000-row statements, not one per row;
-//! - one walk: at most 2 statements per merge (the parents read and the
-//!   side-parent batch of one) plus one node batch per 1,000 queued
-//!   links and a fixed margin. A fallback to one statement per visited
-//!   node would cost about 150,000 on this ladder and fail.
-//!
-//! The parents-batch change re-pins the per-merge term to
-//! `ceil(visited / DERIVED_BATCH) * c + k`.
+//! - one ancestor walk (`Search`): the merge parents ride one
+//!   `parents_many` statement per 1,000 deferred merges. What is left is
+//!   the chain's node reads: a merge chain is a linked list, so the next
+//!   hop's id is only known after the read, and the walk pays one
+//!   statement per merge for them. That is 1 statement per merge plus
+//!   the parents batches, the side-parent node batches, the descend
+//!   hops, and 4 statements of transaction overhead per 1,000 reads
+//!   (about 30 reads per merge here), so about 1.2 statements per
+//!   merge. A fallback to one parents statement per merge would cost
+//!   about 20,000 on this ladder and fail.
+//! - one merge-base walk (`Paint`): unchanged by the parents batch. It
+//!   still asks for each merge's parents in its own statement, and each
+//!   pop reads its node alone: about 3 statements per merge.
 //!
 //! The test runs alone in its file: the statement counter is global to
 //! the process, and the other test files are separate processes, so
@@ -148,26 +154,29 @@ fn the_ladder_walks_stay_under_the_statement_budget() {
         run();
         Backend::test_statement_count()
     };
-    // One walk's budget. c = 3 statements per merge (the parents read,
-    // the side-parent batch of one, and the first-parent node that the
-    // merge chain follows), k = 2,000 for the node-read batches and the
-    // walk's frontier misses on this 20,001-node ladder. A fallback to
-    // one statement per visited node would cost about 150,000 and fail
-    // here. The parents-batch change removes the per-merge term and
-    // re-pins this to ceil(visited / DERIVED_BATCH) * c + k.
-    let cap = 3 * u64::try_from(merges).unwrap() + 2_000;
+    // One ancestor walk's budget: 1 statement per merge for the chain's
+    // node reads (the chain is a linked list) plus 1/5th per merge for
+    // the parents batches, the side-parent node batches, the descend
+    // hops, and the steps' transaction overhead, and k = 1,000 for the
+    // single-node loads off the chain. Measured 11,155 and 10,124 here.
+    let search_cap = u64::try_from(merges).unwrap() + u64::try_from(merges).unwrap() / 5 + 1_000;
+    // One merge-base walk's budget: 2 node reads per merge (the merge
+    // and its side parent, one statement each) and 1 parents statement
+    // per merge, plus the steps' overhead. The parents batch does not
+    // touch the Paint walk; measured 30,141 here.
+    let paint_cap = 3 * u64::try_from(merges).unwrap() + 2_000;
     let not_ancestor = statements(&mut || {
         assert!(!read::is_ancestor(&store, REPO, late, tip, &later()).unwrap());
     });
     assert!(
-        not_ancestor <= cap,
+        not_ancestor <= search_cap,
         "the not-ancestor walk took {not_ancestor} statements"
     );
     let ancestor = statements(&mut || {
         assert!(read::is_ancestor(&store, REPO, sides[0], tip, &later()).unwrap());
     });
     assert!(
-        ancestor <= cap,
+        ancestor <= search_cap,
         "the ancestor walk took {ancestor} statements"
     );
     for (a, b, base) in [
@@ -181,6 +190,9 @@ fn the_ladder_walks_stay_under_the_statement_budget() {
                 [base]
             );
         });
-        assert!(count <= cap, "the merge-base walk took {count} statements");
+        assert!(
+            count <= paint_cap,
+            "the merge-base walk took {count} statements"
+        );
     }
 }
