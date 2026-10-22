@@ -3537,7 +3537,7 @@ mod tests {
         );
     }
 
-    /// A URL whose search_path names no existing schema refuses with
+    /// A URL whose `search_path` names no existing schema refuses with
     /// the fix named, not 'unreachable': the database answered, and
     /// only the schema is missing.
     #[test]
