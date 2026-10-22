@@ -91,6 +91,14 @@ thread_local! {
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
     pub static CHECKS: Cell<usize> = const { Cell::new(0) };
+    /// A test's lower bound on one commit or tree object's bytes, and on
+    /// one tree's entries: the refusal is proved with small objects, and
+    /// the product caps stay the documented ones. `None` is the product.
+    /// Thread-local by design: the cap applies only on the thread that
+    /// set it, so an import on another thread runs at the product's caps.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub static STRUCTURE_CAPS: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
 }
 /// Cache for decoded git objects. A tree diff re-reads the trees that the
 /// previous commit's diff just read.
@@ -121,6 +129,9 @@ pub struct ImportReport {
     pub imported: usize,
     /// Commits whose Scion tree was checked against the git tree.
     pub verified: usize,
+    /// Refs the import moved onto the tip: 1 when `target_ref` took the
+    /// tip, 0 when it already held or contained it.
+    pub refs_moved: usize,
     /// The changeset for the imported revision.
     pub tip: ChangesetId,
 }
@@ -277,18 +288,20 @@ fn import_with_cache(
     // that the server has not flushed yet. A full flush covers it, as it
     // covers every commit that another process made before it.
     store.flush()?;
-    pointed?;
+    let refs_moved = usize::from(pointed?);
     // Every planned check ran, or the import failed above.
     let report = ImportReport {
         commits: plan.reachable,
         imported: plan.todo.len(),
         verified: plan.verify.len(),
+        refs_moved,
         tip,
     };
     tracing::info!(
         commits = report.commits,
         imported = report.imported,
         verified = report.verified,
+        refs_moved,
         secs = started.elapsed().as_secs(),
         %tip,
         "git import done"
@@ -341,20 +354,28 @@ fn store_batch(
                     .map(|(_, blob)| blob),
             )?;
             let result = store.write(|c| {
+                // The provenance of the commits this transaction took, for
+                // the one batch write at its end: a crash then loses whole
+                // commits, never a changeset without its provenance row,
+                // and the busy retry reruns the closure whole, as today.
+                let mut provenance = Vec::new();
                 for (commit, cs, git_tree) in rest {
                     #[cfg(test)]
                     if !slow_record.is_zero() {
                         std::thread::sleep(slow_record);
                     }
-                    let root = record(c, repo_id, *commit, cs, &mut crate::tree::lens_from(&lens))?;
+                    let (id, root) =
+                        record(c, repo_id, *commit, cs, &mut crate::tree::lens_from(&lens))?;
                     if plan.verify.contains(commit) {
                         checker.check(c, *commit, *git_tree, root)?;
                     }
+                    provenance.push((*commit, id));
                     taken += 1;
                     if shared && started_tx.elapsed() >= TX_BUDGET {
                         break;
                     }
                 }
+                c.put_git_imports(repo_id, &provenance)?;
                 Ok(taken)
             });
             match result {
@@ -471,23 +492,23 @@ fn plan(
     })
 }
 
-/// Records that a git commit became the changeset `cs` whose changes build
-/// the tree `root`. Safe to repeat.
+/// Stores the changeset `cs` whose changes build the tree `root`, and
+/// gives the changeset's id with the tree: the caller writes the git
+/// provenance in one batch for the whole transaction.
 fn record(
     c: &mut dyn MetaTx,
     repo: RepoId,
     commit: ObjectId,
     cs: &Changeset,
     lens: crate::tree::BlobLens<'_>,
-) -> Result<TreeId> {
+) -> Result<(ChangesetId, TreeId)> {
     let (id, root) = tree::store_changeset(c, repo, cs, lens).map_err(|e| match e {
         Error::Apply(e) => Error::Corrupt(format!(
             "commit {commit}: changes do not apply to the first parent: {e}"
         )),
         other => other,
     })?;
-    c.put_git_import(repo, commit, id)?;
-    Ok(root)
+    Ok((id, root))
 }
 
 /// Points `name` at `tip`, creating it if missing. Leaves it alone if it is
@@ -500,7 +521,9 @@ fn record(
 /// The move is a compare-and-swap on the ref's version, as a land's is. A
 /// server can land on the ref while the import checks it, so a lost swap
 /// checks the ref again.
-fn point_ref(store: &Backend, repo: RepoId, name: &str, tip: ChangesetId) -> Result<()> {
+/// Returns whether the call moved `name` onto `tip` (`false` when the ref
+/// already held or contained the tip).
+fn point_ref(store: &Backend, repo: RepoId, name: &str, tip: ChangesetId) -> Result<bool> {
     // The check runs in reads, outside any write transaction, so a server
     // that shares the data directory does not wait for it. Each check
     // reads O(log n) nodes of the derived commit graph, and stops at the
@@ -513,7 +536,7 @@ fn point_ref(store: &Backend, repo: RepoId, name: &str, tip: ChangesetId) -> Res
             // Already there, or the ref already contains the tip (changes
             // were landed on top of an earlier import): nothing to do.
             if current.target == tip || contains(current.target, tip)? {
-                return Ok(());
+                return Ok(false);
             }
             if !contains(tip, current.target)? {
                 return Err(Error::FailedPrecondition(format!(
@@ -533,7 +556,7 @@ fn point_ref(store: &Backend, repo: RepoId, name: &str, tip: ChangesetId) -> Res
             move_ref(store, repo, name)?;
         }
         if store.write(|c| c.cas_ref(repo, name, expected, tip))? {
-            return Ok(());
+            return Ok(true);
         }
         tracing::info!(
             name,
@@ -692,14 +715,18 @@ impl Importer<'_> {
         batch: &mut BlobBatch<'_>,
     ) -> Result<BlobId> {
         cached(&mut self.blobs, oid, || {
-            let blob = read_blob(self.git, oid)?;
-            if blob.data.len() > MAX_OBJECT_BYTES {
+            // The cap runs on the header, before the body loads: an
+            // oversized blob costs one ODB lookup, not its own size in
+            // memory. The same class and the same fix as the trees and
+            // commits (`capped_object`).
+            let (kind, _) = capped_object(self.git, oid, "blob")?;
+            if kind != gix::objs::Kind::Blob {
                 return Err(Error::Git(Git::message(format!(
-                    "commit {commit}: \"{}\" is larger than {MAX_OBJECT_BYTES} bytes, \
-                     the most Scion stores",
+                    "commit {commit}: \"{}\" names a {kind:?}, not a blob",
                     path.as_bytes().escape_ascii()
                 ))));
             }
+            let blob = read_blob(self.git, oid)?;
             let id = BlobId::of(&blob.data);
             // A committed row of this repo names this blob only after the
             // file's and its directory's fsyncs succeeded (the batch syncs
@@ -916,9 +943,27 @@ fn read_tree(
     let cause = |what: String, e: gix::Error| {
         Error::Git(Git::cause(format!("commit {commit}: tree {id}: {what}"), e))
     };
+    // The cap runs on the header, before the body loads: an oversized
+    // tree costs one ODB lookup, not its own size in memory.
+    let (kind, size) = capped_object(git, id, "tree")?;
+    if kind != gix::objs::Kind::Tree {
+        return Err(bad(format!("{id} is a {kind:?}, not a tree")));
+    }
     let tree = git
         .find_tree(id)
         .map_err(|e| cause("cannot read".to_owned(), e))?;
+    // The entry bound is the map `read_tree` is about to build: the
+    // header names the bytes, and no entry is smaller than
+    // `MIN_TREE_ENTRY`, so this is the most entries the decode can
+    // produce.
+    let most_entries = size / MIN_TREE_ENTRY;
+    let cap = tree_entries_cap();
+    if most_entries > cap {
+        return Err(bad(format!(
+            "{id} is {size} bytes, about {most_entries} entries, \
+             past the import's limit of {cap} entries per tree"
+        )));
+    }
     let decoded = tree
         .decode()
         .map_err(|e| cause("cannot decode".to_owned(), e))?;
@@ -984,8 +1029,79 @@ fn child_path(commit: ObjectId, dir: &[u8], name: &[u8]) -> Result<RepoPath> {
 }
 
 fn find_commit(git: &gix::Repository, commit: ObjectId) -> Result<gix::Commit<'_>> {
+    // The cap runs on the header, before any decode: the walk reads every
+    // commit, so an oversized one is refused once, cheaply, and the
+    // refusal names the size.
+    capped_object(git, commit, "commit")?;
     git.find_commit(commit)
         .map_err(|e| Error::Git(Git::cause(format!("cannot read commit {commit}"), e)))
+}
+
+/// The most bytes one commit or tree object may take, checked on the
+/// object's header before the import decodes it whole. Files are capped
+/// by `MAX_OBJECT_BYTES`; a commit holds its message and a tree one
+/// entry per path, and neither needs more than the largest file the
+/// store keeps.
+const MAX_STRUCTURE_BYTES: u64 = MAX_OBJECT_BYTES as u64;
+
+/// The most entries one tree may hold, bounded before `read_tree` builds
+/// its map. An entry takes at least 28 bytes (a mode, a one-byte name, a
+/// NUL and a 20-byte object name), so a tree at the byte cap could still
+/// claim millions of entries; past this bound the import refuses rather
+/// than build a map that size.
+const MAX_TREE_ENTRIES: usize = 1_000_000;
+
+// The cap the docs name: a structure object is bounded by the file cap,
+// and a test lowers it only through the seam, never in the product.
+const _: () = assert!(MAX_STRUCTURE_BYTES == 100 << 20);
+const _: () = assert!(MAX_TREE_ENTRIES == 1_000_000);
+
+/// The byte cap this thread's import enforces, or the product's.
+fn structure_bytes_cap() -> u64 {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if let Some((bytes, _)) = STRUCTURE_CAPS.with(Cell::get) {
+        return bytes;
+    }
+    MAX_STRUCTURE_BYTES
+}
+
+/// The most entries this thread's import builds a tree map for.
+fn tree_entries_cap() -> u64 {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if let Some((_, entries)) = STRUCTURE_CAPS.with(Cell::get) {
+        return entries;
+    }
+    MAX_TREE_ENTRIES as u64
+}
+
+/// The smallest bytes one tree entry can take: a mode (5), a space, a
+/// one-byte name, a NUL and a 20-byte object name.
+const MIN_TREE_ENTRY: u64 = 5 + 1 + 1 + 1 + 20;
+
+/// Refuses `id` unless its header says it is `kind` and it fits
+/// [`MAX_STRUCTURE_BYTES`]. The header is read without the body, so an
+/// oversized object costs one ODB lookup, not its own size in memory.
+fn capped_object(
+    git: &gix::Repository,
+    id: ObjectId,
+    what: &str,
+) -> Result<(gix::objs::Kind, u64)> {
+    let header = git
+        .try_find_header(id)
+        .map_err(|e| Error::Git(Git::cause(format!("cannot read {what} {id}"), e)))?
+        .ok_or_else(|| {
+            Error::Git(Git::message(format!(
+                "{what} {id} is not in the repository"
+            )))
+        })?;
+    let (kind, size) = (header.kind(), header.size());
+    let cap = structure_bytes_cap();
+    if size > cap {
+        return Err(Error::Git(Git::message(format!(
+            "{what} {id} is {size} bytes, past the import's limit of {cap}"
+        ))));
+    }
+    Ok((kind, size))
 }
 
 fn read_blob(git: &gix::Repository, oid: ObjectId) -> Result<gix::Blob<'_>> {
@@ -1001,13 +1117,58 @@ fn identity(
     let bad = |e: gix::Error| Error::Git(Git::cause(format!("commit {commit}: bad {role}"), e));
     let signature = signature.map_err(bad)?;
     let time = signature.time().map_err(bad)?;
-    Ok(IdentityTime::new(
+    // The date must read back as it was written. The parser behind
+    // `SignatureRef::time` treats a timezone it cannot read as zero
+    // (gix-date's `parse_header` defaults the offset), and the import
+    // must not store history that differs from its source without
+    // saying so. The one git spelling that cannot read back as itself
+    // is `-0000`, git's written form of an unknown offset: it parses
+    // to zero, and zero serializes as `+0000`.
+    let raw = signature.time;
+    if zone(raw) != Some((time.seconds, time.offset)) {
+        return Err(Error::Git(Git::message(format!(
+            "commit {commit}: {role} date {raw:?} is not a date git can write"
+        ))));
+    }
+    IdentityTime::new(
         signature.name.to_vec(),
         signature.email.to_vec(),
         time.seconds,
         time.offset / 60,
     )
-    .expect("identity fits the format"))
+    .map_err(|e| {
+        Error::Git(Git::message(format!(
+            "commit {commit}: {role} identity does not fit the format: {e}"
+        )))
+    })
+}
+
+/// The raw git date `<seconds> <sign><hhmm>`, as the pair gix parses it
+/// to, or `None` when the bytes are not that grammar. A zone with a
+/// seconds field (`+053030`) or a zone too long to read as two two-digit
+/// fields is refused here, where gix would coerce its offset to zero.
+fn zone(raw: &str) -> Option<(i64, i32)> {
+    let (seconds, offset) = raw.split_once(' ')?;
+    let seconds = seconds.parse().ok()?;
+    let sign = match offset.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let digits = offset.get(1..)?;
+    let (hours, minutes) = digits.split_at(2);
+    if minutes.len() != 2
+        || !hours
+            .bytes()
+            .chain(minutes.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((
+        seconds,
+        sign * (hours.parse::<i32>().ok()? * 3600 + minutes.parse::<i32>().ok()? * 60),
+    ))
 }
 
 fn per_sec(count: usize, since: Instant) -> u128 {

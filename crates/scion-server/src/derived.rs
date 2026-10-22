@@ -868,6 +868,56 @@ pub(crate) fn load<K: Kind>(c: &mut dyn MetaTx, cs: ChangesetId) -> Result<Optio
         .transpose()
 }
 
+/// The stored values of `K` for up to [`DERIVED_BATCH`] changesets, in the
+/// order asked, one statement. Values that are not stored come back as
+/// `None`; the caller decides what a missing node means.
+///
+/// # Errors
+///
+/// [`Error::Corrupt`] if a stored byte string is not a value.
+///
+/// [`DERIVED_BATCH`]: crate::meta::DERIVED_BATCH
+pub(crate) fn load_batch<K: Kind>(
+    c: &mut dyn MetaTx,
+    cs: &[ChangesetId],
+) -> Result<Vec<Option<K::Value>>> {
+    c.get_derived_batch(K::NAME, K::VERSION, cs)?
+        .into_iter()
+        .zip(cs)
+        .map(|(bytes, cs)| {
+            bytes
+                .map(|bytes| {
+                    K::decode(&bytes).ok_or_else(|| {
+                        Error::Corrupt(format!("derived {} v{} for {cs}", K::NAME, K::VERSION))
+                    })
+                })
+                .transpose()
+        })
+        .collect()
+}
+
+/// The stored values of `K` on the first-parent chain that starts at
+/// `start`, at most `limit` of them, one statement. A stored byte string
+/// that is not a value is corruption.
+///
+/// # Errors
+///
+/// [`Error::Corrupt`] if a stored byte string is not a value.
+pub(crate) fn load_chain<K: Kind>(
+    c: &mut dyn MetaTx,
+    start: ChangesetId,
+    limit: i64,
+) -> Result<Vec<(ChangesetId, K::Value)>> {
+    c.get_derived_chain(K::NAME, K::VERSION, start, limit)?
+        .into_iter()
+        .map(|(cs, bytes)| {
+            K::decode(&bytes).map(|value| (cs, value)).ok_or_else(|| {
+                Error::Corrupt(format!("derived {} v{} for {cs}", K::NAME, K::VERSION))
+            })
+        })
+        .collect()
+}
+
 fn require(c: &mut dyn MetaTx, repo: RepoId, cs: ChangesetId) -> Result<()> {
     if c.has_changeset(repo, cs)? {
         Ok(())

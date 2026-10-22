@@ -148,11 +148,7 @@ async fn server_with_tickets(
             stopped.await.ok();
         },
     ));
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(&format!("http://{addr}")).await.unwrap();
     (stop, channel)
 }
 
@@ -588,3 +584,6 @@ async fn a_get_objects_stream_holds_its_principals_slot() {
     .await;
     stop.send(()).ok();
 }
+
+#[path = "common/mod.rs"]
+mod common;

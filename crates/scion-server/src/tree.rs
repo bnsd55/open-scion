@@ -10,7 +10,7 @@
 // through a re-export, so this marker would fire on all of them
 // under any feature set.
 #![allow(unreachable_pub)]
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileEntry, FileState, PathElem, RepoPath, Tree, TreeId,
@@ -93,9 +93,13 @@ pub fn apply(
     changes: &BTreeMap<RepoPath, Option<FileState>>,
     lens: BlobLens<'_>,
 ) -> Result<TreeId> {
+    // The stored trees on every changed path, one get_trees per level of
+    // depth: a commit that touches many directories loads them in one
+    // statement per level instead of one per directory.
+    let mut loaded = prefetch(c, base, changes)?;
     let mut root = base.map_or_else(|| Dir::Loaded(BTreeMap::new()), Dir::Stored);
     for (path, _) in changes.iter().filter(|(_, change)| change.is_none()) {
-        root.delete(c, path, &parts(path))?;
+        root.delete(c, &mut loaded, path, &parts(path))?;
     }
     for (path, state) in changes {
         if let Some(state) = state {
@@ -105,10 +109,13 @@ pub fn apply(
                 Some(blob) => FileEntry::new(*state, lens(blob)?),
                 None => FileEntry::new(*state, 0),
             };
-            root.put(c, path, &parts(path), 0, entry)?;
+            root.put(c, &mut loaded, path, &parts(path), 0, entry)?;
         }
     }
-    root.store(c)
+    let mut rows = Vec::new();
+    let tree = root.store(&mut rows)?;
+    c.put_trees(&rows)?;
+    Ok(tree)
 }
 
 /// Finds the entry at `path` under `root`.
@@ -122,7 +129,10 @@ pub fn lookup(c: &mut dyn MetaTx, root: TreeId, path: &RepoPath) -> Result<Optio
         let Entry::Dir(id) = entry else {
             return Ok(None);
         };
-        match c.get_tree(id)?.entries().clone().remove(&name) {
+        // One entry, straight from the stored bytes: no whole-node
+        // decode, no entry-map clone. A big directory costs what the
+        // one entry costs, not the whole folder.
+        match c.lookup_tree_entry(id, name.as_bytes())? {
             Some(next) => entry = next,
             None => return Ok(None),
         }
@@ -265,14 +275,107 @@ pub fn store_changeset(
         .transpose()?;
     let tree = apply(c, base, cs.changes(), lens)?;
     let id = c.insert_changeset(repo, cs)?;
-    for (_, blob) in db::puts(cs) {
-        c.add_repo_blob(repo, blob)?;
-    }
+    // One round trip for every blob the changeset puts, however many
+    // paths name the same one.
+    let mut puts: Vec<BlobId> = db::puts(cs).map(|(_, blob)| blob).collect();
+    puts.sort();
+    puts.dedup();
+    c.add_repo_blobs(repo, &puts)?;
     derived::put::<RootTree>(c, id, &tree)?;
     derived::remove_old::<RootTree>(c)?;
     derived::on_write::<CommitGraph>(c, id, cs, lens)?;
     derived::on_write::<PathHistory>(c, id, cs, lens)?;
     Ok((id, tree))
+}
+
+/// The prefetch's resolution steps: one entry lookup per step, for the
+/// tests that measure the walk's work instead of its seconds.
+#[cfg(any(test, feature = "test-hooks"))]
+static PREFETCH_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The resolution steps the prefetch took since the process started, or
+/// since the caller last read it into its own arithmetic.
+#[cfg(any(test, feature = "test-hooks"))]
+#[must_use]
+pub fn prefetch_steps() -> u64 {
+    PREFETCH_STEPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The stored trees on every changed path's directory chain, level by
+/// level: level 0 is the root, and each round reads every directory the
+/// round before resolved, in one `get_trees`. One cursor per path
+/// advances one part per round, so the whole walk grows with paths x
+/// depth, once, and the next round's ids dedupe through a set. A
+/// directory the base does not store is built as the apply goes, and
+/// reads nothing. The bytes are decoded and checked against their ids,
+/// as `get_tree` does.
+fn prefetch(
+    c: &mut dyn MetaTx,
+    base: Option<TreeId>,
+    changes: &BTreeMap<RepoPath, Option<FileState>>,
+) -> Result<HashMap<TreeId, Tree>> {
+    let mut trees = HashMap::new();
+    let Some(root) = base else {
+        return Ok(trees);
+    };
+    // Each changed path's parts; a path of length L has its file at the
+    // last part, so its directories are the parts before it.
+    let paths: Vec<Vec<PathElem>> = changes.keys().map(parts).collect();
+    // One cursor per path that has a directory above its file: the path's
+    // index, the tree the cursor sits at (its entries hold the part to
+    // resolve next), and that part's index. A cursor steps one part per
+    // round, so the whole walk grows with paths x depth, once.
+    let mut cursors: Vec<(usize, TreeId, usize)> = paths
+        .iter()
+        .enumerate()
+        .filter(|(_, path)| path.len() > 1)
+        .map(|(i, _)| (i, root, 0))
+        .collect();
+    let mut level: Vec<TreeId> = vec![root];
+    while !level.is_empty() {
+        let bodies = c.get_trees(&level)?;
+        for (id, body) in level.iter().zip(bodies) {
+            let Some(body) = body else {
+                continue; // a stored tree that is missing fails as it did,
+                // when the apply reaches it
+            };
+            let (tree, actual) = Tree::decode_with_id(&body)
+                .map_err(|e| Error::Corrupt(format!("tree {id}: {e}")))?;
+            if actual != *id {
+                return Err(Error::Corrupt(format!("tree {id} does not match its ID")));
+            }
+            trees.insert(*id, tree);
+        }
+        // Each cursor resolves its path's part at this level and steps one
+        // part down; a cursor whose child is its file's directory retires
+        // after queuing that child.
+        let mut next: Vec<TreeId> = Vec::new();
+        let mut queued: HashSet<TreeId> = HashSet::new();
+        cursors.retain_mut(|(i, current, part_index)| {
+            let path = &paths[*i];
+            #[cfg(any(test, feature = "test-hooks"))]
+            PREFETCH_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(Entry::Dir(child)) = trees
+                .get(current)
+                .and_then(|tree| tree.entries().get(&path[*part_index]))
+            else {
+                return false; // the base holds no such directory; the apply
+                // builds it, or refuses, as before
+            };
+            if queued.insert(*child) && !trees.contains_key(child) {
+                next.push(*child);
+            }
+            if *part_index + 2 == path.len() {
+                false // the child is the file's directory: nothing below it
+            } else {
+                *current = *child;
+                *part_index += 1;
+                true
+            }
+        });
+        level = next;
+    }
+    Ok(trees)
 }
 
 /// The parts of a path, as tree entry names.
@@ -300,21 +403,27 @@ enum Node {
 }
 
 impl Dir {
-    fn entries(&mut self, c: &mut dyn MetaTx) -> Result<&mut BTreeMap<PathElem, Node>> {
+    fn entries(
+        &mut self,
+        c: &mut dyn MetaTx,
+        loaded: &mut HashMap<TreeId, Tree>,
+    ) -> Result<&mut BTreeMap<PathElem, Node>> {
         if let Self::Stored(id) = *self {
-            let entries = c
-                .get_tree(id)?
-                .entries()
-                .clone()
-                .into_iter()
-                .map(|(name, entry)| {
-                    let node = match entry {
-                        Entry::File(file) => Node::File(file),
-                        Entry::Dir(id) => Node::Dir(Self::Stored(id)),
-                    };
-                    (name, node)
-                })
-                .collect();
+            let entries = match loaded.remove(&id) {
+                // The prefetch read this tree: its entries hand over
+                // whole, no second read and no clone.
+                Some(tree) => tree.into_entries(),
+                None => c.get_tree(id)?.entries().clone(),
+            }
+            .into_iter()
+            .map(|(name, entry)| {
+                let node = match entry {
+                    Entry::File(file) => Node::File(file),
+                    Entry::Dir(id) => Node::Dir(Self::Stored(id)),
+                };
+                (name, node)
+            })
+            .collect();
             *self = Self::Loaded(entries);
         }
         match self {
@@ -324,13 +433,19 @@ impl Dir {
     }
 
     /// Deletes the file at `parts`. Returns whether this directory is now empty.
-    fn delete(&mut self, c: &mut dyn MetaTx, path: &RepoPath, parts: &[PathElem]) -> Result<bool> {
-        let entries = self.entries(c)?;
+    fn delete(
+        &mut self,
+        c: &mut dyn MetaTx,
+        loaded: &mut HashMap<TreeId, Tree>,
+        path: &RepoPath,
+        parts: &[PathElem],
+    ) -> Result<bool> {
+        let entries = self.entries(c, loaded)?;
         let (name, rest) = parts.split_first().expect("a path has at least one part");
         let remove = match (entries.get_mut(name), rest.is_empty()) {
             (Some(Node::File(_)), true) => true,
             (Some(Node::Dir(_)), true) => return Err(ApplyError::NotAFile(path.clone()).into()),
-            (Some(Node::Dir(child)), false) => child.delete(c, path, rest)?,
+            (Some(Node::Dir(child)), false) => child.delete(c, loaded, path, rest)?,
             (Some(Node::File(_)) | None, _) => {
                 return Err(ApplyError::DeleteMissing(path.clone()).into());
             }
@@ -344,12 +459,13 @@ impl Dir {
     fn put(
         &mut self,
         c: &mut dyn MetaTx,
+        loaded: &mut HashMap<TreeId, Tree>,
         path: &RepoPath,
         parts: &[PathElem],
         depth: usize,
         file: FileEntry,
     ) -> Result<()> {
-        let entries = self.entries(c)?;
+        let entries = self.entries(c, loaded)?;
         let name = &parts[depth];
         if depth + 1 == parts.len() {
             if matches!(entries.get(name), Some(Node::Dir(_))) {
@@ -362,7 +478,7 @@ impl Dir {
             .entry(name.clone())
             .or_insert_with(|| Node::Dir(Self::Loaded(BTreeMap::new())));
         match child {
-            Node::Dir(dir) => dir.put(c, path, parts, depth + 1, file),
+            Node::Dir(dir) => dir.put(c, loaded, path, parts, depth + 1, file),
             Node::File(_) => Err(ApplyError::FileInTheWay {
                 path: path.clone(),
                 file: prefix(&parts[..=depth]),
@@ -377,7 +493,7 @@ impl Dir {
     // 500 KB for 10,000 names of 12 bytes. Upgrade: directories cut into
     // chunks, a new tree format, so a write stores only the chunks it changes
     // (https://github.com/bnsd55/openscion/issues/114).
-    fn store(self, c: &mut dyn MetaTx) -> Result<TreeId> {
+    fn store(self, rows: &mut Vec<(TreeId, Vec<u8>)>) -> Result<TreeId> {
         match self {
             Self::Stored(id) => Ok(id),
             Self::Loaded(entries) => {
@@ -385,12 +501,17 @@ impl Dir {
                 for (name, node) in entries {
                     let entry = match node {
                         Node::File(file) => Entry::File(file),
-                        Node::Dir(dir) => Entry::Dir(dir.store(c)?),
+                        Node::Dir(dir) => Entry::Dir(dir.store(rows)?),
                     };
                     loaded.insert(name, entry);
                 }
                 let tree = Tree::new(loaded).expect("loaded entries fit the format");
-                c.put_tree(&tree)
+                // The id is the body's hash, so the chain can be built
+                // before anything is stored, and the whole chain lands as
+                // one batch of rows.
+                let (body, id) = tree.encode_with_id();
+                rows.push((id, body));
+                Ok(id)
             }
         }
     }
@@ -404,7 +525,6 @@ mod tests {
     use crate::meta::Meta as _;
     use crate::store::Store;
     use scion_core::{BlobId, Changeset, IdentityTime};
-
     /// `(path, Some(content))` puts a regular file; `(path, None)` deletes.
     type Edits<'a> = &'a [(&'a str, Option<&'a str>)];
 
@@ -471,6 +591,93 @@ mod tests {
             );
             assert_eq!(lookup(c, t2, &path("a/b"))?, None);
             assert_eq!(lookup(c, t2, &path("e/x"))?, None, "a file has no children");
+            Ok(())
+        });
+    }
+
+    /// The names one level holds, plus the names that must miss: before
+    /// the first, between two, after the last. Present names carry the
+    /// entry the full decode's map holds for them.
+    fn level_checks(tree: &Tree) -> Vec<(Vec<u8>, bool, Option<Entry>)> {
+        let names: Vec<Vec<u8>> = tree
+            .entries()
+            .keys()
+            .map(|n| n.as_bytes().to_vec())
+            .collect();
+        let mut checks = Vec::new();
+        checks.push((vec![0], false, None));
+        for (i, name) in names.iter().enumerate() {
+            let entry = tree
+                .entries()
+                .get(&PathElem::new(name.clone()).unwrap())
+                .copied();
+            checks.push((name.clone(), true, entry));
+            if i + 1 < names.len() {
+                let mut between = name.clone();
+                between.push(0);
+                between.extend_from_slice(b"mid");
+                checks.push((between, false, None));
+            }
+        }
+        if names.len() >= 2 {
+            // A name that sorts between the two last entries: the scan
+            // must stop near the end, not walk to the last byte.
+            let mut before_last = names[names.len() - 2].clone();
+            before_last.extend_from_slice(b"a0");
+            checks.push((before_last, false, None));
+            let last = &names[names.len() - 1];
+            checks.push((
+                last.clone(),
+                true,
+                tree.entries()
+                    .get(&PathElem::new(last.clone()).unwrap())
+                    .copied(),
+            ));
+        }
+        checks.push((b"zzzz-after-the-last".to_vec(), false, None));
+        checks
+    }
+
+    #[test]
+    fn lookup_tree_entry_answers_what_the_full_decode_answers() {
+        with_db(|c| {
+            let t = apply(
+                c,
+                None,
+                &changes(&[
+                    ("a", Some("1")),
+                    ("aB/c", Some("2")),
+                    ("b/one", Some("3")),
+                    ("b/two", Some("4")),
+                    ("b/three", Some("5")),
+                    ("deep/x/y", Some("6")),
+                    ("\u{3bb}/\u{3b1}", Some("7")),
+                    ("\u{3bb}/\u{3c9}", Some("8")),
+                ]),
+                &mut lens_none(),
+            )?;
+            // Every directory level of the tree, with its id.
+            let mut dirs = vec![t];
+            for p in ["aB", "b", "deep", "deep/x", "\u{3bb}"] {
+                match lookup(c, t, &path(p))? {
+                    Some(Entry::Dir(id)) => dirs.push(id),
+                    other => panic!("{p} is not a dir: {other:?}"),
+                }
+            }
+            for dir in dirs {
+                let tree = c.get_tree(dir)?;
+                for (name, present, expected) in level_checks(&tree) {
+                    let found = c.lookup_tree_entry(dir, &name)?;
+                    if present {
+                        assert_eq!(
+                            found, expected,
+                            "the scan's answer differs from the full decode for {name:?}"
+                        );
+                    } else {
+                        assert!(found.is_none(), "name {name:?} is present but must miss");
+                    }
+                }
+            }
             Ok(())
         });
     }

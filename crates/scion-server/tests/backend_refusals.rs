@@ -148,30 +148,51 @@ fn a_damaged_marker_refuses_both_opens() {
 /// A write that another writer blocks answers busy in seconds, not past
 /// the minute-long statement clock: the open sets a lock timeout like the
 /// SQLite busy timeout, and a lock the database cannot give in it maps to
-/// busy, so the client retries.
+/// busy, so the client retries. The SQLite side of the row runs here too:
+/// another connection of the test holds the write lock past the same
+/// clock, through the busy timeout the open sets.
 #[test]
 fn a_write_blocked_by_another_writer_answers_busy_in_seconds() {
-    if skip_on_sqlite() {
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
     let store = Backend::open_test(dir.path()).unwrap();
-    // A connection of the test holds the name in an open transaction: it
-    // inserted the row and never ended the transaction, so every writer
-    // of the same name waits for it.
-    let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
-    let schema = Backend::test_schema(dir.path()).unwrap();
-    let mut held = postgres::Client::connect(&url, postgres::NoTls).unwrap();
-    held.batch_execute(&format!("SET search_path TO {schema}"))
-        .unwrap();
-    held.batch_execute("BEGIN; INSERT INTO repos (name) VALUES ('held');")
-        .unwrap();
+    if Backend::test_is_postgres() {
+        // A connection of the test holds the name in an open transaction: it
+        // inserted the row and never ended the transaction, so every writer
+        // of the same name waits for it.
+        let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+        let schema = Backend::test_schema(dir.path()).unwrap();
+        let mut held = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        held.batch_execute(&format!("SET search_path TO {schema}"))
+            .unwrap();
+        held.batch_execute("BEGIN; INSERT INTO repos (name) VALUES ('held');")
+            .unwrap();
+        let error = run_blocked_write(&store);
+        let _ = held.batch_execute("ROLLBACK");
+        let _ = error;
+    } else {
+        // A raw connection of the test holds the write lock: BEGIN
+        // IMMEDIATE takes the lock the store's writer wants, and holds
+        // it while the store waits out its busy timeout.
+        let held = rusqlite::Connection::open(dir.path().join("scion.db")).unwrap();
+        held.busy_timeout(std::time::Duration::from_millis(100))
+            .unwrap();
+        held.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let error = run_blocked_write(&store);
+        let _ = held.execute_batch("ROLLBACK");
+        let _ = error;
+    }
+}
+
+/// The blocked write of [`a_write_blocked_by_another_writer_answers_busy_in_seconds`],
+/// timed and checked for the busy answer. Returns the error so a caller
+/// may roll its holder back before the store drops; the checks above
+/// have already proven the answer.
+fn run_blocked_write(store: &Backend) -> scion_server::Error {
     let started = std::time::Instant::now();
     let error = store
         .write(|c| c.create_repo("held").map(|_| ()))
         .expect_err("the held name refuses the write");
     let waited = started.elapsed();
-    let _ = held.batch_execute("ROLLBACK");
     assert!(error.is_busy(), "{error:?}");
     assert!(
         waited >= std::time::Duration::from_secs(4),
@@ -181,6 +202,7 @@ fn a_write_blocked_by_another_writer_answers_busy_in_seconds() {
         waited < std::time::Duration::from_secs(20),
         "answered after {waited:?}"
     );
+    error
 }
 
 /// The store UUID: the first Postgres open mints one, the marker file
@@ -420,4 +442,125 @@ fn a_fsck_of_a_postgres_backed_store_finds_missing_blob_files() {
         "{:?}",
         report.problems
     );
+}
+
+/// One throwaway database per test, so the lock scope of a production
+/// open is checked on a real open without touching the shared test
+/// database's default schema.
+struct Throwaway {
+    url: String,
+    name: String,
+}
+
+impl Throwaway {
+    /// One throwaway database per test, named after the test, so
+    /// parallel tests of this file do not drop each other's database.
+    fn new(who: &str) -> Self {
+        let base = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+        // The name carries the test, so parallel tests of this file do
+        // not drop each other's database.
+        let name = format!("scion_test_lockcheck_{}_{}", who, std::process::id());
+        let mut admin = postgres::Client::connect(&base, postgres::NoTls).unwrap();
+        admin
+            .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+            .unwrap();
+        admin
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .unwrap();
+        let cut = base.rfind('/').expect("the test URL names a database");
+        Self {
+            url: format!("{}/{}", &base[..cut], name),
+            name,
+        }
+    }
+
+    /// The URL of this database, riding `schema` when one is given.
+    fn url_riding(&self, schema: Option<&str>) -> String {
+        match schema {
+            Some(schema) => format!("{}?options=--search_path%3D{schema}", self.url),
+            None => self.url.clone(),
+        }
+    }
+}
+
+impl Drop for Throwaway {
+    fn drop(&mut self) {
+        let base = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+        let Ok(mut admin) = postgres::Client::connect(&base, postgres::NoTls) else {
+            return;
+        };
+        let _ = admin.batch_execute(&format!(
+            "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+            self.name
+        ));
+    }
+}
+
+/// The one-server lock keys on the schema the connection lands in, not
+/// on the words of the URL: a plain URL and one that rides
+/// `--search_path=public` land in the same schema of one database, so
+/// the second open is refused, however differently the two URLs spell
+/// where they go. A production behavior change: a URL that names its own
+/// schema fences one schema, not the whole database.
+#[test]
+fn a_plain_url_and_one_that_rides_public_fence_each_other() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let db = Throwaway::new("fence");
+    let dir_a = tempfile::tempdir().unwrap();
+    let _a = Backend::open(dir_a.path(), Some(&db.url), None).expect("the plain URL opens");
+    let dir_b = tempfile::tempdir().unwrap();
+    let Err(error) = Backend::open(dir_b.path(), Some(&db.url_riding(Some("public"))), None) else {
+        panic!("the second open of one schema is refused");
+    };
+    assert!(
+        error.to_string().contains("another server holds"),
+        "{error}"
+    );
+}
+
+/// Two URLs that ride different schemas of one database open side by
+/// side: each fences its own schema, which is what lets the parallel
+/// tests of one database each hold one server.
+#[test]
+fn two_urls_that_ride_different_schemas_open_side_by_side() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let db = Throwaway::new("side_by_side");
+    let mut admin = postgres::Client::connect(&db.url, postgres::NoTls).unwrap();
+    admin
+        .batch_execute("CREATE SCHEMA scion_test_lock_one; CREATE SCHEMA scion_test_lock_two;")
+        .unwrap();
+    let dir_a = tempfile::tempdir().unwrap();
+    let a = Backend::open(
+        dir_a.path(),
+        Some(&db.url_riding(Some("scion_test_lock_one"))),
+        None,
+    )
+    .expect("the first schema opens");
+    let dir_b = tempfile::tempdir().unwrap();
+    let b = Backend::open(
+        dir_b.path(),
+        Some(&db.url_riding(Some("scion_test_lock_two"))),
+        None,
+    )
+    .expect("the second schema opens beside it");
+    // Each store keeps its rows in its own schema: one repo apiece, and
+    // the other schema's table stays empty.
+    a.write(|c| c.create_repo("one").map(|_| ())).unwrap();
+    b.write(|c| c.create_repo("two").map(|_| ())).unwrap();
+    for (schema, name) in [
+        ("scion_test_lock_one", "one"),
+        ("scion_test_lock_two", "two"),
+    ] {
+        let rows = admin
+            .query(
+                &format!("SELECT name FROM {schema}.repos WHERE name = '{name}'"),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{schema} holds {name}");
+    }
 }

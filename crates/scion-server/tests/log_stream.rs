@@ -9,6 +9,9 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+#[path = "common/log_fields.rs"]
+mod log_fields;
+
 use tracing_subscriber::fmt::MakeWriter;
 
 use scion_core::{Changeset, FileState, RepoPath};
@@ -112,6 +115,7 @@ async fn client(url: &str) -> Scion {
         .unwrap()
         .initial_stream_window_size(65_535)
         .initial_connection_window_size(65_535)
+        .connect_timeout(common::CONNECT_TIMEOUT)
         .connect()
         .await
         .unwrap();
@@ -223,13 +227,27 @@ async fn a_stalled_log_reply_is_counted_and_closes_the_connection() {
     // The close notice names the connection's peer, so the runbook's
     // `find the client` step has an address to grep for.
     let text = log_text();
+    let notice = log_fields::find_line(
+        &text,
+        "closing a connection: its stalled replies hold too much",
+    )
+    .unwrap_or_else(|| panic!("the close notice is not in the log: {text}"));
+    let peer = notice
+        .field("peer")
+        .unwrap_or_else(|| panic!("the close notice names no peer: {notice:?}"));
+    // The event logs the peer as Debug: `Some(127.0.0.1:54321)`. The
+    // runbook's `find the client` step needs a real address, not a
+    // placeholder: a loopback host and a port the client actually
+    // held.
+    let peer = peer
+        .strip_prefix("Some(")
+        .and_then(|value| value.strip_suffix(')'))
+        .unwrap_or(peer)
+        .parse::<std::net::SocketAddr>()
+        .unwrap_or_else(|_| panic!("the close notice names a parseable peer: {peer}"));
     assert!(
-        text.contains("closing a connection: its stalled replies hold too much"),
-        "the close notice is not in the log: {text}"
-    );
-    assert!(
-        text.contains("peer=Some(127.0.0.1"),
-        "the close notice names no peer: {text}"
+        peer.ip().is_loopback() && peer.port() != 0,
+        "the close notice names the client's address: {peer}"
     );
 }
 
@@ -369,11 +387,7 @@ async fn a_unary_reply_over_the_message_limit_is_refused() {
         std::future::pending(),
         std::sync::Arc::new(scion_proto::runtime::metrics::Metrics::default()),
     ));
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(&format!("http://{addr}")).await.unwrap();
     let mut client = scion_proto::v1::scion_client::ScionClient::new(channel);
     let err = client
         .resolve_ref(scion_proto::v1::ResolveRefRequest::default())
@@ -430,12 +444,29 @@ async fn a_stalled_blame_reply_is_counted_and_closes_the_connection() {
     // The close notice names the connection's peer, so the runbook's
     // `find the client` step has an address to grep for.
     let text = log_text();
+    let notice = log_fields::find_line(
+        &text,
+        "closing a connection: its stalled replies hold too much",
+    )
+    .unwrap_or_else(|| panic!("the close notice is not in the log: {text}"));
+    let peer = notice
+        .field("peer")
+        .unwrap_or_else(|| panic!("the close notice names no peer: {notice:?}"));
+    // The event logs the peer as Debug: `Some(127.0.0.1:54321)`. The
+    // runbook's `find the client` step needs a real address, not a
+    // placeholder: a loopback host and a port the client actually
+    // held.
+    let peer = peer
+        .strip_prefix("Some(")
+        .and_then(|value| value.strip_suffix(')'))
+        .unwrap_or(peer)
+        .parse::<std::net::SocketAddr>()
+        .unwrap_or_else(|_| panic!("the close notice names a parseable peer: {peer}"));
     assert!(
-        text.contains("closing a connection: its stalled replies hold too much"),
-        "the close notice is not in the log: {text}"
-    );
-    assert!(
-        text.contains("peer=Some(127.0.0.1"),
-        "the close notice names no peer: {text}"
+        peer.ip().is_loopback() && peer.port() != 0,
+        "the close notice names the client's address: {peer}"
     );
 }
+
+#[path = "common/mod.rs"]
+mod common;

@@ -282,3 +282,6 @@ async fn every_metric_the_alert_rules_name_is_served() {
         );
     }
 }
+
+#[path = "common/mod.rs"]
+mod common;
