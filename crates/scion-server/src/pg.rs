@@ -2480,7 +2480,7 @@ impl MetaTx for PgTx<'_> {
         let version = i64::from(version);
         let rows = self.c.query(
             "WITH RECURSIVE walk(id, depth) AS (
-                 SELECT $1::bytea, 0
+                 SELECT $1::bytea, 0::bigint
                  UNION ALL
                  SELECT cp.parent, w.depth + 1
                  FROM walk w
