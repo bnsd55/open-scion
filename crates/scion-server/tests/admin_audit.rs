@@ -482,3 +482,75 @@ fn a_restore_whose_audit_file_refuses_changes_nothing() {
         "the target holds no store"
     );
 }
+
+/// The verify subcommand runs without the store-open match that hid an
+/// `unreachable!` behind verify and restore since the archive landed: a
+/// good archive exits 0, a damaged one names its damage and does not.
+#[test]
+fn a_verify_subcommand_reports_a_good_archive_and_names_a_damaged_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let archive = dir.path().join("archive");
+    seed_exportable(&data);
+
+    let out = run(
+        &data,
+        &[
+            "export",
+            "--repo",
+            "hist",
+            "--out",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "export ran: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_scion-server"))
+        .args(["verify", "--archive", archive.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "a good archive verifies");
+    let out_text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out_text.contains("verify: 0 damages"),
+        "the report says what it saw: {out_text}"
+    );
+
+    // A blob file whose bytes another hand changed: the verify names the
+    // blob, and the exit is not 0. The blobs live in a fan-out of two
+    // hex levels under blobs/.
+    let mut blob = None;
+    for first in fs::read_dir(archive.join("blobs")).unwrap().flatten() {
+        for second in fs::read_dir(first.path()).unwrap().flatten() {
+            if second.path().is_file() {
+                blob = Some(second.path());
+                break;
+            }
+        }
+        if blob.is_some() {
+            break;
+        }
+    }
+    let blob = blob.expect("the archive holds a blob file");
+    fs::write(&blob, b"someone changed these bytes\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_scion-server"))
+        .args(["verify", "--archive", archive.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a damaged archive does not verify");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains("verify: 1 damages"),
+        "the report names the damage count: {text}"
+    );
+}
