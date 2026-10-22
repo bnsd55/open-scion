@@ -604,7 +604,16 @@ pub(crate) fn on_write<K: Kind>(
     changeset: &Changeset,
     lens: crate::tree::BlobLens<'_>,
 ) -> Result<()> {
-    if load::<K>(c, id)?.is_none()
+    // While the importer's batching is on, the caller is writing the
+    // transaction's own changesets: their ids are new, so the stored
+    // check cannot find anything, and the values the transaction
+    // inserted answer the parents' reads. The flush lands the rows.
+    let stored = if c.changeset_batching() {
+        None
+    } else {
+        load::<K>(c, id)?
+    };
+    if stored.is_none()
         && let Some(parents) = parent_values::<K>(c, changeset)?
     {
         let value = K::derive(c, id, changeset, parents, lens)?;
