@@ -115,7 +115,7 @@ drain still waits for.
 #### One server, and no automatic failover
 
 There is no automatic failover. One active server holds the store: a
-second server on the same data directory (or the same Postgres database)
+second server on the same data directory (or the same Postgres schema)
 refuses to start, and a running server whose lock the database gave to
 another process is fenced — it answers `FailedPrecondition` to every call
 and exits. That is the guard against two servers taking one store, not a
@@ -264,9 +264,10 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
   transaction per migration, under a database lock with the same 5 s clock:
   an open that waits longer answers busy, and the caller retries. A
   database of a newer build is refused: run that build's server.
-- One server process serves one database: a second `serve` on the same
-  `--postgres-url` fails at its open with "another server holds this
-  database". An import does not take that lock and runs beside a server.
+- One server process serves one store - a data directory, or a Postgres
+  schema: a second `serve` on the same `--postgres-url` (and schema)
+  fails at its open with "another server holds this store". An import
+  does not take that lock and runs beside a server.
 - The server opens one write connection and a pool of 8 read
   connections, plus the short-lived connections of a migration or an
   import. Size the database's `max_connections` for all of it: the
@@ -275,8 +276,9 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
   refuses the server's next connection, and every call that needs one
   answers `unavailable` until one is free.
 - The one-server rule and the write queue are Postgres advisory locks,
-  visible as `pg_locks` rows of kind `advisory`: the one-server lock
-  and the migration lock are fixed keys of the database, and every
+  visible as `pg_locks` rows of kind `advisory`: the one-server lock is
+  a key of the schema `current_schema()` names, the migration lock is a
+  fixed key of the database, and every
   write transaction also takes the schema's collector key
   (`pg_advisory_xact_lock(hashtext(current_schema() || ':gc'))`),
   which orders it against the collector's sweeps and gives up on that
@@ -369,6 +371,12 @@ The server records an audit log: an append-only JSON-lines file of
 refused authentication (counted per peer), writes, ref changes, lands
 and administrative changes, with no tokens and no contents. It lives at
 `audit.log` in the data directory; `--audit-file` puts it elsewhere.
+The CLI's state-changing subcommands record their own admin lines in
+the same file: one intent before a change, and one result after it.
+`gc` is the first, and the list grows with each slice. The collector
+is the runbook's cure for a full disk, so a gc whose intent cannot go
+in because the disk is full runs anyway, and records its intent, marked
+`deferred: disk_full`, after it freed the space.
 There is no way to turn it off: a server that cannot record refuses the
 changes it cannot account for, and flips readiness until a restart. The
 file is mode 0600, never a symlink, in a directory only the server's

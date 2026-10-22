@@ -170,6 +170,18 @@ pub trait MetaTx {
     /// Every parent of `id`, in order, with its generation.
     fn parents(&mut self, id: ChangesetId, id_gen: i64) -> Result<Vec<(ChangesetId, i64)>>;
 
+    /// The parents of up to [`DERIVED_BATCH`] merges, in the order asked:
+    /// for each merge, its parents in order with their generations. One
+    /// statement where the backend can. A merge asked twice in the batch
+    /// gets its parents once per ask. A merge with no parent rows gives an
+    /// empty list, as [`MetaTx::parents`] would.
+    ///
+    /// [`DERIVED_BATCH`]: crate::meta::DERIVED_BATCH
+    fn parents_many(
+        &mut self,
+        merges: &[(ChangesetId, i64)],
+    ) -> Result<Vec<Vec<(ChangesetId, i64)>>>;
+
     /// Whether `ancestor` is `descendant` or reachable from it, within a
     /// bounded walk.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -400,6 +412,11 @@ pub trait MetaTx {
 
     /// Whether `repo` may name `blob`.
     fn repo_has_blob(&mut self, repo: RepoId, blob: BlobId) -> Result<bool>;
+
+    /// The blobs of the list that `repo` may not name: what the member
+    /// check of `CreateChangeset` refuses. One read for the whole list, so
+    /// a changeset's cost does not grow with its change count.
+    fn repo_missing_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<Vec<BlobId>>;
 
     /// Every repo with its name, in ID order. The walker of `gc`.
     fn repos(&mut self) -> Result<Vec<(RepoId, String)>>;

@@ -584,6 +584,16 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn parents_many(
+        &mut self,
+        merges: &[(ChangesetId, i64)],
+    ) -> Result<Vec<Vec<(ChangesetId, i64)>>> {
+        match self {
+            Self::Sqlite(tx) => tx.parents_many(merges),
+            Self::Postgres(pg) => pg.parents_many(merges),
+        }
+    }
+
     fn get_ref(&mut self, repo: RepoId, name: &str) -> Result<Option<RefState>> {
         match self {
             Self::Sqlite(tx) => tx.get_ref(repo, name),
@@ -881,6 +891,13 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.repo_has_blob(repo, blob),
             Self::Postgres(pg) => pg.repo_has_blob(repo, blob),
+        }
+    }
+
+    fn repo_missing_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<Vec<BlobId>> {
+        match self {
+            Self::Sqlite(tx) => tx.repo_missing_blobs(repo, blobs),
+            Self::Postgres(pg) => pg.repo_missing_blobs(repo, blobs),
         }
     }
 

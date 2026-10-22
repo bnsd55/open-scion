@@ -66,6 +66,7 @@ pub(crate) enum Kind {
 }
 
 /// One acknowledged operation, and where in the run it happened.
+#[derive(Clone)]
 pub(crate) struct Entry {
     pub kind: Kind,
     pub where_: String,
@@ -111,6 +112,20 @@ impl OpLog {
     /// The entries, for a test that must inspect what it recorded.
     pub(crate) fn entries(&self) -> &[Entry] {
         &self.entries
+    }
+
+    /// Splits at `at`: the entries before it, and the rest. A backup
+    /// test uses it to part what was acknowledged before the snapshot
+    /// from what ran beside it.
+    pub(crate) fn split_at(mut self, at: usize) -> (OpLog, OpLog) {
+        let at = at.min(self.entries.len());
+        let post = self.entries.split_off(at);
+        (
+            OpLog {
+                entries: self.entries,
+            },
+            OpLog { entries: post },
+        )
     }
 }
 
@@ -256,6 +271,31 @@ pub(crate) fn fsck_ok(store: &scion_server::Backend, what: &str) {
 }
 
 /// `GetChangeset` as one call.
+/// `GetChangeset` without the panic: `None` when the server does not
+/// hold the changeset (the caller decides whether absence is allowed),
+/// an error for anything else.
+pub(crate) async fn try_get_changeset(
+    scion: &mut Scion,
+    id: ChangesetId,
+) -> Result<Option<(Changeset, ChangesetId)>, tonic::Status> {
+    let request = GetChangesetRequest {
+        repo: super::REPO.into(),
+        changeset_id: id.as_bytes().to_vec(),
+    };
+    let mut stream = match scion.get_changeset(request).await {
+        Ok(stream) => stream.into_inner(),
+        Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
+        Err(status) => return Err(status),
+    };
+    let mut bytes = Vec::new();
+    while let Some(part) = stream.message().await? {
+        bytes.extend_from_slice(&part.changeset);
+    }
+    Ok(Some(
+        Changeset::decode_with_id(&bytes).map_err(|e| tonic::Status::internal(e.to_string()))?,
+    ))
+}
+
 async fn get_changeset(scion: &mut Scion, id: ChangesetId) -> (Changeset, ChangesetId) {
     let request = GetChangesetRequest {
         repo: super::REPO.into(),
@@ -293,6 +333,33 @@ async fn ref_history(
         }
     }
     history
+}
+
+/// `ReadFile` without the panic: `Ok(None)` when the path is not there
+/// (the caller decides whether absence is allowed), an error for
+/// anything else.
+pub(crate) async fn try_read_file(
+    scion: &mut Scion,
+    changeset: ChangesetId,
+    path: &[u8],
+) -> Result<Option<Vec<u8>>, tonic::Status> {
+    let mut stream = match scion
+        .read_file(ReadFileRequest {
+            repo: super::REPO.into(),
+            changeset_id: changeset.as_bytes().to_vec(),
+            path: path.to_vec(),
+        })
+        .await
+    {
+        Ok(stream) => stream.into_inner(),
+        Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
+        Err(status) => return Err(status),
+    };
+    let mut bytes = Vec::new();
+    while let Some(part) = stream.message().await? {
+        bytes.extend_from_slice(&part.data);
+    }
+    Ok(Some(bytes))
 }
 
 /// `ReadFile` as one call: the whole bytes of `path` at `changeset`.

@@ -247,6 +247,19 @@ impl MetaTx for SqliteTx<'_> {
             .map_err(crate::error::from_sqlite)
     }
 
+    /// The blobs of the list that the repo does not have. A loop over
+    /// [`repo_has_blob`](Self::repo_has_blob) is fine here: the check is
+    /// local, so a list of any length costs no round trips.
+    fn repo_missing_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<Vec<BlobId>> {
+        let mut missing = Vec::new();
+        for blob in blobs {
+            if !self.repo_has_blob(repo, *blob)? {
+                missing.push(*blob);
+            }
+        }
+        Ok(missing)
+    }
+
     /// Reads a changeset that `repo` may see and checks it against its ID.
     ///
     /// # Errors
@@ -375,6 +388,17 @@ impl MetaTx for SqliteTx<'_> {
             Ok((parent, parent_gen))
         })
         .collect()
+    }
+
+    fn parents_many(
+        &mut self,
+        merges: &[(ChangesetId, i64)],
+    ) -> Result<Vec<Vec<(ChangesetId, i64)>>> {
+        // Local, no round trip: one prepared statement over the batch.
+        merges
+            .iter()
+            .map(|&(id, id_gen)| self.parents(id, id_gen))
+            .collect()
     }
 
     /// Whether `ancestor` is `descendant` or reachable from it through parents.
