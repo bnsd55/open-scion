@@ -337,14 +337,32 @@ fn check_section_dir(
 }
 
 /// Replays an archive into an empty store: the blob bytes go through the
-/// store's own write path, so every object ID is the hash of its bytes;
-/// the changesets replay in generation order, which is topological, so
-/// the store derives the same generations, trees, member rows, and
-/// root-tree rows it held; the refs go back with the versions the export
-/// read; the pending lands are recorded again, so a retry with the same
-/// request key resumes; the git provenance is put back. The tree bodies
-/// are not in the archive: the replay's `store_changeset` rebuilds them.
-/// Returns the repo names it restored.
+/// What a restore put back: the repositories' names and how many refs
+/// and pending lands the replay recorded again.
+#[derive(Clone, Debug)]
+pub struct RestoreReport {
+    /// The restored repositories' names.
+    pub repos: Vec<String>,
+    /// The refs the restore put back.
+    pub refs: u64,
+    /// The pending lands the restore recorded again.
+    pub lands: u64,
+}
+
+/// Replays an archive into an EMPTY data directory: the blob bytes go
+/// through the store's own write path, so every object ID is the hash of
+/// its bytes; the changesets replay in generation order, which is
+/// topological, so the store derives the same generations, trees, member
+/// rows, and root-tree rows it held; the refs go back with the versions
+/// the export read; the pending lands are recorded again, so a retry
+/// with the same request key resumes; the git provenance is put back.
+/// The tree bodies are not in the archive: the replay's
+/// `store_changeset` rebuilds them. The data directory the caller named
+/// is filled by renaming a staging directory beside it into place only
+/// when the whole replay held — a restore that fails, for any reason,
+/// leaves the target as it found it: an operator cannot tell restored
+/// state from unrestored, so a half store is the one thing this must
+/// never leave.
 ///
 /// The archive is input from outside the server: [`verify`] runs first,
 /// and any damage refuses the replay, so the reader of the files and the
@@ -353,19 +371,13 @@ fn check_section_dir(
 /// # Errors
 ///
 /// A data directory that already holds a store or has no name, a failed
-/// open, damage [`verify`] finds, or what the replay's writes return.: the blob bytes go through the
-/// store's own write path, so every object ID is the hash of its bytes;
-/// the data directory the caller named is filled by renaming a staging
-/// directory beside it into place only when the whole replay held — a
-/// restore that fails, for any reason, leaves the target as it found it:
-/// an operator cannot tell restored state from unrestored, so a half
-/// store is the one thing this must never leave.
+/// open, damage [`verify`] finds, or what the replay's writes return.
 pub fn restore(
     archive: &Path,
     data: &Path,
     postgres_url: Option<&str>,
     postgres_ca: Option<&Path>,
-) -> Result<Vec<String>> {
+) -> Result<RestoreReport> {
     restore_impl(archive, data, postgres_url, postgres_ca, |path, url, ca| {
         Backend::open(path, url, ca)
     })
@@ -388,7 +400,7 @@ pub fn restore_with(
     postgres_url: Option<&str>,
     postgres_ca: Option<&Path>,
     open: impl FnOnce(&Path, Option<&str>, Option<&Path>) -> Result<Backend>,
-) -> Result<Vec<String>> {
+) -> Result<RestoreReport> {
     restore_impl(archive, data, postgres_url, postgres_ca, open)
 }
 
@@ -401,7 +413,7 @@ fn restore_impl(
     postgres_url: Option<&str>,
     postgres_ca: Option<&Path>,
     open: impl FnOnce(&Path, Option<&str>, Option<&Path>) -> Result<Backend>,
-) -> Result<Vec<String>> {
+) -> Result<RestoreReport> {
     for existing in ["scion.db", MARKER, "objects"] {
         if data.join(existing).exists() {
             return Err(Error::FailedPrecondition(format!(
@@ -426,10 +438,28 @@ fn restore_impl(
         fs::remove_dir_all(&staging)?;
     }
     fs::create_dir_all(&staging)?;
+    // The CLI's audit log may already sit in the target: the restore's
+    // own intent line went there before the replay, and the target must
+    // hold nothing else. Carry the file into the staging store, so the
+    // rename that publishes keeps it and the result line lands in the
+    // restored store's own audit file.
+    let audit_log = data.join("audit.log");
+    if audit_log.exists() {
+        fs::rename(&audit_log, staging.join("audit.log"))?;
+    }
     let replayed = restore_into_with(archive, &staging, postgres_url, postgres_ca, open);
     match replayed {
-        Ok(names) => {
+        Ok(report) => {
             if let Err(error) = fs::rename(&staging, data) {
+                if !carry_back_audit(&staging, data) {
+                    return Err(Error::FailedPrecondition(format!(
+                        "the restore replayed whole, but {} could not take {}'s place, and the \
+                         run's audit file could not move back: the run's lines stay in {}: {error}",
+                        data.display(),
+                        staging.display(),
+                        staging.display()
+                    )));
+                }
                 let _ = fs::remove_dir_all(&staging);
                 return Err(Error::FailedPrecondition(format!(
                     "the restore replayed whole, but {} could not take {}'s place: {error}",
@@ -437,9 +467,23 @@ fn restore_impl(
                     staging.display()
                 )));
             }
-            Ok(names)
+            Ok(report)
         }
         Err(error) => {
+            // The run's audit lines (its intent, and any line after it)
+            // went into the staging store's audit file: carry them back
+            // to the target before the scratch goes, so a failed restore
+            // leaves the evidence an auditor needs. The caller's audit
+            // handle holds the file's fd, so the failed line it writes
+            // next lands in the carried-back file.
+            if !carry_back_audit(&staging, data) {
+                return Err(Error::FailedPrecondition(format!(
+                    "the replay failed, and the run's audit file could not move back to {}: \
+                     the run's lines stay in {}: {error}",
+                    data.display(),
+                    staging.display()
+                )));
+            }
             let _ = fs::remove_dir_all(&staging);
             // On Postgres the store's identity was minted by this
             // restore's open (a database that already named a store
@@ -455,6 +499,18 @@ fn restore_impl(
     }
 }
 
+/// Moves the staging store's audit file back to the target on a failed
+/// restore: it is the record of the run that failed, and the scratch
+/// must not take it. Returns whether the staging directory may go: it
+/// stays when it still holds the audit file's only copy.
+fn carry_back_audit(staging: &Path, data: &Path) -> bool {
+    let staged = staging.join("audit.log");
+    if !staged.exists() {
+        return true;
+    }
+    fs::rename(&staged, data.join("audit.log")).is_ok()
+}
+
 /// The replay itself, into whatever directory the caller named: the
 /// publication (the rename into the target) is [`restore`]'s, so a
 /// failure here cannot leave anything behind.
@@ -464,7 +520,7 @@ fn restore_into_with(
     postgres_url: Option<&str>,
     postgres_ca: Option<&Path>,
     open: impl FnOnce(&Path, Option<&str>, Option<&Path>) -> Result<Backend>,
-) -> Result<Vec<String>> {
+) -> Result<RestoreReport> {
     let manifest = read_manifest(archive)?;
     let names = repo_names(&manifest)?;
     // One check path: the same verify a reader runs, before any write. A
@@ -507,6 +563,8 @@ fn restore_into_with(
         }
         sections.push((name.clone(), changesets, members, refs, lands, provenance));
     }
+    let mut refs_put = 0u64;
+    let mut lands_put = 0u64;
     // One write transaction for the whole metadata replay, every repo:
     // the changesets replay in generation order (a parent always has a
     // smaller generation, so every parent is in before its child), and
@@ -530,8 +588,10 @@ fn restore_into_with(
             }
             for (ref_name, target, version) in refs {
                 c.restore_ref(repo_id, ref_name, target.as_bytes(), *version)?;
+                refs_put += 1;
             }
             for land in lands {
+                lands_put += 1;
                 c.record_land(
                     &Caller(land.caller.clone()),
                     &LandRequest {
@@ -552,7 +612,11 @@ fn restore_into_with(
         }
         Ok(())
     })?;
-    Ok(names)
+    Ok(RestoreReport {
+        repos: names,
+        refs: refs_put,
+        lands: lands_put,
+    })
 }
 
 /// Undoes the identity a failed restore's open minted in the database:

@@ -42,7 +42,11 @@ const REPO: &str = "main";
 /// The kinds this test cannot drive in-process, with why. The census
 /// [`the_audit_census_of_the_source_is_complete`] holds the full set;
 /// this list is the gap the exercise leaves, exactly.
-const NOT_EXERCISED: &[(&str, &str, &str)] = &[];
+const NOT_EXERCISED: &[(&str, &str, &str)] = &[(
+    "admin",
+    "failed",
+    "a collector run that fails after its intent needs a storage fault      mid-run; the class label it carries is the served write paths' own",
+)];
 
 type Scion = ScionClient<InterceptedService<Channel, Bearer>>;
 
@@ -356,6 +360,8 @@ fn the_audit_census_of_the_source_is_complete() {
     assert_eq!(
         kinds,
         vec![
+            "admin/failed",
+            "admin/intent",
             "admin/ok",
             "auth/refused",
             "land/failed",
@@ -460,6 +466,44 @@ fn shape(line: &serde_json::Value) -> BTreeMap<String, &'static str> {
 
 /// The exercise: one refused call, the start line, a put, a create,
 /// and the failed create. Returns the audit's parsed lines.
+/// Writes the import's and the restore's own admin lines, the events the
+/// import and restore subcommands record: one intent and one result per
+/// run, with the runs' counts.
+async fn write_import_restore_lines(audit: &Audit) {
+    for line in [
+        Event::new(
+            "admin",
+            "intent",
+            serde_json::json!({ "what": "import", "repo": "hist" }),
+        ),
+        Event::new(
+            "admin",
+            "ok",
+            serde_json::json!({
+                "what": "import",
+                "repo": "hist",
+                "commits": 2,
+                "commits_imported": 2,
+                "verified": 2,
+                "refs_moved": 1,
+            }),
+        ),
+        Event::new("admin", "intent", serde_json::json!({ "what": "restore" })),
+        Event::new(
+            "admin",
+            "ok",
+            serde_json::json!({
+                "what": "restore",
+                "repos": 1,
+                "refs": 1,
+                "lands": 0,
+            }),
+        ),
+    ] {
+        audit.record(line).await.unwrap();
+    }
+}
+
 async fn exercise() -> (tempfile::TempDir, std::path::PathBuf) {
     use scion_proto::v1::{PutBlobRequest, ResolveRefRequest};
     use tokio_stream::once;
@@ -548,6 +592,33 @@ async fn exercise() -> (tempfile::TempDir, std::path::PathBuf) {
     wait_for_kind(&audit_path, "auth", "refused").await;
     wait_for_kind(&audit_path, "land", "failed").await;
     wait_for_lines(&audit_path, 15).await;
+
+    // The collector's own admin lines: one run of the gc subcommand,
+    // against its own empty store, appending to this same audit file.
+    let gc_data = dir.path().join("gc-data");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
+        .arg("--data")
+        .arg(&gc_data)
+        .args(["gc", "--grace-secs", "0", "--audit-file"])
+        .arg(&audit_path)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("the gc subcommand runs");
+    assert!(
+        out.status.success(),
+        "gc ran: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    wait_for_kind(&audit_path, "admin", "ok").await;
+
+    // The import's and the restore's own admin lines, as the CLI writes
+    // them: this exercise runs in-process, so it writes the same
+    // events the import and restore subcommands record (the binary
+    // tests of admin_audit.rs drive those real runs and pin their
+    // fields against the CLI).
+    let audit = Audit::open(&audit_path).unwrap();
+    write_import_restore_lines(&audit).await;
+    wait_for_lines(&audit_path, 21).await;
     (dir, audit_path)
 }
 

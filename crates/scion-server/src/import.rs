@@ -129,6 +129,9 @@ pub struct ImportReport {
     pub imported: usize,
     /// Commits whose Scion tree was checked against the git tree.
     pub verified: usize,
+    /// Refs the import moved onto the tip: 1 when `target_ref` took the
+    /// tip, 0 when it already held or contained it.
+    pub refs_moved: usize,
     /// The changeset for the imported revision.
     pub tip: ChangesetId,
 }
@@ -285,18 +288,20 @@ fn import_with_cache(
     // that the server has not flushed yet. A full flush covers it, as it
     // covers every commit that another process made before it.
     store.flush()?;
-    pointed?;
+    let refs_moved = usize::from(pointed?);
     // Every planned check ran, or the import failed above.
     let report = ImportReport {
         commits: plan.reachable,
         imported: plan.todo.len(),
         verified: plan.verify.len(),
+        refs_moved,
         tip,
     };
     tracing::info!(
         commits = report.commits,
         imported = report.imported,
         verified = report.verified,
+        refs_moved,
         secs = started.elapsed().as_secs(),
         %tip,
         "git import done"
@@ -508,7 +513,9 @@ fn record(
 /// The move is a compare-and-swap on the ref's version, as a land's is. A
 /// server can land on the ref while the import checks it, so a lost swap
 /// checks the ref again.
-fn point_ref(store: &Backend, repo: RepoId, name: &str, tip: ChangesetId) -> Result<()> {
+/// Returns whether the call moved `name` onto `tip` (`false` when the ref
+/// already held or contained the tip).
+fn point_ref(store: &Backend, repo: RepoId, name: &str, tip: ChangesetId) -> Result<bool> {
     // The check runs in reads, outside any write transaction, so a server
     // that shares the data directory does not wait for it. Each check
     // reads O(log n) nodes of the derived commit graph, and stops at the
@@ -521,7 +528,7 @@ fn point_ref(store: &Backend, repo: RepoId, name: &str, tip: ChangesetId) -> Res
             // Already there, or the ref already contains the tip (changes
             // were landed on top of an earlier import): nothing to do.
             if current.target == tip || contains(current.target, tip)? {
-                return Ok(());
+                return Ok(false);
             }
             if !contains(tip, current.target)? {
                 return Err(Error::FailedPrecondition(format!(
@@ -541,7 +548,7 @@ fn point_ref(store: &Backend, repo: RepoId, name: &str, tip: ChangesetId) -> Res
             move_ref(store, repo, name)?;
         }
         if store.write(|c| c.cas_ref(repo, name, expected, tip))? {
-            return Ok(());
+            return Ok(true);
         }
         tracing::info!(
             name,

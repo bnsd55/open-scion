@@ -274,7 +274,29 @@ pub(crate) fn test_url() -> Result<String> {
 /// test-hooks feature, and so does this.
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn test_schema(data: &Path) -> String {
-    let path = data.canonicalize().unwrap_or_else(|_| data.to_path_buf());
+    // The hash must not move when the leaf directory appears: a first
+    // open of a data directory that does not exist yet would otherwise
+    // hash the raw path (on macOS /var is a symlink to /private/var, so
+    // the raw and the canonical spellings hash apart), and every open
+    // after the directory exists would hash the canonical one. The
+    // canonical form of the deepest existing ancestor, with the missing
+    // tail spelled as the caller spelled it, is one name for both.
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = data.to_path_buf();
+    let base = loop {
+        match cur.canonicalize() {
+            Ok(base) => break base,
+            Err(_) => match cur.file_name() {
+                Some(name) => {
+                    tail.push(name.to_owned());
+                    cur.pop();
+                }
+                None => break cur,
+            },
+        }
+    };
+    let tail: std::path::PathBuf = tail.into_iter().rev().collect();
+    let path = base.join(tail);
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(&path, &mut hasher);
     format!("scion_test_{:016x}", std::hash::Hasher::finish(&hasher))

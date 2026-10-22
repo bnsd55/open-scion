@@ -1003,7 +1003,7 @@ async fn a_land_cut_at_its_deadline_gets_exactly_one_answer() {
         }
     }
     let lines = read_lines(&audit_path);
-    let mut cancelled = 0;
+    let mut cut = 0;
     let mut arrived = 0;
     for i in 0..8 {
         let id = format!("t-land-{i}");
@@ -1023,15 +1023,21 @@ async fn a_land_cut_at_its_deadline_gets_exactly_one_answer() {
             .filter(|line| line["outcome"] != "intent")
             .count();
         assert_eq!(answers, 1, "exactly one answer to {id}'s intent");
-        if land_lines(&lines, &id)
-            .iter()
-            .any(|line| line["outcome"] == "failed" && line["why"] == "cancelled")
-        {
-            cancelled += 1;
+        // Which side answers is a race with no witness: idle, the drop
+        // answers `cancelled`; on a loaded runner the job claims the
+        // call before the 1 ns cut reaches the guard, and its own line
+        // answers `deadline_exceeded`. The drop's own cancelled path is
+        // pinned without timing by `service.rs`'s
+        // a_call_aborted_before_its_job_claims_it_answers_cancelled_and_records_nothing.
+        if land_lines(&lines, &id).iter().any(|line| {
+            line["outcome"] == "failed"
+                && (line["why"] == "cancelled" || line["why"] == "deadline_exceeded")
+        }) {
+            cut += 1;
         }
     }
     assert!(arrived >= 4, "most calls reached the server: {arrived}");
-    assert!(cancelled >= 1, "the 1 ns deadline cancelled a land");
+    assert!(cut >= 1, "the 1 ns deadline cut a land");
     stop.send(()).unwrap();
 }
 
