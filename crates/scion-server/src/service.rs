@@ -540,27 +540,27 @@ impl ScionService {
 
     /// The audit's answer the land job owes its intent: the outcome's
     /// own lines when the land ran, else the one failed line. The why
-    /// is the code label of the reply the caller reads, from the one
-    /// mapping an error and a reply share. The checks before the land
-    /// refuse a call after the guard already said STARTED, so the job
-    /// owes the intent its answer there too.
+    /// is the code label of the one Status the job built, the one the
+    /// reply carries too, so one error logs once. The checks before
+    /// the land refuse a call after the guard already said STARTED, so
+    /// the job owes the intent its answer there too.
     fn audit_land_outcome(
         audit: &crate::audit::Audit,
         request_id: &str,
         principal: &str,
         repo: &str,
         target_ref: &str,
-        outcome: &crate::error::Result<Result<land::LandOutcome, Status>>,
+        outcome: &Result<land::LandOutcome, Status>,
     ) {
         match outcome {
-            Ok(Ok(outcome)) => {
+            Ok(outcome) => {
                 for line in
                     Self::land_result_lines(request_id, principal, repo, target_ref, outcome)
                 {
                     Self::audit_result_blocking(audit, &line);
                 }
             }
-            Ok(Err(status)) => {
+            Err(status) => {
                 Self::audit_result_blocking(
                     audit,
                     &Self::land_failed_line(
@@ -569,18 +569,6 @@ impl ScionService {
                         repo,
                         target_ref,
                         code_label(status.code()),
-                    ),
-                );
-            }
-            Err(err) => {
-                Self::audit_result_blocking(
-                    audit,
-                    &Self::land_failed_line(
-                        request_id,
-                        principal,
-                        repo,
-                        target_ref,
-                        code_label(err.status().code()),
                     ),
                 );
             }
@@ -1675,19 +1663,18 @@ impl Scion for ScionService {
                 }
                 // A rebase keeps the changes, so these are the paths that the
                 // land changes, on any ref of the repo. Checked on every call,
-                // before the land records anything, also on a retry.
-                // A rebase keeps the changes, so these are the paths that the
-                // land changes, on any ref of the repo. Checked on every call,
-                // before the land records anything, also on a retry. The
-                // outer Result is the checks and the worker's own failures;
-                // the inner one is the land's own verdict, whose code the
-                // reply names.
-                let outcome: crate::error::Result<Result<land::LandOutcome, Status>> = (|| {
-                    let cs = read::get_changeset(&store, &req.repo, req.changeset)?;
-                    access.check_write(&caller, &req.repo, cs.changes().keys())?;
-                    Ok(lands.land(&store, &caller, &req).map_err(Status::from))
-                })(
-                );
+                // before the land records anything, also on a retry. Every
+                // refusal becomes its one Status here: the audit's label
+                // and the reply read the same value, so one error logs
+                // once.
+                let outcome: Result<land::LandOutcome, Status> = (|| {
+                    let cs = read::get_changeset(&store, &req.repo, req.changeset)
+                        .map_err(Status::from)?;
+                    access
+                        .check_write(&caller, &req.repo, cs.changes().keys())
+                        .map_err(Status::from)?;
+                    lands.land(&store, &caller, &req).map_err(Status::from)
+                })();
                 // The job that changed the state writes the state change's
                 // own lines, after the commit and outside the write
                 // transaction: the evidence does not depend on the call
@@ -1702,7 +1689,7 @@ impl Scion for ScionService {
                     &job_ref,
                     &outcome,
                 );
-                outcome
+                Ok(outcome)
             })
             .await;
         match ran {

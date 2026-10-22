@@ -292,19 +292,21 @@ impl Lands {
             if changed == 1 {
                 tracing::info!(land_id, "rejected a stale pending land");
                 // The intent's request id is the call's and is not
-                // stored; the line joins the intent on the request key
-                // and the land id.
+                // stored, so this line carries a fresh id of its own:
+                // the auditor joins it to the intent on the request key
+                // and the land id (both in the line), not on request_id.
                 if let Err(why) = audit.record_blocking(&crate::audit::Event::new(
                     "land",
                     "failed",
                     crate::service::json_fields(
-                        &request_key,
+                        &scion_proto::runtime::request_id::generate(),
                         &caller,
                         &serde_json::json!({
                             "rpc": "Land",
                             "repo": repo_name,
                             "ref": target_ref,
                             "land_id": land_id,
+                            "request_key": request_key,
                             "why": "stale",
                         }),
                     ),
@@ -3062,7 +3064,11 @@ mod tests {
             .collect();
         assert_eq!(results.len(), 1, "one result line for one intent");
         assert_eq!(results[0]["why"], "stale");
-        assert_eq!(results[0]["request_id"], "old");
+        // The request id is the sweep's own fresh id: the intent's
+        // request id is not stored, so the line joins the intent on the
+        // request key, not on request_id.
+        assert_eq!(results[0]["request_key"], "old");
+        assert_ne!(results[0]["request_id"], "old");
         assert_eq!(results[0]["land_id"], recorded.1.land_id);
     }
 

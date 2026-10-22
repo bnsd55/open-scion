@@ -382,10 +382,12 @@ linking old to new, not by line order.
 Every intent line gets one result line: the store job that claimed the
 change writes it, and a call that dies before its job starts has its
 drop answer `cancelled`; a land the sweep rejects at the next start is
-answered by the sweep (`why: stale`). One change is left where the
-result can be missing: a job that dies after it claimed the call but
-before it recorded anything - the server log then carries what the
-audit line cannot.
+answered by the sweep (`why: stale`) — that line carries a fresh
+request id of its own, because the sweep does not know the intent's:
+the auditor joins it to the intent on the request key and the land id.
+One change is left where the result can be missing: a job that dies
+after it claimed the call but before it recorded anything - the server
+log then carries what the audit line cannot.
 
 ### Folder read rules
 
