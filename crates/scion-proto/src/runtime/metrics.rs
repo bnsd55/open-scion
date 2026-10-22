@@ -1300,7 +1300,7 @@ mod tests {
     }
 
     /// The stalled gauge hides until a reply stalls, so the golden of
-    /// the metric surface (tests/metrics_golden.rs) cannot exercise
+    /// the metric surface (`tests/metrics_golden.rs`) cannot exercise
     /// it: its name, type and label set pin here instead.
     #[test]
     fn the_stalled_gauge_renders_once_a_reply_holds_bytes() {
