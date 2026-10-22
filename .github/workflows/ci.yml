@@ -38,10 +38,11 @@ jobs:
   # The tier gate. It reads the pull request's own file list from the
   # API: no checkout, no fetch, no third-party action. A PR that touches
   # only docs/**, *.md or changes/** cannot change behavior, so
-  # docs_only=true and only the docs tests run for it. A draft PR skips
-  # every job, this one included. The slow tier below (every job but
-  # lint, test and docs) never runs on a pull request: main, the
-  # nightly schedule and a dispatch run it as before.
+  # docs_only=true and only the docs tests run for it. The risk flags
+  # add jobs: pg adds test (postgres), macos adds test (macOS),
+  # workflows adds the release smoke. A draft PR skips every job, this
+  # one included. Main, the nightly schedule and a dispatch run every
+  # job as before.
   tier:
     name: what a pull request touches
     runs-on: ubuntu-24.04
@@ -49,21 +50,66 @@ jobs:
     if: github.event_name == 'pull_request' && !github.event.pull_request.draft
     outputs:
       docs_only: ${{ steps.files.outputs.docs_only }}
+      pg: ${{ steps.files.outputs.pg }}
+      macos: ${{ steps.files.outputs.macos }}
+      workflows: ${{ steps.files.outputs.workflows }}
     steps:
       - id: files
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # The path rules live here, once; the table is in the pull
+          # request body.
           files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/${{ github.event.pull_request.number }}/files" --jq '.[].filename')
           docs_only=true
+          pg=false
+          macos=false
+          workflows=false
           while IFS= read -r file; do
             [ -z "$file" ] && continue
             case "$file" in
               docs/*|*.md|changes/*) ;;
-              *) docs_only=false; break ;;
+              *) docs_only=false ;;
+            esac
+            # Postgres or metadata code, and the tests that opt into
+            # the Postgres backend (SCION_TEST_BACKEND).
+            case "$file" in
+              crates/scion-server/src/pg.rs|\
+              crates/scion-server/src/meta.rs|\
+              crates/scion-server/src/backend.rs|\
+              crates/scion-server/src/db.rs|\
+              crates/scion-server/migrations/*|\
+              crates/scion-server/tests/archive_attacks.rs|\
+              crates/scion-server/tests/backend_refusals.rs|\
+              crates/scion-server/tests/crash_pg.rs|\
+              crates/scion-server/tests/every_rpc_unauthenticated.rs|\
+              crates/scion-server/tests/import.rs|\
+              crates/scion-server/tests/migrate_log.rs|\
+              crates/scion-server/tests/serve_flags.rs|\
+              crates/scion-server/tests/write.rs) pg=true ;;
+            esac
+            # macOS or filesystem code: the tier store, the scn vfs
+            # and mount path, the permission checks.
+            case "$file" in
+              crates/scion-tier/*|\
+              crates/scn/src/vfs.rs|\
+              crates/scn/src/cmd/mount.rs|\
+              crates/scn/src/cmd/checkout.rs|\
+              crates/scn/src/materialize.rs) macos=true ;;
+            esac
+            # Workflow or release files. The lint job's actionlint
+            # step already runs for every pull request; the release
+            # smoke is the addition.
+            case "$file" in
+              .github/workflows/*|scripts/release*) workflows=true ;;
             esac
           done <<< "$files"
-          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+          {
+            echo "docs_only=$docs_only"
+            echo "pg=$pg"
+            echo "macos=$macos"
+            echo "workflows=$workflows"
+          } >> "$GITHUB_OUTPUT"
 
   lint:
     name: fmt + clippy
@@ -207,8 +253,12 @@ jobs:
 
   test-postgres:
     name: test (postgres)
-    # The slow tier: main, the nightly and a dispatch only.
-    if: github.event_name != 'pull_request'
+    needs: tier
+    # Risk tier: a pull request that touches Postgres or metadata code
+    # also runs this job, on one Postgres version as today. Main, the
+    # nightly and a dispatch always run it.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' && needs.tier.outputs.pg == 'true')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
@@ -267,8 +317,12 @@ jobs:
 
   test-macos:
     name: test (macOS)
-    # The slow tier: main, the nightly and a dispatch only.
-    if: github.event_name != 'pull_request'
+    needs: tier
+    # Risk tier: a pull request that touches the tier store, the scn
+    # vfs or mount path, or the permission checks also runs this job.
+    # Main, the nightly and a dispatch always run it.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' && needs.tier.outputs.macos == 'true')) }}
     runs-on: macos-15
     timeout-minutes: 40
     steps:
@@ -289,7 +343,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
         env:
-          PROPTEST_CASES: "2000"
+          # A pull request runs 500 cases, main and the nightly 2000.
+          PROPTEST_CASES: ${{ github.event_name == 'pull_request' && '500' || '2000' }}
       - name: the work tree is still clean after the tests
         run: |
           # New untracked files count too (a stray bench-output.txt);
@@ -545,8 +600,12 @@ jobs:
 
   release-smoke:
     name: release smoke (${{ matrix.os }})
-    # The slow tier: main, the nightly and a dispatch only.
-    if: github.event_name != 'pull_request'
+    needs: tier
+    # Risk tier: a pull request that touches a workflow or a release
+    # script also runs this job. Main, the nightly and a dispatch
+    # always run it.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' && needs.tier.outputs.workflows == 'true')) }}
     strategy:
       fail-fast: false
       matrix:
