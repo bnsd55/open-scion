@@ -347,9 +347,14 @@ fn writer(
                     changed
                 });
                 for msg in batch {
-                    let _ = msg.done.send(Err(io::Error::other(format!(
-                        "the audit line was not made durable: {why}"
-                    ))));
+                    // The kind is the caller's only window on why: a
+                    // full disk's StorageFull must survive the wrap, or
+                    // a remedy that runs on a full disk cannot tell the
+                    // disk's answer from any other refusal.
+                    let _ = msg.done.send(Err(io::Error::new(
+                        why.kind(),
+                        format!("the audit line was not made durable: {why}"),
+                    )));
                 }
             }
         }
@@ -359,7 +364,10 @@ fn writer(
 fn append(file: &mut std::fs::File, batch: &[Msg], faults: &AtomicU64) -> io::Result<()> {
     if faults.load(Ordering::Relaxed) > 0 {
         faults.fetch_sub(1, Ordering::Relaxed);
-        return Err(io::Error::other(
+        // The kind of a full disk, so the test can watch what a caller
+        // that distinguishes out-of-space sees.
+        return Err(io::Error::new(
+            io::ErrorKind::StorageFull,
             "the audit append was made to fail by the test hook",
         ));
     }
@@ -535,6 +543,23 @@ mod tests {
         a.unwrap();
         b.unwrap();
         assert_eq!(read_lines(&path).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_write_error_keeps_its_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let audit = Audit::open(&path).unwrap();
+        audit.fail_next_appends(1).unwrap();
+        let why = audit
+            .record(Event::new("write", "ok", json!({})))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            why.kind(),
+            io::ErrorKind::StorageFull,
+            "the caller reads the disk's answer, not a generic other: {why:?}"
+        );
     }
 
     #[tokio::test]
