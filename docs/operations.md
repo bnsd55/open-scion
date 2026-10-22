@@ -300,7 +300,11 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
   the database against a directory that names another store is refused
   with both UUIDs, so a restore that mixes a database with the wrong
   directory fails at the start instead of serving metadata whose blobs
-  are not on this disk.
+  are not on this disk. A directory whose marker names a store also
+  refuses a database that holds no store at all - the usual cause is a
+  `--postgres-url` whose search_path names a schema no store ever
+  served - so the mistake fails at the start, not as "repo not found"
+  on every later call.
 - One server process serves one database, and it stays that way: if the
   server's connection drops and the lock is lost to another process, the
   server is fenced. Every read and write fails with the loss named, the
