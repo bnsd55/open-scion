@@ -194,7 +194,8 @@ fn a_full_metadata_disk_answers_out_of_space_and_needs_no_repair() {
     }
     if Backend::test_is_postgres() {
         // The metadata lives in the database then; its disk full is the
-        // SQLSTATE 53100 arm, not a data-directory row.
+        // SQLSTATE 53100 arm of the pg mapping, a unit test of pg.rs,
+        // not a data-directory row.
         return;
     }
     let mount = Mount::new("meta", "1m", "4096");

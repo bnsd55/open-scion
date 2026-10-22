@@ -54,8 +54,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use common::*;
 use scion_core::BlobId;
+use scion_server::Backend;
 use scion_server::test_support::store::BlobStatus;
-use scion_server::test_support::store::Store;
 use tonic::Status;
 
 /// The `LazyFS` checkout the suite runs against: it must hold
@@ -256,6 +256,19 @@ fn seed() -> u64 {
     seed
 }
 
+/// The lands pending in this directory's metadata, whatever backend
+/// holds it: a SQLite file beside the blobs, or the schema the test
+/// database names for the directory. The read runs on threads of its
+/// own, because the sync client blocks on its connection's runtime and
+/// the test's async worker already hosts one.
+fn pending(data: &std::path::Path) -> i64 {
+    std::thread::scope(|s| {
+        s.spawn(|| common::LandsReader::open(data).counts().1)
+            .join()
+            .unwrap()
+    })
+}
+
 /// The real server, several clients, and a cut at three kinds of moment, as
 /// in the crash suite: at a random moment, in the middle of a large upload,
 /// and while a land is pending. Every reply the clients got must survive:
@@ -323,17 +336,13 @@ async fn every_reply_survives_a_power_cut() {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
             _ => {
-                let db = rusqlite::Connection::open(data.join("scion.db")).unwrap();
                 wait_until_bounded("a land is pending in the database", 5, || {
-                    pending_lands(&db) > 0
+                    pending(&data) > 0
                 })
                 .await;
             }
         }
-        let pending_at_kill = {
-            let db = rusqlite::Connection::open(data.join("scion.db")).unwrap();
-            pending_lands(&db) > 0
-        };
+        let pending_at_kill = pending(&data) > 0;
         if pending_at_kill {
             pending_kills += 1;
         }
@@ -681,7 +690,7 @@ async fn run_acked_waves(events: &EventLog, round: usize, url: &str, rng: &mut R
 }
 
 /// Says every acknowledged blob and every blob file of the store verifies.
-fn verify_whole(store: &Store, acked: &[BlobId], events: &EventLog, round: usize, data: &Path) {
+fn verify_whole(store: &Backend, acked: &[BlobId], events: &EventLog, round: usize, data: &Path) {
     events.line(&format!("round {round}: reopens, {} acked", acked.len()));
     for id in acked {
         let status = store.blobs().verify(*id).unwrap();
@@ -707,6 +716,14 @@ fn verify_whole(store: &Store, acked: &[BlobId], events: &EventLog, round: usize
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn racing_puts_of_one_blob_survive_a_cut() {
     if !may_run() {
+        return;
+    }
+    if Backend::test_is_postgres() {
+        // The park that makes the race certain is a SQLite hook: it parks
+        // the store's writer, and the Postgres store has no park. The
+        // blob path of the race is the data directory's, and the cut rows
+        // above prove it; this row stays SQLite-proven.
+        eprintln!("skip on postgres: the write park is a SQLite hook");
         return;
     }
     let lazyfs = lazyfs_dir().unwrap();
@@ -819,7 +836,7 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
         // The store reopens from the backing directory: what `LazyFS`
         // persisted, and nothing else.
         let data = lazy.backing.join("data");
-        let store = Store::open_shared(&data).unwrap();
+        let store = open_store_shared(&data);
         verify_whole(&store, &acked[..], &events, round, &data);
         drop(store);
         drop(lazy);
@@ -908,7 +925,7 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
         // after the close: from there on, only the daemon's exit can change
         // a byte.
         let backing = lazy.backing.join("data");
-        let store = Store::open_shared(&backing).unwrap();
+        let store = open_store_shared(&backing);
         for (id, _) in &acked {
             let status = store.blobs().verify(*id).unwrap();
             assert_eq!(status, BlobStatus::Valid, "acknowledged blob {id}");
@@ -938,7 +955,7 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
             panic!("the backing changed while the mount went away: {changed:?}");
         }
         // What the checker verified still verifies.
-        let store = Store::open_shared(&backing).unwrap();
+        let store = open_store_shared(&backing);
         for (id, _) in &acked {
             let status = store.blobs().verify(*id).unwrap();
             assert_eq!(status, BlobStatus::Valid, "blob {id} after the exit");
@@ -957,6 +974,13 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn import_process_races_the_server_on_the_same_blob() {
     if !may_run() {
+        return;
+    }
+    if Backend::test_is_postgres() {
+        // The park that holds the server's writer between keep and rename
+        // is a SQLite hook, and the import beside it opens the data
+        // directory's own database. The row stays SQLite-proven.
+        eprintln!("skip on postgres: the write park is a SQLite hook");
         return;
     }
     let lazyfs = lazyfs_dir().unwrap();
@@ -1048,7 +1072,7 @@ async fn import_process_races_the_server_on_the_same_blob() {
     // the backing, where only synced writes live.
     let backing = lazy.backing.join("data");
     drop(lazy);
-    let store = Store::open_shared(&backing).unwrap();
+    let store = open_store_shared(&backing);
     let status = store.blobs().verify(id).unwrap();
     assert_eq!(status, BlobStatus::Valid, "raced blob {id}");
     drop(store);
