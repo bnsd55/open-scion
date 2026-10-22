@@ -71,6 +71,9 @@ pub(crate) mod error;
 // These two are API, not implementation: a server main runs them by hand,
 // and docs/operations.md documents both. Everything else in the list is
 // an implementation detail of the two binaries, however public it looks.
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "test_support/docs.rs"]
+pub(crate) mod docs_hooks;
 pub mod fsck;
 pub mod gc;
 pub(crate) mod graph;
@@ -261,6 +264,11 @@ pub mod test_support {
     /// The on-disk store, so tests open and inspect one directly.
     pub mod store {
         pub use crate::store::*;
+    }
+    /// The guide's own commands, so a Proof's test runs the block under
+    /// its runbook's heading instead of retyping it.
+    pub mod docs {
+        pub use crate::docs_hooks::*;
     }
     /// Tree apply and the per-changeset root tree.
     pub mod tree {
