@@ -297,6 +297,12 @@ scion_pg_collector_key_wait_seconds_count
 # HELP scion_data_free_bytes Free bytes of the filesystem that holds the data directory.
 # TYPE scion_data_free_bytes gauge
 scion_data_free_bytes
+# HELP scion_derive_walks_in_flight Derive walks holding a permit now.
+# TYPE scion_derive_walks_in_flight gauge
+scion_derive_walks_in_flight
+# HELP scion_derive_walks_waiting Derive walks waiting for a permit.
+# TYPE scion_derive_walks_waiting gauge
+scion_derive_walks_waiting
 # HELP scion_pg_pool_wait_seconds Time a call waited for a Postgres reader, in seconds.
 # TYPE scion_pg_pool_wait_seconds histogram
 scion_pg_pool_wait_seconds_bucket{le="0.001"}
