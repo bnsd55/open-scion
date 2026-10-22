@@ -747,9 +747,12 @@ fn base64_of(bytes: &[u8]) -> String {
 #[test]
 fn an_open_that_migrates_writes_its_line_once() {
     if scion_server::Backend::test_is_postgres() {
-        // A Postgres database's schema is the fleet's: no single open
-        // moves it, so there is no migration for a process to record.
-        println!("skipping: the migration line is a SQLite store's");
+        // The Postgres line rides the same code path this test pins (the
+        // open's migration reports its versions, and the record goes in
+        // before the command's pair); a test of it needs a schema at an
+        // older version, and the Postgres migrations are not idempotent,
+        // so no test seam makes one.
+        println!("skipping: the migrate line's path is pinned on SQLite");
         return;
     }
     let dir = tempfile::tempdir().unwrap();

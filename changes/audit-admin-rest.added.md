@@ -7,12 +7,13 @@ records `admin`/`failed` with the class. Making the counts real,
 `backfill` returns a `DeriveReport` (the kind's name, the rows it wrote,
 the rows of older versions it removed) instead of a bare name.
 
-An open that migrates a SQLite store's schema records one
+An open that migrates a store's schema records one
 `admin`/`ok` line `{what: migrate, from, to}` as soon as the audit can
 open, before the command's own pair: the migration ran inside the
 store's open, before the audit could exist, so no intent can precede
-it. A fresh open creates the schema and reports no migration; a
-Postgres database's schema is the fleet's, and no single open moves it.
+it. A fresh open creates the schema and reports no migration. Both
+engines report their move: a Postgres open runs its own migrations at
+open, and its runner reports the versions the same way SQLite's does.
 
 The `ticket-key` subcommand records one intent before the key exists
 and one ok after it is on the disk. The lines carry the what and

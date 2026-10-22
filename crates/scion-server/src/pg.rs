@@ -139,6 +139,9 @@ struct PgInner {
     /// The UUID of this database, written at the first open and carried
     /// by the marker file of the data directory.
     store_uuid: [u8; 16],
+    /// The schema versions this open moved, when it migrated. Version 0's
+    /// first open creates the schema, and reports none.
+    migrated: Option<(u32, u32)>,
     /// Clients for [`Pg::read`], at most [`READERS`](crate::store::READERS)
     /// at once, like the readers of a SQLite store.
     readers: Readers,
@@ -766,7 +769,7 @@ impl Pg {
         } else {
             connect_with(url, ca, &options, schema)?
         };
-        migrate(&mut writer)?;
+        let migrated = migrate(&mut writer)?;
         // The durability of a commit is a promise of this backend: check
         // that the server kept its side of it.
         let on: String = writer.query("SHOW synchronous_commit", &[])?[0].get(0);
@@ -836,6 +839,7 @@ impl Pg {
             writer: Mutex::new(writer),
             fence,
             store_uuid,
+            migrated,
             readers: Readers::new_with(readers, url, ca, &options, schema)?,
             blobs,
             writers: Mutex::new(0),
@@ -875,6 +879,12 @@ impl Pg {
     /// directory also carries.
     pub(crate) fn store_uuid(&self) -> [u8; 16] {
         self.inner.store_uuid
+    }
+
+    /// The schema versions this open moved, when it migrated: the
+    /// process that opened records the move in its audit log.
+    pub(crate) fn migrated(&self) -> Option<(u32, u32)> {
+        self.inner.migrated
     }
 
     /// Fails when the fence tripped: the process lost the database to
@@ -1871,8 +1881,12 @@ fn make_tls(ca: &Path) -> Result<MakeRustlsConnect> {
 
 /// Brings the database to this build's schema: runs every migration it has
 /// not run yet, in one transaction each, and refuses a schema of a newer
-/// build.
-fn migrate(client: &mut PgClient) -> Result<()> {
+/// build. Returns the `(from, to)` versions when it migrated, and `None`
+/// when the database was at this build's version already. A database of
+/// version 0 was no schema at all: the first open creates one, and a
+/// creation moves nothing.
+#[allow(clippy::needless_pass_by_ref_mut)]
+fn migrate(client: &mut PgClient) -> Result<Option<(u32, u32)>> {
     // One process at a time migrates: a lock of the session, held across
     // the migrations, so a server and an import started together take
     // turns while the migrations are quick, and the version the loser
@@ -1889,7 +1903,7 @@ fn migrate(client: &mut PgClient) -> Result<()> {
 }
 
 /// The migrations themselves, under the session's schema lock.
-fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
+fn migrate_under_lock(client: &mut PgClient) -> Result<Option<(u32, u32)>> {
     // The ledger of the versions, made first, in its own transaction: a
     // migration that fails leaves the ledger and every version before it.
     client.batch(
@@ -1915,7 +1929,7 @@ fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
         )));
     }
     if version == PG_SCHEMA_VERSION {
-        return Ok(());
+        return Ok(None);
     }
     tracing::info!(
         from_version = version,
@@ -1950,7 +1964,14 @@ fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
         to_version = PG_SCHEMA_VERSION,
         "the metadata migration is done"
     );
-    Ok(())
+    // Version 0 was no schema at all: the first open creates one, and a
+    // creation moves nothing.
+    let migrated = if version == 0 {
+        None
+    } else {
+        Some((version, PG_SCHEMA_VERSION))
+    };
+    Ok(migrated)
 }
 
 /// Reads a tree's rows and checks them against its ID.
