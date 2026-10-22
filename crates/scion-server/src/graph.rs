@@ -363,6 +363,14 @@ fn in_steps<T>(
 /// through another parent of the merge. So this searches the first-parent
 /// history of the descendant, then does the same from each such parent. It
 /// takes each merge once.
+///
+/// The merge chain runs on node reads alone: a merge's own node holds its
+/// first parent, so the walk defers the parents query and collects the
+/// taken merges. At most [`DERIVED_BATCH`] of them wait; then one parents
+/// statement fetches the whole batch's parents, and the side parents that
+/// pass the floor join the stack of histories. The deferral reorders the
+/// search: the same merges and side parents are taken, so the answer is
+/// the same, which the property tests pin against the ancestor sets.
 struct Search {
     ancestor: ChangesetId,
     /// The changeset the walk starts from; the cache seeds with its node.
@@ -374,6 +382,8 @@ struct Search {
     merge: Option<Link>,
     /// The merges taken.
     merges: HashSet<ChangesetId>,
+    /// The merges whose side parents still wait for their batch.
+    deferred: Vec<At>,
 }
 
 impl Search {
@@ -385,6 +395,7 @@ impl Search {
             next: vec![from],
             merge: None,
             merges: HashSet::new(),
+            deferred: Vec::new(),
         }
     }
 
@@ -398,32 +409,69 @@ impl Search {
             if at.generation <= self.floor || !self.merges.insert(at.id) {
                 return Ok(None);
             }
-            let parents = index.parents(at)?;
-            let Some((&(first, _), others)) = parents.split_first() else {
-                return Err(Error::Corrupt(format!(
-                    "commit graph: merge {} has no parents",
-                    at.id
-                )));
-            };
-            let side_ids: Vec<ChangesetId> = others
-                .iter()
-                .filter(|&&(_, generation)| generation >= self.floor)
-                .map(|&(parent, _)| parent)
-                .collect();
-            for at in index.at_batch(&side_ids)? {
-                self.next.push(at);
+            // The chain goes on without the parents query: the merge's own
+            // node holds its first parent. Its side parents wait for the
+            // next parents batch.
+            let at = index.at(at.id)?;
+            self.deferred.push(at);
+            if self.deferred.len() >= DERIVED_BATCH {
+                self.take_deferred(index)?;
             }
-            self.merge = index.at(first)?.node.merge;
+            self.merge = index.at(at.node.parent.id)?.node.merge;
             return Ok(None);
         }
         let Some(from) = self.next.pop() else {
-            return Ok(Some(false));
+            if self.deferred.is_empty() {
+                return Ok(Some(false));
+            }
+            // Every history is searched; the last merges' side parents
+            // still wait in the batch.
+            self.take_deferred(index)?;
+            return Ok(None);
         };
         if index.descend(from, self.floor, |link| link.generation)?.id == self.ancestor {
             return Ok(Some(true));
         }
         self.merge = from.node.merge;
         Ok(None)
+    }
+
+    /// Takes the deferred merges' side parents: one parents statement for
+    /// the whole batch, then the side parents that pass the floor join the
+    /// stack of histories to search, their nodes in one batch statement.
+    /// A merge whose parents are missing is a corrupt graph, as when the
+    /// parents came one merge at a time.
+    fn take_deferred(&mut self, index: &mut Index) -> Result<()> {
+        let deferred = std::mem::take(&mut self.deferred);
+        let merges = deferred
+            .iter()
+            .map(|at| (at.id, at.node.generation))
+            .collect::<Vec<_>>();
+        let fetched = index.c.parents_many(&merges)?;
+        let mut side_ids = Vec::new();
+        for (at, parents) in deferred.iter().zip(fetched) {
+            let Some((&(first, _), others)) = parents.split_first() else {
+                return Err(Error::Corrupt(format!(
+                    "commit graph: merge {} has no parents",
+                    at.id
+                )));
+            };
+            if first != at.node.parent.id {
+                return Err(Error::Corrupt(format!(
+                    "commit graph: merge {} has parent {first} first, its node says {}",
+                    at.id, at.node.parent.id
+                )));
+            }
+            for &(parent, generation) in others {
+                if generation >= self.floor {
+                    side_ids.push(parent);
+                }
+            }
+        }
+        for at in index.at_batch(&side_ids)? {
+            self.next.push(at);
+        }
+        Ok(())
     }
 }
 
@@ -595,10 +643,6 @@ struct Index<'a> {
     deadline: &'a Deadline,
     reads: usize,
     nodes: &'a mut HashMap<ChangesetId, Node>,
-    /// Changesets whose nodes the walk will likely ask for next: the links
-    /// of every node read so far. Fetched in one batch statement when the
-    /// queue fills, or on the first cache miss.
-    prefetch: Vec<ChangesetId>,
 }
 
 impl<'a> Index<'a> {
@@ -612,7 +656,6 @@ impl<'a> Index<'a> {
             deadline,
             reads: 0,
             nodes,
-            prefetch: Vec::new(),
         }
     }
 
@@ -637,90 +680,28 @@ impl<'a> Index<'a> {
     ///
     /// [`DERIVED_BATCH`]: crate::meta::DERIVED_BATCH
     fn at_batch(&mut self, ids: &[ChangesetId]) -> Result<Vec<At>> {
-        self.prefetch.extend_from_slice(ids);
-        self.flush_prefetch()?;
+        let nodes = derived::load_batch::<CommitGraph>(self.c, ids)?;
         self.reads += ids.len();
         self.deadline.check()?;
         ids.iter()
-            .map(|id| {
-                Ok(At {
-                    id: *id,
-                    node: self.node(*id)?,
-                })
+            .zip(nodes)
+            .map(|(id, node)| {
+                let node =
+                    node.ok_or_else(|| Error::Corrupt(format!("commit graph: no node for {id}")))?;
+                self.nodes.insert(*id, node);
+                Ok(At { id: *id, node })
             })
             .collect()
     }
 
-    /// The node of a changeset, from the cache or one statement. A miss
-    /// reads the node alone and queues its links; the queue flushes in one
-    /// batch statement only when it fills, so a chain of hops pays one
-    /// statement per batch of links, not one per hop.
+    /// The node of a changeset, from the cache or one statement.
     fn node(&mut self, id: ChangesetId) -> Result<Node> {
         if let Some(node) = self.nodes.get(&id) {
             return Ok(*node);
         }
-        if self.prefetch.len() >= DERIVED_BATCH {
-            self.flush_prefetch()?;
-            if let Some(node) = self.nodes.get(&id) {
-                return Ok(*node);
-            }
-        }
-        let node = derived::load::<CommitGraph>(self.c, id)?
-            .ok_or_else(|| Error::Corrupt(format!("commit graph: no node for {id}")))?;
+        let node = node(self.c, id)?;
         self.nodes.insert(id, node);
-        self.queue_links(&node);
         Ok(node)
-    }
-
-    /// Queues the changesets a node points to for the next batch. Only
-    /// nodes not in the cache: a queue of cached ids would make every
-    /// flush fetch a full batch to learn almost nothing.
-    fn queue_links(&mut self, node: &Node) {
-        for id in [node.parent.id, node.jump.id]
-            .into_iter()
-            .chain(node.merge.iter().map(|link| link.id))
-        {
-            if self.nodes.contains_key(&id) {
-                continue;
-            }
-            if self.prefetch.contains(&id) {
-                continue;
-            }
-            if self.prefetch.len() >= DERIVED_BATCH {
-                return;
-            }
-            self.prefetch.push(id);
-        }
-    }
-
-    /// Fetches the queued nodes in one batch statement, up to the batch
-    /// cap, and empties the queue. A node the walk never asks for costs a
-    /// row in the reply, not a statement. The links of every node fetched
-    /// join the queue, so the walk's frontier stays ahead of the walk and
-    /// a chain of hops pays one statement per batch, not one per hop.
-    ///
-    /// # Errors
-    ///
-    /// What the database returns.
-    fn flush_prefetch(&mut self) -> Result<()> {
-        if self.prefetch.is_empty() {
-            return Ok(());
-        }
-        self.prefetch.truncate(DERIVED_BATCH);
-        let ids = std::mem::take(&mut self.prefetch);
-        let nodes = derived::load_batch::<CommitGraph>(self.c, &ids)?;
-        let mut fresh: Vec<Node> = Vec::new();
-        for (id, node) in ids.into_iter().zip(nodes) {
-            if let Some(node) = node
-                && self.nodes.insert(id, node).is_none()
-            {
-                fresh.push(node);
-            }
-        }
-        for node in &fresh {
-            self.queue_links(node);
-        }
-        Ok(())
     }
 
     /// Every parent of a merge, in order, with its generation.
@@ -1359,5 +1340,38 @@ mod tests {
         // None where the commit's own fsync flushes the drive cache.
         let flushes = store.blobs().full_flushes() - before;
         assert_eq!(flushes, u64::from(crate::store::FSYNC_LEAVES_DRIVE_CACHE));
+    }
+
+    /// The parents batch changes no walk's read count: every changeset the
+    /// walk reaches counts one read, as when every merge asked for its
+    /// parents alone. The step budget and the deadline ride on these
+    /// counts, so the batching must not move them. The numbers are the
+    /// walks' counts when every merge asked for its parents in its own
+    /// statement: the merge's parents read became the merge's node read.
+    #[test]
+    fn the_parents_batch_counts_the_same_reads() {
+        let (_dir, store, repo, ids) = store_graph(&ladder(100));
+        let (side, tip) = (ids[1], *ids.last().unwrap());
+        let floor = store.read(|c| c.generation(repo, side)).unwrap();
+        let mut search = Search::new(At::get_unbounded(&store, repo, tip).unwrap(), side, floor);
+        let (found, cost) = in_steps(&store, &later(), STEPS, &mut HashMap::new(), |index| {
+            search.next(index)
+        })
+        .unwrap();
+        assert!(found);
+        // 100 merges: a node read for the merge and one for its first
+        // parent, one for each side parent, and the history the search
+        // descends around them.
+        assert_eq!(cost.reads, 313, "{cost:?}");
+        let mut paint = Paint::new(
+            At::get_unbounded(&store, repo, side).unwrap(),
+            At::get_unbounded(&store, repo, tip).unwrap(),
+        );
+        let (bases, cost) = in_steps(&store, &later(), STEPS, &mut HashMap::new(), |index| {
+            paint.next(index)
+        })
+        .unwrap();
+        assert_eq!(bases, [side]);
+        assert_eq!(cost.reads, 300, "{cost:?}");
     }
 }
