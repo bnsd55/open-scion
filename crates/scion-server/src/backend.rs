@@ -541,6 +541,26 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn preload_derived_chain(
+        &mut self,
+        kind: &str,
+        version: u32,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.preload_derived_chain(kind, version, start, limit),
+            Self::Postgres(pg) => pg.preload_derived_chain(kind, version, start, limit),
+        }
+    }
+
+    fn changeset_batching(&self) -> bool {
+        match self {
+            Self::Sqlite(tx) => tx.changeset_batching(),
+            Self::Postgres(pg) => pg.changeset_batching(),
+        }
+    }
+
     fn flush_changeset_rows(&mut self, repo: RepoId) -> Result<()> {
         match self {
             Self::Sqlite(tx) => tx.flush_changeset_rows(repo),

@@ -28,6 +28,7 @@ use scion_core::{
 
 use crate::backend::Backend;
 use crate::deadline::{CALL_LIMIT, Deadline};
+use crate::derived::Kind;
 use crate::error::{Error, Git, Result};
 use crate::graph;
 use crate::meta::Meta as _;
@@ -374,6 +375,23 @@ fn store_batch(
                 // changeset_parents, repo_changesets, derived, history,
                 // git_import.
                 c.set_changeset_batching(true);
+                // The batch's first commits derive from parents this
+                // transaction did not insert. Holding their first-parent
+                // chains of derived values (one chain read each) makes
+                // every read outside the batch - the Myers' jump of
+                // commit_graph, the parents' generations - cost one read
+                // for the whole chain, never one per commit; a jump past
+                // the preloaded chain falls back to a single read.
+                if let Some((_, first, _)) = rest.first() {
+                    for parent in first.parents() {
+                        c.preload_derived_chain(
+                            <crate::graph::CommitGraph as Kind>::NAME,
+                            <crate::graph::CommitGraph as Kind>::VERSION,
+                            *parent,
+                            crate::meta::DERIVED_BATCH_I64,
+                        )?;
+                    }
+                }
                 for (commit, cs, git_tree) in rest {
                     #[cfg(test)]
                     if !slow_record.is_zero() {

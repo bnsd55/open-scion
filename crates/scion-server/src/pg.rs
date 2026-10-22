@@ -353,9 +353,9 @@ enum Param {
     /// A list of integers, for the bulk seed's and the batch flush's
     /// `unnest` over `int8[]`.
     I64Array(Vec<i64>),
-    /// A list of strings, for the bulk seed's `unnest` over `text[]`.
-    #[cfg(any(test, feature = "test-hooks"))]
-    TextArray(Vec<&'static str>),
+    /// A list of strings, for the bulk seed's and the batch flush's
+    /// `unnest` over `text[]`.
+    TextArray(Vec<String>),
 }
 
 impl Param {
@@ -390,8 +390,7 @@ impl Param {
     }
 
     /// A list of strings, as one `text[]` parameter.
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn text_array(v: Vec<&'static str>) -> Param {
+    fn text_array(v: Vec<String>) -> Param {
         Param::TextArray(v)
     }
 }
@@ -410,7 +409,6 @@ impl ToSql for Param {
             Self::OptBytes(v) => v.to_sql(t, out),
             Self::ByteaArray(v) => v.to_sql(t, out),
             Self::I64Array(v) => v.to_sql(t, out),
-            #[cfg(any(test, feature = "test-hooks"))]
             Self::TextArray(v) => v.to_sql(t, out),
         }
     }
@@ -432,7 +430,6 @@ impl ToSql for Param {
             Self::OptBytes(v) => v.to_sql(t, out),
             Self::ByteaArray(v) => v.to_sql(t, out),
             Self::I64Array(v) => v.to_sql(t, out),
-            #[cfg(any(test, feature = "test-hooks"))]
             Self::TextArray(v) => v.to_sql(t, out),
         }
     }
@@ -926,12 +923,16 @@ impl Pg {
         self.check_fenced()?;
         let (mut writer, _waiting) = self.lock_writer();
         let mut pending = Vec::new();
+        let mut derived = Vec::new();
+        let mut preload = std::collections::HashMap::new();
         let mut pg = PgTx {
             c: &mut writer,
             gen_cache: std::collections::HashMap::new(),
             inserted_gens: std::collections::HashMap::new(),
             cs_batching: false,
             cs_pending: Some(&mut pending),
+            derived_pending: Some(&mut derived),
+            derived_preload: Some(&mut preload),
             ended: true,
         };
         f(&mut pg)
@@ -991,7 +992,9 @@ impl Pg {
         // default: every change of the caller checks the newest state of
         // the row it touches (the CAS predicates).
         let mut pending = Vec::new();
-        let mut tx = PgTx::begin(&mut writer, &mut pending)?;
+        let mut derived = DerivedPending::default();
+        let mut preload = std::collections::HashMap::new();
+        let mut tx = PgTx::begin(&mut writer, &mut pending, &mut derived, &mut preload)?;
         // Every writer and the collector's batches of one schema order on
         // one advisory key, held to the end of the transaction: what a
         // SQLite write transaction gets from the data directory's one
@@ -1038,11 +1041,9 @@ impl Pg {
         )?;
         match f(&mut tx) {
             Ok(value) => {
-                if tx
-                    .cs_pending
-                    .as_deref()
-                    .is_some_and(|pending| !pending.is_empty())
-                {
+                let unflushed = tx.cs_pending.as_deref().is_some_and(|p| !p.is_empty())
+                    || tx.derived_pending.as_deref().is_some_and(|p| !p.is_empty());
+                if unflushed {
                     // A caller that turned the importer's batching on and
                     // ended the transaction without the flush would
                     // commit changesets with no parents and no repo
@@ -1051,7 +1052,8 @@ impl Pg {
                     // the bug surfaces at the caller that forgot the
                     // flush, not as missing rows later.
                     tracing::error!(
-                        pending = tx.cs_pending.as_ref().map_or(0, |pending| pending.len()),
+                        pending = tx.cs_pending.as_ref().map_or(0, |p| p.len())
+                            + tx.derived_pending.as_ref().map_or(0, |p| p.len()),
                         "the transaction holds changeset rows it never flushed; \
                          the transaction rolls back"
                     );
@@ -1178,6 +1180,13 @@ impl Drop for PgWriteWaiter<'_> {
 /// [`Meta::Tx`] names it, and the trait re-exports through
 /// `test_support::meta`.
 #[allow(unreachable_pub)]
+/// The derived rows a batching transaction holds for the flush.
+type DerivedPending = Vec<(String, i64, ChangesetId, Vec<u8>)>;
+
+/// The derived values of the chains a batching transaction preloaded, by
+/// (kind, version, id).
+type DerivedPreload = std::collections::HashMap<(String, i64, Vec<u8>), Vec<u8>>;
+
 pub struct PgTx<'a> {
     c: &'a mut PgClient,
     /// The generations this transaction has already read. A changeset's
@@ -1209,6 +1218,16 @@ pub struct PgTx<'a> {
     /// commit without the flush. `None` on a read transaction, which
     /// inserts nothing.
     cs_pending: Option<&'a mut Vec<(ChangesetId, Vec<ChangesetId>)>>,
+    /// The derived rows the transaction inserted while batching: the
+    /// flush writes them one statement per 1,000 rows, after the
+    /// changesets they name. Shared with the reborrows, like the
+    /// changesets' pending list.
+    derived_pending: Option<&'a mut DerivedPending>,
+    /// The derived values of the chains the importer preloaded, by
+    /// (kind, version, id): the batch's reads of ancestors outside the
+    /// transaction cost one chain read for the whole chain, not one per
+    /// commit. Shared with the reborrows.
+    derived_preload: Option<&'a mut DerivedPreload>,
     /// The transaction was ended by `commit` or `rollback`; a drop then
     /// leaves the client alone.
     ended: bool,
@@ -1220,6 +1239,8 @@ impl<'a> PgTx<'a> {
     fn begin(
         c: &'a mut PgClient,
         pending: &'a mut Vec<(ChangesetId, Vec<ChangesetId>)>,
+        derived: &'a mut DerivedPending,
+        preload: &'a mut DerivedPreload,
     ) -> Result<PgTx<'a>> {
         c.execute("BEGIN", &[])?;
         Ok(Self {
@@ -1228,6 +1249,8 @@ impl<'a> PgTx<'a> {
             inserted_gens: std::collections::HashMap::new(),
             cs_batching: false,
             cs_pending: Some(pending),
+            derived_pending: Some(derived),
+            derived_preload: Some(preload),
             ended: false,
         })
     }
@@ -1263,6 +1286,8 @@ impl<'a> PgTx<'a> {
             inserted_gens: std::collections::HashMap::new(),
             cs_batching: false,
             cs_pending: None,
+            derived_pending: None,
+            derived_preload: None,
             ended: false,
         };
         tx.c.execute(
@@ -1290,6 +1315,8 @@ impl<'a> PgTx<'a> {
             // The reborrows share the pending list with the original, so
             // its commit path sees what they inserted.
             cs_pending: self.cs_pending.as_deref_mut(),
+            derived_pending: self.derived_pending.as_deref_mut(),
+            derived_preload: self.derived_preload.as_deref_mut(),
             ended: true,
         }
     }
@@ -2011,7 +2038,9 @@ fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
         // versions before it stand.
         let step = std::time::Instant::now();
         let mut pending = Vec::new();
-        let mut tx = PgTx::begin(client, &mut pending)?;
+        let mut derived = Vec::new();
+        let mut preload = std::collections::HashMap::new();
+        let mut tx = PgTx::begin(client, &mut pending, &mut derived, &mut preload)?;
         tx.c.batch(&format!(
             "{sql}\nINSERT INTO schema_migrations (version, name) \
              VALUES ({}, 'postgres schema')",
@@ -2180,11 +2209,12 @@ impl MetaTx for PgTx<'_> {
             return Ok(id);
         }
         // Every parent as one statement, however many a merge has: the
-        // row number is the parent's place in the array.
+        // row number is the parent's place in the array, counting from
+        // zero, as the first-parent readers and the seed writer count.
         if !parents.is_empty() {
             self.c.execute(
                 "INSERT INTO changeset_parents (cs, n, parent)
-                 SELECT $1, ord, parent
+                 SELECT $1, ord - 1, parent
                  FROM unnest($2::bytea[]) WITH ORDINALITY AS parents(parent, ord)
                  ON CONFLICT (cs, n) DO NOTHING",
                 &[
@@ -2212,17 +2242,27 @@ impl MetaTx for PgTx<'_> {
         }
     }
 
+    /// Whether the import's changeset batching is on.
+    fn changeset_batching(&self) -> bool {
+        self.cs_batching
+    }
+
     /// Writes the parents and the repo membership of the changesets the
     /// transaction inserted while batching, one statement per 1,000 rows
     /// per table, and returns how many statements it wrote. The parents'
     /// row numbers follow the per-commit insert's contract (the parent's
-    /// place, counting from one, as `WITH ORDINALITY` numbers it).
+    /// place in the array, counting from zero). The
+    /// transaction's derived rows land after them, in the order the
+    /// foreign keys read: `changesets`, `changeset_parents`,
+    /// `repo_changesets`, `derived`, `history`, `git_import` - the
+    /// history rows join the batch in the slice after this one.
     ///
     /// # Errors
     ///
     /// Database errors.
     fn flush_changeset_rows(&mut self, repo: RepoId) -> Result<()> {
         const CHUNK: usize = 1_000;
+        const DELETE_CHUNK: usize = 10_000;
         let Some(pending) = self.cs_pending.as_deref_mut() else {
             return Ok(());
         };
@@ -2233,7 +2273,7 @@ impl MetaTx for PgTx<'_> {
         let mut member_rows: Vec<(i64, Vec<u8>)> = Vec::new();
         for (id, parents) in pending.drain(..) {
             let key = id_bytes(id.as_bytes());
-            for (n, parent) in (1_i64..).zip(&parents) {
+            for (n, parent) in (0_i64..).zip(&parents) {
                 parent_rows.push((key.clone(), n, id_bytes(parent.as_bytes())));
             }
             member_rows.push((repo.0, key));
@@ -2268,6 +2308,83 @@ impl MetaTx for PgTx<'_> {
                  ON CONFLICT (repo_id, cs) DO NOTHING",
                 &[P::i64_array(repos), P::bytea_array(css)],
             )?;
+        }
+        // The derived rows the transaction inserted, after the changesets
+        // they name: one statement per 1,000 rows, then one delete of the
+        // older versions per kind, which the per-commit writes ran as
+        // part of each write.
+        let Some(derived) = self.derived_pending.as_deref_mut() else {
+            return Ok(());
+        };
+        let mut kinds: Vec<(String, i64)> = Vec::new();
+        for (k, v, ..) in derived.iter() {
+            match kinds.iter_mut().find(|(kind, _)| kind == k) {
+                Some((_, seen)) => *seen = (*seen).max(*v),
+                None => kinds.push((k.clone(), *v)),
+            }
+        }
+        for chunk in derived.chunks(CHUNK) {
+            let kinds = chunk.iter().map(|(k, ..)| k.clone()).collect::<Vec<_>>();
+            let versions = chunk.iter().map(|(_, v, _, _)| *v).collect::<Vec<_>>();
+            let css = chunk
+                .iter()
+                .map(|(_, _, cs, _)| id_bytes(cs.as_bytes()))
+                .collect::<Vec<_>>();
+            let values = chunk
+                .iter()
+                .map(|(_, _, _, value)| value.clone())
+                .collect::<Vec<_>>();
+            self.c.execute(
+                "INSERT INTO derived (kind, version, cs, value)
+                 SELECT * FROM unnest($1::text[], $2::int8[], $3::bytea[], $4::bytea[])
+                 ON CONFLICT (kind, version, cs) DO NOTHING",
+                &[
+                    P::text_array(kinds),
+                    P::i64_array(versions),
+                    P::bytea_array(css),
+                    P::bytea_array(values),
+                ],
+            )?;
+        }
+        // One delete of the older versions per kind, as the per-commit
+        // write ran as part of each write: below the newest version the
+        // batch wrote, bounded like the per-commit delete.
+        for (kind, version) in &kinds {
+            self.c.execute(
+                "DELETE FROM derived WHERE (kind, version, cs) IN (
+                     SELECT kind, version, cs FROM derived
+                     WHERE kind = $1 AND version < $2 LIMIT $3)",
+                &[
+                    P::text(kind.clone()),
+                    P::i64(*version),
+                    P::i64(i64::try_from(DELETE_CHUNK).unwrap_or(i64::MAX)),
+                ],
+            )?;
+        }
+        derived.clear();
+        Ok(())
+    }
+
+    /// Holds the derived values of the first-parent chain that starts at
+    /// `start`, so the batch's reads of them cost nothing.
+    fn preload_derived_chain(
+        &mut self,
+        kind: &str,
+        version: u32,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<()> {
+        if !self.cs_batching {
+            return Ok(());
+        }
+        let rows = self.get_derived_chain(kind, version, start, limit)?;
+        if let Some(preload) = self.derived_preload.as_deref_mut() {
+            for (cs, value) in rows {
+                preload.insert(
+                    (kind.to_owned(), i64::from(version), id_bytes(cs.as_bytes())),
+                    value,
+                );
+            }
         }
         Ok(())
     }
@@ -2608,7 +2725,12 @@ impl MetaTx for PgTx<'_> {
         Ok(())
     }
 
-    /// The stored bytes of a derived value, if computed.
+    /// The stored bytes of a derived value, if computed. While the
+    /// importer's batching is on, the values this transaction inserted
+    /// answer first (newest insert wins), then the chains the importer
+    /// preloaded, then the database: the batch's derives chain through
+    /// the values it inserted, and the reads of the ancestors outside
+    /// the transaction cost what the preload already paid for.
     fn get_derived(
         &mut self,
         kind: &str,
@@ -2616,15 +2738,28 @@ impl MetaTx for PgTx<'_> {
         cs: ChangesetId,
     ) -> Result<Option<Vec<u8>>> {
         let version = i64::from(version);
+        let key = id_bytes(cs.as_bytes());
+        if self.cs_batching {
+            if let Some(pending) = self.derived_pending.as_deref() {
+                for (k, v, c, value) in pending.iter().rev() {
+                    if *k == kind && *v == version && id_bytes(c.as_bytes()) == key {
+                        return Ok(Some(value.clone()));
+                    }
+                }
+            }
+            if let Some(value) = self
+                .derived_preload
+                .as_deref()
+                .and_then(|preload| preload.get(&(kind.to_owned(), version, key.clone())))
+            {
+                return Ok(Some(value.clone()));
+            }
+        }
         Ok(self
             .c
             .query_opt(
                 "SELECT value FROM derived WHERE kind = $1 AND version = $2 AND cs = $3",
-                &[
-                    P::text(kind),
-                    P::i64(version),
-                    P::bytes(&id_bytes(cs.as_bytes())),
-                ],
+                &[P::text(kind), P::i64(version), P::bytes(&key)],
             )?
             .map(|row| row.get(0)))
     }
@@ -2776,6 +2911,17 @@ impl MetaTx for PgTx<'_> {
         cs: ChangesetId,
         value: &[u8],
     ) -> Result<()> {
+        // While the importer's batching is on, the row waits for the
+        // flush, which writes it in batches and checks nothing: the
+        // batch's changesets are new, so no stored row can disagree, and
+        // the flush lands inside this transaction. The buffer answers
+        // this transaction's reads of the same value.
+        if self.cs_batching
+            && let Some(pending) = self.derived_pending.as_deref_mut()
+        {
+            pending.push((kind.to_owned(), i64::from(version), cs, value.to_vec()));
+            return Ok(());
+        }
         let version64 = i64::from(version);
         let inserted = self.c.execute(
             "INSERT INTO derived (kind, version, cs, value) VALUES ($1, $2, $3, $4)
@@ -2796,8 +2942,15 @@ impl MetaTx for PgTx<'_> {
     }
 
     /// Deletes up to `limit` derived values of `kind` with a version below
-    /// `version`, and returns how many.
+    /// `version`, and returns how many. While the importer's batching is
+    /// on, this waits for the flush, which deletes once per kind for the
+    /// whole transaction: the end state is the same, and the old rows of
+    /// a version a batch is still writing are readable garbage until the
+    /// flush lands.
     fn delete_derived_below(&mut self, kind: &str, version: u32, limit: usize) -> Result<usize> {
+        if self.cs_batching {
+            return Ok(0);
+        }
         let version = i64::from(version);
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let deleted = self.c.execute(
@@ -3692,7 +3845,10 @@ impl PgTx<'_> {
     ) -> Result<()> {
         const CHUNK: usize = 1_000;
         for chunk in rows.chunks(CHUNK) {
-            let kinds = chunk.iter().map(|(kind, ..)| *kind).collect::<Vec<_>>();
+            let kinds = chunk
+                .iter()
+                .map(|(kind, ..)| (*kind).to_owned())
+                .collect::<Vec<_>>();
             let versions = chunk
                 .iter()
                 .map(|(_, version, ..)| *version)

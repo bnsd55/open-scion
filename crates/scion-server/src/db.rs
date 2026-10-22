@@ -195,6 +195,20 @@ impl MetaTx for SqliteTx<'_> {
     /// batch buys no round trips), so this holds nothing.
     fn set_changeset_batching(&mut self, _on: bool) {}
 
+    fn preload_derived_chain(
+        &mut self,
+        _kind: &str,
+        _version: u32,
+        _start: ChangesetId,
+        _limit: i64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn changeset_batching(&self) -> bool {
+        false
+    }
+
     /// Writes what the batching held back: nothing, on SQLite.
     ///
     /// # Errors

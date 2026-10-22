@@ -159,10 +159,32 @@ pub trait MetaTx {
     /// `insert_changeset` writes the changesets row only: the parents and
     /// the repo membership of the transaction's changesets wait for
     /// [`MetaTx::flush_changeset_rows`], which writes them in batches at
-    /// the transaction's end. A transaction that turns this on must flush
-    /// before it ends, and its changesets must come parents first, so the
-    /// batch's generations chain in memory.
+    /// the transaction's end. The derived values of the transaction's
+    /// changesets wait the same way: `put_derived` holds the row, and
+    /// `get_derived` answers from the values the transaction inserted
+    /// before it reads the database, so the batch's derives chain through
+    /// it. A transaction that turns this on must flush before it ends,
+    /// and its changesets must come parents first, so the batch's
+    /// generations chain in memory.
     fn set_changeset_batching(&mut self, on: bool);
+
+    /// Holds the derived values on the first-parent chain that starts at
+    /// `start`, so the batch's reads of them cost nothing: the importer
+    /// preloads the first commits' parents' chains, and a jump outside
+    /// what the transaction inserted then costs one read for the whole
+    /// chain, not one per commit.
+    fn preload_derived_chain(
+        &mut self,
+        kind: &str,
+        version: u32,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<()>;
+
+    /// Whether the import's changeset batching is on: the caller writes
+    /// the transaction's own changesets, so their derived checks that
+    /// read what was just written wait for the flush.
+    fn changeset_batching(&self) -> bool;
 
     /// Writes the parents and the repo membership that
     /// [`MetaTx::set_changeset_batching`] held back, one statement per
