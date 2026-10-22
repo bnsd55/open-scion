@@ -386,10 +386,22 @@ async fn gc_command(
     // The run's intent, before anything moves: a crash after it leaves
     // an intent with no result, which tells the auditor a run started.
     let what = serde_json::json!({ "what": "gc", "dry_run": dry_run });
-    audit
+    // The collector is the runbook's cure for the disk it writes its own
+    // line to: an intent append that fails because the disk is full must
+    // not stop the run. The deferred intent goes in after the run freed
+    // the space, marked with why it was late. Every other audit failure
+    // still refuses before any change.
+    let deferred = match audit
         .record(scion_server::Event::new("admin", "intent", what.clone()))
         .await
-        .with_context(|| "cannot record the gc intent in the audit log".to_owned())?;
+    {
+        Ok(()) => false,
+        Err(e) if is_disk_full(&e) => true,
+        Err(e) => {
+            return Err(anyhow::Error::new(e))
+                .with_context(|| "cannot record the gc intent in the audit log".to_owned());
+        }
+    };
     let started = std::time::Instant::now();
     let report = match gc::run(store, grace, dry_run, &mut |_| {}) {
         Ok(report) => report,
@@ -401,6 +413,9 @@ async fn gc_command(
                 "dry_run": dry_run,
                 "why": error_class(&e),
             });
+            if deferred {
+                write_deferred_intent(&audit, dry_run, false).await;
+            }
             if let Err(record_why) = audit
                 .record(scion_server::Event::new("admin", "failed", fields))
                 .await
@@ -420,10 +435,10 @@ async fn gc_command(
         "rows_young": report.rows_young,
         "files_young": report.files_young,
     });
-    audit
-        .record(scion_server::Event::new("admin", "ok", fields))
-        .await
-        .with_context(|| "cannot record the gc result in the audit log".to_owned())?;
+    // The run's report goes out first: on a full disk the deferred
+    // lines may still fail, and the operator reads the stdout either
+    // way. The deferred intent goes in before the result, so the file
+    // reads in the order the run happened.
     println!(
         "gc: {} repos, {} rows pruned, {} files removed{}",
         report.repos,
@@ -431,10 +446,43 @@ async fn gc_command(
         report.files_removed,
         if dry_run { " (dry run)" } else { "" },
     );
+    if deferred {
+        write_deferred_intent(&audit, dry_run, true).await;
+    }
+    audit
+        .record(scion_server::Event::new("admin", "ok", fields))
+        .await
+        .with_context(|| "cannot record the gc result in the audit log".to_owned())?;
     if let Some(path) = metrics_file {
         write_gc_metrics_file(path, &report, started.elapsed(), dry_run);
     }
     Ok(())
+}
+
+/// Whether an audit write failed because the disk is out of space: the
+/// collector is the remedy for exactly this, so a gc must run anyway.
+fn is_disk_full(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    )
+}
+
+/// Writes the intent line a disk-full audit deferred: the run freed the
+/// space, so the line goes in now, marked with why it was late. An
+/// append that still fails ends the process with the run's own status:
+/// the report is already on stdout, and there is nothing left to record
+/// it with.
+async fn write_deferred_intent(audit: &scion_server::Audit, dry_run: bool, run_ok: bool) {
+    let mut what = serde_json::json!({ "what": "gc", "dry_run": dry_run });
+    what["deferred"] = serde_json::json!("disk_full");
+    if let Err(why) = audit
+        .record(scion_server::Event::new("admin", "intent", what))
+        .await
+    {
+        eprintln!("scion-server gc: the run's intent line is still not recorded: {why}");
+        std::process::exit(i32::from(!run_ok));
+    }
 }
 
 /// Writes the metrics file of `scion-server gc --metrics-file`: the
