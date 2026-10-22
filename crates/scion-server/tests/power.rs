@@ -310,7 +310,15 @@ async fn every_reply_survives_a_power_cut() {
         });
         let mut server = Server::start(&data, &log);
         eprintln!("round {round}: server up");
-        check(&server.url, &data, &mut ledger, &mut checked, &mut rng).await;
+        check(
+            &server.url,
+            &data,
+            &data,
+            &mut ledger,
+            &mut checked,
+            &mut rng,
+        )
+        .await;
         eprintln!("round {round}: check 1 done");
         let signals = Arc::new(Signals::default());
         let clients: Vec<_> = (0..CLIENTS)
@@ -367,11 +375,23 @@ async fn every_reply_survives_a_power_cut() {
         }
         total += ledger.lands.len();
         // The store reopens from the backing directory: what `LazyFS`
-        // persisted, and nothing else.
+        // persisted, and nothing else. The server serves the schema the
+        // first open named: the metadata lives in the database of the
+        // original path, and the backing path would name a fresh, empty
+        // schema, whose open adopts the marker and serves nothing. The
+        // schema follows the store, not the path.
         let data = lazy.backing.join("data");
-        let server = Server::start(&data, &log);
+        let server = Server::start_reopened(&data, &lazy.mount.join("data"), &log);
         eprintln!("round {round}: restart up");
-        check(&server.url, &data, &mut ledger, &mut checked, &mut rng).await;
+        check(
+            &server.url,
+            &data,
+            &lazy.mount.join("data"),
+            &mut ledger,
+            &mut checked,
+            &mut rng,
+        )
+        .await;
         eprintln!("round {round}: check 2 done");
         drop(server);
         drop(lazy);
@@ -834,9 +854,11 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
         ));
         acked.extend(ids);
         // The store reopens from the backing directory: what `LazyFS`
-        // persisted, and nothing else.
+        // persisted, and nothing else. The schema follows the store, not
+        // the path: the metadata lives in the database the original
+        // path's schema names.
         let data = lazy.backing.join("data");
-        let store = open_store_shared(&data);
+        let store = open_store_shared_reopened(&data, &lazy.mount.join("data"));
         verify_whole(&store, &acked[..], &events, round, &data);
         drop(store);
         drop(lazy);
@@ -925,7 +947,10 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
         // after the close: from there on, only the daemon's exit can change
         // a byte.
         let backing = lazy.backing.join("data");
-        let store = open_store_shared(&backing);
+        // The schema follows the store, not the path: the metadata lives
+        // in the database the original path's schema names, and the
+        // backing path would name a fresh, empty schema.
+        let store = open_store_shared_reopened(&backing, &data);
         for (id, _) in &acked {
             let status = store.blobs().verify(*id).unwrap();
             assert_eq!(status, BlobStatus::Valid, "acknowledged blob {id}");
@@ -955,7 +980,7 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
             panic!("the backing changed while the mount went away: {changed:?}");
         }
         // What the checker verified still verifies.
-        let store = open_store_shared(&backing);
+        let store = open_store_shared_reopened(&backing, &data);
         for (id, _) in &acked {
             let status = store.blobs().verify(*id).unwrap();
             assert_eq!(status, BlobStatus::Valid, "blob {id} after the exit");
@@ -1072,7 +1097,9 @@ async fn import_process_races_the_server_on_the_same_blob() {
     // the backing, where only synced writes live.
     let backing = lazy.backing.join("data");
     drop(lazy);
-    let store = open_store_shared(&backing);
+    // The schema follows the store, not the path (inert on SQLite, whose
+    // metadata is the directory).
+    let store = open_store_shared_reopened(&backing, &data);
     let status = store.blobs().verify(id).unwrap();
     assert_eq!(status, BlobStatus::Valid, "raced blob {id}");
     drop(store);
