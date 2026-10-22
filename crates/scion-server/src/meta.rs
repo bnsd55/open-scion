@@ -428,6 +428,11 @@ pub trait MetaTx {
     /// Whether `repo` may name `blob`.
     fn repo_has_blob(&mut self, repo: RepoId, blob: BlobId) -> Result<bool>;
 
+    /// The blobs of the list that `repo` may not name: what the member
+    /// check of `CreateChangeset` refuses. One read for the whole list, so
+    /// a changeset's cost does not grow with its change count.
+    fn repo_missing_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<Vec<BlobId>>;
+
     /// Every repo with its name, in ID order. The walker of `gc`.
     fn repos(&mut self) -> Result<Vec<(RepoId, String)>>;
 

@@ -2117,6 +2117,34 @@ impl MetaTx for PgTx<'_> {
             .is_some())
     }
 
+    /// The blobs of the list that the repo does not have. One statement
+    /// per 1,000 ids, the chunk size of [`add_repo_blobs`](Self::add_repo_blobs):
+    /// a changeset may name 100,000 changes, and one query per blob
+    /// would cost one round trip each.
+    fn repo_missing_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<Vec<BlobId>> {
+        const CHUNK: usize = 1_000;
+        let mut missing = Vec::new();
+        for chunk in blobs.chunks(CHUNK) {
+            let ids: Vec<Vec<u8>> = chunk.iter().map(|blob| id_bytes(blob.as_bytes())).collect();
+            let rows = self.c.query(
+                "SELECT x FROM unnest($2::bytea[]) AS x
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM repo_blobs WHERE repo_id = $1 AND blob = x
+                 )",
+                &[P::i64(repo.0), P::bytea_array(ids)],
+            )?;
+            for row in rows {
+                let bytes: Vec<u8> = row.get(0);
+                missing.push(BlobId::from_bytes(
+                    bytes
+                        .try_into()
+                        .expect("the stored blob column holds 32-byte ids"),
+                ));
+            }
+        }
+        Ok(missing)
+    }
+
     /// Reads a changeset that `repo` may see and checks it against its ID.
     ///
     /// # Errors

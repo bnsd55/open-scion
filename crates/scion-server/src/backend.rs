@@ -887,6 +887,13 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn repo_missing_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<Vec<BlobId>> {
+        match self {
+            Self::Sqlite(tx) => tx.repo_missing_blobs(repo, blobs),
+            Self::Postgres(pg) => pg.repo_missing_blobs(repo, blobs),
+        }
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     fn is_ancestor(
         &mut self,
