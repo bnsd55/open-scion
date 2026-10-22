@@ -23,6 +23,7 @@
 use std::collections::BTreeMap;
 
 use scion_core::Changeset;
+use scion_core::ChangesetId;
 use scion_server::test_support::meta::Meta as _;
 use scion_server::test_support::read;
 use scion_server::test_support::seed;
@@ -46,6 +47,72 @@ fn later() -> Deadline {
     Deadline::new(Instant::now() + Duration::from_secs(600))
 }
 
+/// The ladder's changesets and the ids the budget test walks between:
+/// the root, `merges` side branches joined by merges, and one late and
+/// one early changeset off the ladder.
+fn ladder_changesets(
+    merges: usize,
+) -> (
+    Vec<Changeset>,
+    Vec<ChangesetId>,
+    Vec<ChangesetId>,
+    ChangesetId,
+    ChangesetId,
+) {
+    let mut css = vec![
+        Changeset::new(vec![], author(), None, b"root".to_vec(), BTreeMap::new())
+            .expect("changeset fits the format"),
+    ];
+    let mut main = vec![css[0].encode_with_id().1];
+    let mut sides = Vec::new();
+    for i in 0..merges {
+        let last = *main.last().unwrap();
+        let side = Changeset::new(
+            vec![last],
+            author(),
+            None,
+            format!("side {i}").into_bytes(),
+            BTreeMap::new(),
+        )
+        .expect("changeset fits the format");
+        let side_id = side.encode_with_id().1;
+        let merge = Changeset::new(
+            vec![last, side_id],
+            author(),
+            None,
+            format!("merge {i}").into_bytes(),
+            BTreeMap::new(),
+        )
+        .expect("changeset fits the format");
+        let merge_id = merge.encode_with_id().1;
+        css.push(side);
+        css.push(merge);
+        main.push(merge_id);
+        sides.push(side_id);
+    }
+    let late = Changeset::new(
+        vec![sides[0]],
+        author(),
+        None,
+        b"late".to_vec(),
+        BTreeMap::new(),
+    )
+    .expect("changeset fits the format");
+    let early = Changeset::new(
+        vec![main[0]],
+        author(),
+        None,
+        b"early".to_vec(),
+        BTreeMap::new(),
+    )
+    .expect("changeset fits the format");
+    let late_id = late.encode_with_id().1;
+    let early_id = early.encode_with_id().1;
+    css.push(late);
+    css.push(early);
+    (css, main, sides, late_id, early_id)
+}
+
 #[test]
 fn the_ladder_walks_stay_under_the_statement_budget() {
     if !Backend::test_is_postgres() {
@@ -55,63 +122,13 @@ fn the_ladder_walks_stay_under_the_statement_budget() {
     let merges = 10_000;
     let dir = tempfile::tempdir().unwrap();
     let store = Backend::open_test(dir.path()).unwrap();
+    let (css, main, sides, late, early) = ladder_changesets(merges);
     let (main, sides, late, early) = store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
-            let mut css = vec![
-                Changeset::new(vec![], author(), None, b"root".to_vec(), BTreeMap::new())
-                    .expect("changeset fits the format"),
-            ];
-            let mut main = vec![css[0].encode_with_id().1];
-            let mut sides = Vec::new();
-            for i in 0..merges {
-                let last = *main.last().unwrap();
-                let side = Changeset::new(
-                    vec![last],
-                    author(),
-                    None,
-                    format!("side {i}").into_bytes(),
-                    BTreeMap::new(),
-                )
-                .expect("changeset fits the format");
-                let side_id = side.encode_with_id().1;
-                let merge = Changeset::new(
-                    vec![last, side_id],
-                    author(),
-                    None,
-                    format!("merge {i}").into_bytes(),
-                    BTreeMap::new(),
-                )
-                .expect("changeset fits the format");
-                let merge_id = merge.encode_with_id().1;
-                css.push(side);
-                css.push(merge);
-                main.push(merge_id);
-                sides.push(side_id);
-            }
-            let late = Changeset::new(
-                vec![sides[0]],
-                author(),
-                None,
-                b"late".to_vec(),
-                BTreeMap::new(),
-            )
-            .expect("changeset fits the format");
-            let early = Changeset::new(
-                vec![main[0]],
-                author(),
-                None,
-                b"early".to_vec(),
-                BTreeMap::new(),
-            )
-            .expect("changeset fits the format");
-            let late_id = late.encode_with_id().1;
-            let early_id = early.encode_with_id().1;
-            css.push(late);
-            css.push(early);
             let ids = seed::seed_file_less_ladder(c, repo, &css)?;
             assert_eq!(ids.len(), css.len());
-            Ok((main, sides, late_id, early_id))
+            Ok((main, sides, late, early))
         })
         .unwrap();
     let tip = *main.last().unwrap();
