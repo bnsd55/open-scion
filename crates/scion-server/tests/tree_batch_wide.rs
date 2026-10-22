@@ -1,16 +1,14 @@
-//! A wide changeset builds under the bound: the prefetch walks each path
-//! one part per level, so the build's tree reads grow with paths x depth,
-//! once. The quadratic walk this replaced re-walked every path from the
-//! root at every level and scanned the next level's ids per path. The
-//! shape is 100,000 files over 20,000 directories: the card's 20,000 over
-//! 2,000 builds in ~330ms quadratic against ~190ms cursor on the writing
-//! machine, too close for a bound that holds under load; the shape times
-//! five separates them about forty to one. The
-//! build runs on SQLite whatever the test backend is: this guard measures
-//! CPU, not statements, and must not share the Postgres statement counter
-//! with the statement guard.
-
-use std::time::Duration;
+//! A wide changeset's prefetch takes one resolution step per changed
+//! path's directory: the walk's work grows with paths x depth, once. The
+//! quadratic walk this replaced re-walked every path from the root at
+//! every level, so its steps grow with paths x depth x levels, and the
+//! same shape costs many times the sum of the paths' depths: at two
+//! parts deep its next-level dedupe scans the whole level per changed
+//! path. The shape is 100,000 files over 20,000 directories: the card's
+//! 20,000 over 2,000 is too small to separate the two under load. The
+//! build runs on
+//! SQLite whatever the test backend is, so it never shares the Postgres
+//! statement counter with the statement guard.
 
 use scion_core::{Changeset, FileState, IdentityTime, RepoPath};
 
@@ -72,14 +70,23 @@ fn a_wide_changeset_builds_under_the_bound() {
     )
     .with_parents(vec![base_id])
     .expect("changeset fits the format");
-    let started = std::time::Instant::now();
+    // The walk's work: one resolution step per directory the changed
+    // paths' chains cross, so the steps are at most the sum of the
+    // changed paths' depths. A walk that re-walks the paths from the
+    // root at every level resolves about twice that.
+    let before = tree::prefetch_steps();
     store
         .write(|c| tree::apply(c, Some(base_root), commit.changes(), &mut |_| Ok(0)))
         .unwrap();
-    let elapsed = started.elapsed();
-    eprintln!("100,000 files over 20,000 directories built in {elapsed:?}");
+    let steps = tree::prefetch_steps() - before;
+    let bound: u64 = commit
+        .changes()
+        .keys()
+        .map(|path| path.as_bytes().split(|&b| b == b'/').count() as u64)
+        .sum();
+    eprintln!("the walk took {steps} steps for paths whose depths sum to {bound}");
     assert!(
-        elapsed < Duration::from_secs(2),
-        "the build took {elapsed:?}"
+        steps <= bound,
+        "the walk took {steps} steps, past the {bound} the paths sum to"
     );
 }

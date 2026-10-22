@@ -288,6 +288,19 @@ pub fn store_changeset(
     Ok((id, tree))
 }
 
+/// The prefetch's resolution steps: one entry lookup per step, for the
+/// tests that measure the walk's work instead of its seconds.
+#[cfg(any(test, feature = "test-hooks"))]
+static PREFETCH_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The resolution steps the prefetch took since the process started, or
+/// since the caller last read it into its own arithmetic.
+#[cfg(any(test, feature = "test-hooks"))]
+#[must_use]
+pub fn prefetch_steps() -> u64 {
+    PREFETCH_STEPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The stored trees on every changed path's directory chain, level by
 /// level: level 0 is the root, and each round reads every directory the
 /// round before resolved, in one `get_trees`. One cursor per path
@@ -340,6 +353,8 @@ fn prefetch(
         let mut queued: HashSet<TreeId> = HashSet::new();
         cursors.retain_mut(|(i, current, part_index)| {
             let path = &paths[*i];
+            #[cfg(any(test, feature = "test-hooks"))]
+            PREFETCH_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let Some(Entry::Dir(child)) = trees
                 .get(current)
                 .and_then(|tree| tree.entries().get(&path[*part_index]))
