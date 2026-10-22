@@ -2235,7 +2235,8 @@ impl MetaTx for PgTx<'_> {
 
     /// The parents of up to `DERIVED_BATCH` merges, in the order asked,
     /// in one statement: the ids travel as one `bytea[]`, and the reply
-    /// has at most one row per parent. The generation check is the one
+    /// has at most one row per parent. A merge asked twice gets its
+    /// parents twice, once per ask. The generation check is the one
     /// [`MetaTx::parents`] makes, with the asked merge's generation.
     ///
     /// # Errors
@@ -2256,24 +2257,25 @@ impl MetaTx for PgTx<'_> {
             &[P::bytea_array(ids)],
         )?;
         let mut out: Vec<Vec<(ChangesetId, i64)>> = vec![Vec::new(); merges.len()];
-        let asked: HashMap<Vec<u8>, usize> = merges
-            .iter()
-            .enumerate()
-            .map(|(i, (id, _))| (id.as_bytes().to_vec(), i))
-            .collect();
+        // One id can be asked twice: two histories reach the same merge.
+        let mut asked: HashMap<&[u8], Vec<usize>> = HashMap::new();
+        for (i, (id, _)) in merges.iter().enumerate() {
+            asked.entry(id.as_bytes()).or_default().push(i);
+        }
         for row in &rows {
             let cs: Vec<u8> = row.get(0);
             let parent: Vec<u8> = row.get(1);
             let parent_gen: i64 = row.get(2);
-            let i = asked[&cs];
-            let (id, id_gen) = merges[i];
             let parent = to_id(&parent)?;
-            if parent_gen >= id_gen {
-                return Err(Error::Corrupt(format!(
-                    "changeset {id} has generation {id_gen}, its parent {parent} {parent_gen}"
-                )));
+            for &i in &asked[cs.as_slice()] {
+                let (id, id_gen) = merges[i];
+                if parent_gen >= id_gen {
+                    return Err(Error::Corrupt(format!(
+                        "changeset {id} has generation {id_gen}, its parent {parent} {parent_gen}"
+                    )));
+                }
+                out[i].push((parent, parent_gen));
             }
-            out[i].push((parent, parent_gen));
         }
         Ok(out)
     }
