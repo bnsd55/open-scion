@@ -67,6 +67,69 @@ fn source(data: &Path) -> (Backend, ChangesetId) {
     (store, main)
 }
 
+/// The section claims one read snapshot. A writer that lands a changeset
+/// between the section's statements must stay outside it: the section
+/// read the changesets first, so its refs can only name changesets it
+/// holds. Without the snapshot this fails at the verify: the refs query
+/// sees the landed changeset, the changesets query does not, and the
+/// archive names a ref target it does not hold.
+#[test]
+fn a_section_holds_one_snapshot_when_a_writer_lands_between_its_statements() {
+    let data = tempfile::tempdir().unwrap();
+    let (store, _) = source(data.path());
+
+    // The blob the hook's changeset names, stored before the export: the
+    // hook only records the row and moves the ref.
+    let hook_blob = store.blobs().put(b"hook").unwrap();
+
+    // The writer the hook runs: the first section takes the hook and it
+    // lands one changeset on `dev` while that section holds its
+    // snapshot; the fired flag says the hook ran inside THIS export.
+    let writes = store.clone();
+    let say = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let inside = std::sync::Arc::clone(&say);
+    archive::set_section_hook(Some(Box::new(move || {
+        inside.store(true, std::sync::atomic::Ordering::SeqCst);
+        writes
+            .write(|c| {
+                let repo = c.repo_id(REPO)?;
+                let state = c.get_ref(repo, "dev")?;
+                let parent = match &state {
+                    Some(state) => state.target,
+                    None => c.get_ref(repo, "main")?.expect("main").target,
+                };
+                let cs = changeset(vec![parent], &[("h", Some(regular("hook")))]);
+                let id = tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0;
+                c.add_repo_blob(repo, hook_blob)?;
+                assert!(c.cas_ref(repo, "dev", state.map(|s| s.version), id)?);
+                Ok(())
+            })
+            .unwrap();
+    })));
+
+    let out = tempfile::tempdir().unwrap().path().join("archive");
+    let manifest = archive::export(&store, data.path(), None, true, &out)
+        .unwrap_or_else(|e| panic!("export failed: {e:#}"));
+    archive::set_section_hook(None);
+    assert!(
+        say.load(std::sync::atomic::Ordering::SeqCst),
+        "the hook never ran inside this export's section"
+    );
+    assert_eq!(manifest["format"], "scion-archive");
+
+    // The archive is sound, per the format, with no store code.
+    let damages = archive::verify(&out).unwrap();
+    assert!(damages.is_empty(), "{damages:?}");
+
+    // And a restore replays it into an empty store with a clean fsck.
+    let restored_dir = tempfile::tempdir().unwrap();
+    let report = archive::restore(&out, restored_dir.path(), None, None).unwrap();
+    assert_eq!(report.repos, vec![REPO]);
+    let restored = Backend::open(restored_dir.path(), None, None).unwrap();
+    let problems = fsck::run(&restored, fsck::BATCH, &mut |_| {}).unwrap();
+    assert!(problems.problems.is_empty(), "{problems:?}");
+}
+
 #[test]
 fn an_export_beside_a_writer_verifies_and_restores_resolving_main() {
     let data = tempfile::tempdir().unwrap();
@@ -118,8 +181,8 @@ fn an_export_beside_a_writer_verifies_and_restores_resolving_main() {
     // generations, a clean fsck, and a main that resolves to what the
     // snapshot read.
     let restored_dir = tempfile::tempdir().unwrap();
-    let names = archive::restore(&out, restored_dir.path(), None, None).unwrap();
-    assert_eq!(names, vec![REPO]);
+    let report = archive::restore(&out, restored_dir.path(), None, None).unwrap();
+    assert_eq!(report.repos, vec![REPO]);
     let restored = Backend::open(restored_dir.path(), None, None).unwrap();
     let problems = fsck::run(&restored, fsck::BATCH, &mut |_| {}).unwrap();
     assert!(problems.problems.is_empty(), "{problems:?}");

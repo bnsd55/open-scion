@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Duration;
 
+/// How long a test client may take to connect: a cache that died must
+/// not leave the test reconnecting forever.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 use tonic::transport::Channel;
 use tonic_health::pb::HealthCheckRequest;
 use tonic_health::pb::health_check_response::ServingStatus;
@@ -112,6 +116,7 @@ async fn wait_serving(cache: &mut Cache) {
     };
     let channel = Channel::from_shared(format!("http://{addr}"))
         .unwrap()
+        .connect_timeout(CONNECT_TIMEOUT)
         .connect()
         .await
         .expect("the cache listens");
@@ -130,6 +135,7 @@ async fn wait_serving(cache: &mut Cache) {
     let addr2 = bound_addr(&cache.log).expect("the address again");
     let channel2 = Channel::from_shared(format!("http://{addr2}"))
         .unwrap()
+        .connect_timeout(CONNECT_TIMEOUT)
         .connect()
         .await
         .expect("the cache listens again");

@@ -79,14 +79,16 @@ Prove the one-machine server under real load.
 
 - A 72-hour soak and fault job runs against one server, with resource
   ceilings named in advance, and its raw numbers published in
-  [benchmarks](benchmarks.md): open. What exists is a 120-minute
-  nightly soak ([#320](https://github.com/bnsd55/openscion/issues/320)),
-  whose scheduled runs on `main` failed on the RSS warm-up; the fix
-  landed in [#365](https://github.com/bnsd55/openscion/pull/365), and
-  the next scheduled run confirms it. The fault job
-  does not exist yet. No 72-hour run has happened: it will run on a
-  rented VM as a one-job self-hosted runner (D10). No soak numbers are
-  in [benchmarks](benchmarks.md) yet.
+  [benchmarks](benchmarks.md): open. The 12-hour fault soak (Run B)
+  ran and passed; its numbers are in
+  [benchmarks](benchmarks.md#fault-soak-run-b). The 72-hour soak (Run
+  A) runs on an owner machine since 2026-10-21, and its report comes
+  on [#399](https://github.com/bnsd55/openscion/issues/399). A
+  120-minute
+  nightly soak ([#320](https://github.com/bnsd55/openscion/issues/320))
+  runs scheduled on `main`; its RSS warm-up failure was fixed in
+  [#365](https://github.com/bnsd55/openscion/pull/365), and the
+  scheduled run of 2026-10-21 passed.
 - [The checkout benchmark stands against `git clone`](https://github.com/bnsd55/openscion/issues/6):
   done, the comparison and its numbers are in
   [benchmarks](benchmarks.md).
@@ -162,8 +164,21 @@ Make one server routine to run.
 - `docs/operations.md` has runbooks for install, upgrade, rollback,
   backup, restore, key and certificate rotation, disk full, EIO, a
   Postgres restart, a failed migration, an `fsck` failure and garbage
-  collection.
-- Each runbook has a CI test or a recorded release drill.
+  collection: done - the disk-full and failing-disk runbooks
+  ([#448](https://github.com/bnsd55/openscion/pull/448)), the
+  Postgres-restart runbook
+  ([#453](https://github.com/bnsd55/openscion/pull/453)), the
+  failed-migration and fsck-failure runbooks
+  ([#454](https://github.com/bnsd55/openscion/pull/454)), and the
+  first-boot (the install runbook) and certificate-rotation runbooks
+  ([#457](https://github.com/bnsd55/openscion/pull/457)).
+- Each runbook has a CI test or a recorded release drill: done, with
+  each runbook's `Proof:` line held by the docs_ops registry, except
+  one arm: rollback's run-the-old-binary arm, whose drill is #431 (the
+  pre-upgrade backup restores and serves under the N-1 binary). The
+  restore arm is proven
+  ([#454](https://github.com/bnsd55/openscion/pull/454)'s
+  `a_newer_schema_refuses_the_open_and_a_restore_serves`).
 - Readiness, liveness and graceful drain have end-to-end tests.
   Readiness goes false before the server drains in-flight calls.
 - Prometheus alert rules and the log fields they use are versioned and

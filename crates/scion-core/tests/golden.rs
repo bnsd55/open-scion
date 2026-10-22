@@ -2,6 +2,9 @@
 //!
 //! Expected bytes are assembled by hand from the grammar, independent of the
 //! encoder. If a test here fails, the format changed and every stored ID with it.
+//! Updating on purpose: the bytes ARE the grammar, so an update is a new
+//! format version beside v1 with a changes/ fragment naming the break - never
+//! a re-pin of this file.
 
 use std::collections::BTreeMap;
 

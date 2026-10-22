@@ -46,5 +46,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "archive-read"
+path = "fuzz_targets/archive-read.rs"
+test = false
+doc = false
+bench = false
+
 # Fuzzing builds on nightly with its own lockfile, outside the main workspace.
 [workspace]

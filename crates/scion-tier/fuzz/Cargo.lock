@@ -1159,6 +1159,7 @@ name = "scion-tier-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "open-scion-proto",
  "open-scion-tier",
  "tempfile",
 ]

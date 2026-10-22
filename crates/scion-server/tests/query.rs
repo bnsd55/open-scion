@@ -19,7 +19,7 @@ use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::read::{
     self, DiffEntry, MAX_DIFF_ENTRIES, MAX_RENAME_CHUNKS, Rename,
 };
-use scion_server::{Backend, Error, test_support::tree};
+use scion_server::{Backend, Error, test_support::seed, test_support::tree};
 use tempfile::TempDir;
 
 const REPO: &str = "r";
@@ -259,35 +259,68 @@ fn graph_queries_across_many_merges_answer() {
     // A ladder: each changeset on main merges a side changeset that
     // branched from main's previous changeset. 20,001 changesets, each a
     // merge or the parent of one, so the walks take every one. With a bound
-    // of 10,000 steps, these queries failed with RESOURCE_EXHAUSTED.
+    // of 10,000 steps, these queries failed with RESOURCE_EXHAUSTED. The
+    // seed is bulk: the test measures the queries, not the seeding.
     let merges = 10_000;
     let (_data, store) = open_store();
     let (main, sides, late, early) = store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
-            let mut put = |parents: Vec<ChangesetId>, message: String| {
-                let cs = Changeset::new(
-                    parents,
-                    author(),
-                    None,
-                    message.into_bytes(),
-                    BTreeMap::new(),
-                )
-                .expect("changeset fits the format");
-                Ok::<_, Error>(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0)
-            };
-            let mut main = vec![put(vec![], "root".into())?];
+            let mut css = vec![
+                Changeset::new(vec![], author(), None, b"root".to_vec(), BTreeMap::new())
+                    .expect("changeset fits the format"),
+            ];
+            let mut main = vec![css[0].encode_with_id().1];
             let mut sides = Vec::new();
             for i in 0..merges {
                 let last = *main.last().unwrap();
-                let side = put(vec![last], format!("side {i}"))?;
-                main.push(put(vec![last, side], format!("merge {i}"))?);
-                sides.push(side);
+                let side = Changeset::new(
+                    vec![last],
+                    author(),
+                    None,
+                    format!("side {i}").into_bytes(),
+                    BTreeMap::new(),
+                )
+                .expect("changeset fits the format");
+                let side_id = side.encode_with_id().1;
+                let merge = Changeset::new(
+                    vec![last, side_id],
+                    author(),
+                    None,
+                    format!("merge {i}").into_bytes(),
+                    BTreeMap::new(),
+                )
+                .expect("changeset fits the format");
+                let merge_id = merge.encode_with_id().1;
+                css.push(side);
+                css.push(merge);
+                main.push(merge_id);
+                sides.push(side_id);
             }
             // Not merged: one from the oldest side changeset, one from root.
-            let late = put(vec![sides[0]], "late".into())?;
-            let early = put(vec![main[0]], "early".into())?;
-            Ok((main, sides, late, early))
+            let late = Changeset::new(
+                vec![sides[0]],
+                author(),
+                None,
+                b"late".to_vec(),
+                BTreeMap::new(),
+            )
+            .expect("changeset fits the format");
+            let early = Changeset::new(
+                vec![main[0]],
+                author(),
+                None,
+                b"early".to_vec(),
+                BTreeMap::new(),
+            )
+            .expect("changeset fits the format");
+            let late_id = late.encode_with_id().1;
+            let early_id = early.encode_with_id().1;
+            css.push(late);
+            css.push(early);
+            let ids = seed::seed_file_less_ladder(c, repo, &css)?;
+            assert_eq!(ids.len(), css.len());
+            Ok((main, sides, late_id, early_id))
         })
         .unwrap();
     let tip = *main.last().unwrap();
@@ -299,8 +332,95 @@ fn graph_queries_across_many_merges_answer() {
         (late, tip, sides[0]),
         (tip, early, main[0]),
     ] {
-        let bases = read::merge_base(&store, REPO, a, b, &later()).unwrap();
-        assert_eq!(bases, [base]);
+        assert_eq!(
+            read::merge_base(&store, REPO, a, b, &later()).unwrap(),
+            [base]
+        );
+    }
+}
+
+/// The bulk seed keeps its promise: a small file-less ladder seeded in
+/// batches answers exactly like the same ladder seeded through the
+/// ordinary write path. The ids match (the encoding is content-bound),
+/// so every query runs on the same pairs; any drift in the bulk rows -
+/// a generation, a jump link, a derived value - shows up here as a
+/// different answer.
+#[test]
+fn the_bulk_seed_answers_like_the_ordinary_seed() {
+    let shape = |merges: usize| {
+        let mut css = vec![
+            Changeset::new(vec![], author(), None, b"root".to_vec(), BTreeMap::new())
+                .expect("changeset fits the format"),
+        ];
+        let mut main = vec![css[0].encode_with_id().1];
+        for i in 0..merges {
+            let last = *main.last().unwrap();
+            let side = Changeset::new(
+                vec![last],
+                author(),
+                None,
+                format!("side {i}").into_bytes(),
+                BTreeMap::new(),
+            )
+            .expect("changeset fits the format");
+            let side_id = side.encode_with_id().1;
+            css.push(side);
+            let merge = Changeset::new(
+                vec![last, side_id],
+                author(),
+                None,
+                format!("merge {i}").into_bytes(),
+                BTreeMap::new(),
+            )
+            .expect("changeset fits the format");
+            let merge_id = merge.encode_with_id().1;
+            css.push(merge);
+            main.push(merge_id);
+        }
+        let late = Changeset::new(
+            vec![main[1]],
+            author(),
+            None,
+            b"late".to_vec(),
+            BTreeMap::new(),
+        )
+        .expect("changeset fits the format");
+        let late_id = late.encode_with_id().1;
+        css.push(late);
+        (css, main, late_id)
+    };
+    let ladder = shape(40);
+
+    // The ordinary path: one write per changeset.
+    let (_data, plain) = open_store();
+    plain
+        .write(|c| {
+            let repo = c.create_repo(REPO)?;
+            for cs in &ladder.0 {
+                tree::store_changeset(c, repo, cs, &mut |_| Ok(0))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    // The bulk seed.
+    let (_data, bulk) = open_store();
+    bulk.write(|c| {
+        let repo = c.create_repo(REPO)?;
+        seed::seed_file_less_ladder(c, repo, &ladder.0)?;
+        Ok(())
+    })
+    .unwrap();
+    let tip = *ladder.1.last().unwrap();
+    for (a, b) in [
+        (ladder.0[1].encode_with_id().1, tip),
+        (ladder.1[0], tip),
+        (ladder.2, tip),
+        (tip, ladder.1[0]),
+    ] {
+        let answer = |store: &Backend| read::is_ancestor(store, REPO, a, b, &later()).unwrap();
+        assert_eq!(answer(&plain), answer(&bulk), "is_ancestor({a}, {b})");
+        let bases = |store: &Backend| read::merge_base(store, REPO, a, b, &later()).unwrap();
+        assert_eq!(bases(&plain), bases(&bulk), "merge_base({a}, {b})");
     }
 }
 
