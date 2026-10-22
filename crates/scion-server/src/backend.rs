@@ -62,6 +62,18 @@ impl Backend {
     /// The Postgres handle, when this backend is one. The crate's own
     /// code reads it to tell the one-writer engines apart (a Postgres
     /// database always has one writer; a data directory may be shared).
+    /// The schema versions this open moved, when the open migrated a
+    /// SQLite store. A fresh open creates the schema and reports none;
+    /// a Postgres database's schema is the fleet's, and no single open
+    /// moves it.
+    #[must_use]
+    pub fn migrated(&self) -> Option<(u32, u32)> {
+        match &self.inner {
+            Inner::Sqlite(store) => store.migrated(),
+            Inner::Postgres(_) => None,
+        }
+    }
+
     pub(crate) fn as_postgres(&self) -> Option<&Pg> {
         match &self.inner {
             Inner::Postgres(pg) => Some(pg),

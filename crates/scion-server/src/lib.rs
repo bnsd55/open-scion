@@ -264,6 +264,10 @@ pub mod test_support {
     /// The on-disk store, so tests open and inspect one directly.
     pub mod store {
         pub use crate::store::*;
+        /// The schema version this build ships, and the migration runner,
+        /// for a test that makes a store of an older version.
+        #[allow(unreachable_pub)]
+        pub use crate::store::{SCHEMA_VERSION, migrate};
     }
     /// The guide's own commands, so a Proof's test runs the block under
     /// its runbook's heading instead of retyping it.
@@ -291,6 +295,7 @@ pub mod test_support {
 // public the module it sits in looks. The doc(hidden) items are not
 // here, and never were.
 pub use access::Access;
+pub use derived::DeriveReport;
 pub use error::{Error, Git, Result, Storage, StorageClass};
 pub use gc::DEFAULT_GRACE_SECS;
 pub use graph::{CommitGraph, backfill_commit_graph};

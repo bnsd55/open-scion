@@ -371,12 +371,16 @@ and administrative changes, with no tokens and no contents. It lives at
 `audit.log` in the data directory; `--audit-file` puts it elsewhere.
 The CLI's state-changing subcommands record their own admin lines in
 the same file: one intent before a change, and one result after it.
-`gc`, `import`, and `restore` are the first, and the list grows with
-each slice. The restore's lines land in the restored store's own
+Every state-changing command is covered: gc, import, restore, derive,
+ticket-key generation, and the schema migration an open performs. The
+restore's lines land in the restored store's own
 audit file, so its history opens with the restore that made it. The
 collector is the runbook's cure for a full disk, so a gc whose intent
 cannot go in because the disk is full runs anyway, and records its
-intent, marked `deferred: disk_full`, after it freed the space.
+intent, marked `deferred: disk_full`, after it freed the space. The
+migration's line has no intent before it: it ran inside the store's
+open, before the audit could exist, so its record, marked with the
+versions it moved, goes in as soon as the audit exists.
 There is no way to turn it off: a server that cannot record refuses the
 changes it cannot account for, and flips readiness until a restart. The
 file is mode 0600, never a symlink, in a directory only the server's

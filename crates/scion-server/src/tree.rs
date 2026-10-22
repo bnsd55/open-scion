@@ -140,13 +140,16 @@ pub fn lookup(c: &mut dyn MetaTx, root: TreeId, path: &RepoPath) -> Result<Optio
 /// tree plus its changes.
 pub struct RootTree;
 
+use crate::derived::DeriveReport;
+
 /// Derives the root tree of `cs`, and removes the rows of older
-/// versions. Returns the kind's name for the `derive` command's report.
+/// versions. Returns the kind's name and the counts the `derive`
+/// command's report carries.
 ///
 /// # Errors
 ///
-/// Errors of the `derived` fill, and of the final flush.
-pub fn backfill_root_tree(store: &Backend, repo: &str, cs: ChangesetId) -> Result<&'static str> {
+/// Errors of the derived fill, and of the final flush.
+pub fn backfill_root_tree(store: &Backend, repo: &str, cs: ChangesetId) -> Result<DeriveReport> {
     crate::derived::backfill::<RootTree>(store, repo, cs)
 }
 

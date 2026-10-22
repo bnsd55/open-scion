@@ -611,3 +611,187 @@ fn a_restore_that_fails_mid_replay_leaves_its_audit_record() {
     assert_eq!(held.len(), 1, "the target holds only the audit: {held:?}");
     assert_eq!(held[0].file_name(), "audit.log");
 }
+
+/// The derive subcommand's admin pair: one intent before the backfill
+/// and one ok after it, with the rows the run wrote and removed.
+#[test]
+fn a_derive_writes_an_admin_intent_and_ok_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    seed_exportable(&data);
+
+    let out = run(&data, &["derive", "--kind", "root_tree", "--repo", "hist"]);
+    assert!(
+        out.status.success(),
+        "derive ran: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let lines = audit_lines(&data);
+    assert_eq!(lines.len(), 2, "one intent and one result: {lines:?}");
+    assert_eq!(lines[0]["event"], "admin");
+    assert_eq!(lines[0]["outcome"], "intent");
+    assert_eq!(lines[0]["what"], "derive");
+    assert_eq!(lines[0]["kind"], "root_tree");
+    assert_eq!(lines[1]["event"], "admin");
+    assert_eq!(lines[1]["outcome"], "ok");
+    assert_eq!(lines[1]["what"], "derive");
+    assert_eq!(lines[1]["kind"], "root_tree");
+    assert!(
+        lines[1]["written"].is_u64(),
+        "the ok line carries the rows the run wrote: {lines:?}"
+    );
+    assert_eq!(lines[1]["removed"], 0, "no older version's rows to remove");
+}
+
+/// A derive that fails writes its failed line: the intent's pair is
+/// complete, with the error's class and never its message.
+#[test]
+fn a_derive_that_fails_writes_its_failed_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    seed_exportable(&data);
+
+    let out = run(
+        &data,
+        &["derive", "--kind", "root_tree", "--repo", "no-such-repo"],
+    );
+    assert!(!out.status.success(), "a missing repo fails the run");
+    let lines = audit_lines(&data);
+    assert_eq!(lines.len(), 2, "one intent and one result: {lines:?}");
+    assert_eq!(lines[0]["outcome"], "intent");
+    assert_eq!(lines[0]["what"], "derive");
+    assert_eq!(lines[1]["event"], "admin");
+    assert_eq!(lines[1]["outcome"], "failed");
+    assert_eq!(lines[1]["what"], "derive");
+    assert_eq!(lines[1]["why"], "failed");
+}
+
+/// The ticket-key subcommand's admin pair: one intent before the key
+/// exists and one ok after it is on the disk, and no key material in the
+/// audit in any encoding.
+#[test]
+fn a_ticket_key_writes_its_pair_and_no_key_material() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let key_file = dir.path().join("tickets.key");
+
+    let out = run(&data, &["ticket-key", "--out", key_file.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "ticket-key ran: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let lines = audit_lines(&data);
+    assert_eq!(lines.len(), 2, "one intent and one result: {lines:?}");
+    assert_eq!(lines[0]["event"], "admin");
+    assert_eq!(lines[0]["outcome"], "intent");
+    assert_eq!(lines[0]["what"], "ticket-key");
+    assert_eq!(lines[1]["event"], "admin");
+    assert_eq!(lines[1]["outcome"], "ok");
+    assert_eq!(lines[1]["what"], "ticket-key");
+
+    // No seed or key bytes in the audit, in hex or in base64: the file
+    // holds the seed as hex, and the audit never names it.
+    let seed_hex = fs::read_to_string(&key_file).unwrap();
+    let seed_hex = seed_hex.trim();
+    assert_eq!(seed_hex.len(), 64, "the seed file holds 64 hex characters");
+    let seed = (0..seed_hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&seed_hex[i..i + 2], 16).unwrap())
+        .collect::<Vec<u8>>();
+    let audit = fs::read_to_string(data.join("audit.log")).unwrap();
+    assert!(
+        !audit.contains(seed_hex),
+        "the seed's hex is not in the audit"
+    );
+    assert!(
+        !audit.contains(&base64_of(&seed)),
+        "the seed's base64 is not in the audit"
+    );
+}
+
+/// Base64 of `bytes`, in the standard alphabet with padding, so a test
+/// can search an audit for an encoding of a secret without a dependency.
+fn base64_of(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// An open that migrates an older store writes its line once: the
+/// migration ran inside the store's open, before the audit could open,
+/// so its record goes in before the command's own pair. A second open
+/// migrates nothing, and writes no line.
+#[test]
+fn an_open_that_migrates_writes_its_line_once() {
+    if scion_server::Backend::test_is_postgres() {
+        // A Postgres database's schema is the fleet's: no single open
+        // moves it, so there is no migration for a process to record.
+        println!("skipping: the migration line is a SQLite store's");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    fs::create_dir_all(&data).unwrap();
+    // The metadata at version 1, as the build's first migration makes it.
+    let db = rusqlite::Connection::open(data.join("scion.db")).unwrap();
+    scion_server::test_support::store::migrate(&db, 1).unwrap();
+    drop(db);
+
+    let out = gc(&data, &["--grace-secs", "0"]);
+    assert!(
+        out.status.success(),
+        "gc ran: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let lines = audit_lines(&data);
+    assert_eq!(lines.len(), 3, "migrate, then the gc's pair: {lines:?}");
+    assert_eq!(lines[0]["event"], "admin");
+    assert_eq!(lines[0]["outcome"], "ok");
+    assert_eq!(lines[0]["what"], "migrate");
+    assert_eq!(lines[0]["from"], 1);
+    assert!(
+        lines[0]["to"].as_u64().unwrap_or(0) > 1,
+        "the open moved the schema up: {lines:?}"
+    );
+    assert_eq!(lines[1]["what"], "gc");
+    assert_eq!(lines[1]["outcome"], "intent");
+    assert_eq!(lines[2]["outcome"], "ok");
+
+    // The second open finds the schema at this build's version, and
+    // writes no migration line.
+    let out = gc(&data, &["--grace-secs", "0"]);
+    assert!(out.status.success(), "the second gc ran");
+    let lines = audit_lines(&data);
+    assert_eq!(
+        lines.len(),
+        5,
+        "the second run adds its own pair: {lines:?}"
+    );
+    assert_eq!(lines[3]["what"], "gc");
+    assert_eq!(lines[3]["outcome"], "intent");
+    assert_eq!(lines[4]["outcome"], "ok");
+}
