@@ -2201,6 +2201,47 @@ impl MetaTx for PgTx<'_> {
             .is_some())
     }
 
+    /// One page of the first-parent chain, one statement: the recursive
+    /// term follows the indexed first-parent rows (cs, n = 0), so every
+    /// hop is one index lookup, and the join carries the generation and
+    /// the body. Every fetched changeset is an ancestor of `start`, so
+    /// the repo check rides the start row, as `get_changeset` checks it.
+    fn first_parent_page(
+        &mut self,
+        repo: RepoId,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, i64, Vec<u8>)>> {
+        let rows = self.c.query(
+            "WITH RECURSIVE walk(id, depth) AS (
+                     SELECT rc.cs, 0::bigint FROM repo_changesets rc
+                     WHERE rc.repo_id = $1 AND rc.cs = $2
+                     UNION ALL
+                     SELECT cp.parent, w.depth + 1
+                     FROM walk w
+                     JOIN changeset_parents cp ON cp.cs = w.id AND cp.n = 0
+                     WHERE w.depth < $3
+                 )
+                 SELECT c.id, c.gen, c.body FROM walk
+                 JOIN changesets c ON c.id = walk.id
+                 ORDER BY walk.depth",
+            &[
+                P::i64(repo.0),
+                P::bytes(&id_bytes(start.as_bytes())),
+                P::i64(limit),
+            ],
+        )?;
+        if rows.is_empty() {
+            return Err(Error::NotFound(format!("changeset {start}")));
+        }
+        rows.into_iter()
+            .map(|row| {
+                let cs: Vec<u8> = row.get(0);
+                Ok((to_id(&cs)?, row.get(1), row.get(2)))
+            })
+            .collect()
+    }
+
     /// The generation of a changeset that `repo` may see.
     ///
     /// # Errors
