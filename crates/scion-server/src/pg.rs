@@ -56,7 +56,7 @@ use crate::store::Blobs;
 pub(crate) mod test_hooks;
 
 /// The schema version this build makes and reads.
-pub(crate) const PG_SCHEMA_VERSION: u32 = 4;
+pub(crate) const PG_SCHEMA_VERSION: u32 = 5;
 
 /// How long a call may wait for a Postgres reader before the server
 /// answers [`Error::Unavailable`]. Well below the 600 s call deadline:
@@ -86,6 +86,7 @@ const PG_MIGRATIONS: [&str; PG_SCHEMA_VERSION as usize] = [
     include_str!("../migrations/postgres/0002_view_roots.sql"),
     include_str!("../migrations/postgres/0003_view_trees.sql"),
     include_str!("../migrations/postgres/0004_store_uuid.sql"),
+    include_str!("../migrations/postgres/0005_parent_numbering.sql"),
 ];
 
 /// The fence of a process that lost the one-server lock. The worker of
@@ -2075,11 +2076,12 @@ impl MetaTx for PgTx<'_> {
             ],
         )?;
         // Every parent as one statement, however many a merge has: the
-        // row number is the parent's place in the array.
+        // row number is the parent's place in the array. SQLite numbers
+        // the rows from zero, so the ordinality (one-based) shifts down.
         if !parents.is_empty() {
             self.c.execute(
                 "INSERT INTO changeset_parents (cs, n, parent)
-                 SELECT $1, ord, parent
+                 SELECT $1, ord - 1, parent
                  FROM unnest($2::bytea[]) WITH ORDINALITY AS parents(parent, ord)
                  ON CONFLICT (cs, n) DO NOTHING",
                 &[
