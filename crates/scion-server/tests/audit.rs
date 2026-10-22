@@ -1069,17 +1069,23 @@ async fn a_land_dropped_around_its_jobs_start_gets_one_answer() {
         let _ = ci.land(request).await;
     }
     // The answer of the last try may still be in flight: wait until
-    // every intent has its one answer, not until the file is long
-    // enough (an ok land writes a ref line too, so line counts lie). A
-    // loaded runner makes an append slow, so give it a minute.
+    // every try is settled - one intent with its one answer, or a call
+    // whose 0 ms deadline expired before the request was sent, which
+    // never reaches the server and owes nothing. A loaded runner makes
+    // an append slow, so give it a minute.
     for _ in 0..1200 {
         let lines = read_lines(&audit_path);
         let all = (0..tries).all(|i| {
-            land_lines(&lines, &format!("t-race-{i}"))
-                .into_iter()
+            let lines = land_lines(&lines, &format!("t-race-{i}"));
+            let intents = lines
+                .iter()
+                .filter(|line| line["outcome"] == "intent")
+                .count();
+            let answers = lines
+                .iter()
                 .filter(|line| line["outcome"] != "intent")
-                .count()
-                == 1
+                .count();
+            (intents == 0 && answers == 0) || (intents == 1 && answers == 1)
         });
         if all {
             break;
@@ -1095,6 +1101,17 @@ async fn a_land_dropped_around_its_jobs_start_gets_one_answer() {
             .filter(|line| line["event"] == "land" && line["outcome"] == "intent")
             .filter(|line| line["request_id"] == id)
             .count();
+        if intents == 0 {
+            // A 0 ms deadline can expire while the client is still
+            // sending: the call never reached the server, so nothing is
+            // owed - and the file must hold nothing for it.
+            assert!(
+                land_lines(&lines, &id).is_empty(),
+                "a call the server never saw left lines: {:?}",
+                land_lines(&lines, &id)
+            );
+            continue;
+        }
         assert_eq!(intents, 1, "one intent for {id}");
         let answers = land_lines(&lines, &id)
             .into_iter()
