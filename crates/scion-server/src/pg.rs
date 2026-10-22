@@ -2737,6 +2737,27 @@ impl MetaTx for PgTx<'_> {
         load_tree(self.c, id).map(|(tree, _)| tree)
     }
 
+    /// The stored bytes of the trees the ids name, in the order asked.
+    /// One statement per 1,000 ids: the ids travel as one bytea array.
+    fn get_trees(&mut self, ids: &[TreeId]) -> Result<Vec<Option<Vec<u8>>>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(crate::meta::DERIVED_BATCH) {
+            let keys: Vec<Vec<u8>> = chunk.iter().map(|id| id_bytes(id.as_bytes())).collect();
+            let rows = self.c.query(
+                "SELECT id, body FROM trees WHERE id = ANY($1)",
+                &[P::bytea_array(keys.clone())],
+            )?;
+            let mut bodies: std::collections::HashMap<Vec<u8>, Vec<u8>> = rows
+                .into_iter()
+                .map(|row| (row.get::<_, Vec<u8>>(0), row.get::<_, Vec<u8>>(1)))
+                .collect();
+            for key in keys {
+                out.push(bodies.remove(&key));
+            }
+        }
+        Ok(out)
+    }
+
     /// Reads a tree's stored `TreeV1` bytes and checks them against its ID.
     ///
     /// # Errors

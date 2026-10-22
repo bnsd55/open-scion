@@ -93,9 +93,13 @@ pub fn apply(
     changes: &BTreeMap<RepoPath, Option<FileState>>,
     lens: BlobLens<'_>,
 ) -> Result<TreeId> {
+    // The stored trees on every changed path, one get_trees per level of
+    // depth: a commit that touches many directories loads them in one
+    // statement per level instead of one per directory.
+    let mut loaded = prefetch(c, base, changes)?;
     let mut root = base.map_or_else(|| Dir::Loaded(BTreeMap::new()), Dir::Stored);
     for (path, _) in changes.iter().filter(|(_, change)| change.is_none()) {
-        root.delete(c, path, &parts(path))?;
+        root.delete(c, &mut loaded, path, &parts(path))?;
     }
     for (path, state) in changes {
         if let Some(state) = state {
@@ -105,7 +109,7 @@ pub fn apply(
                 Some(blob) => FileEntry::new(*state, lens(blob)?),
                 None => FileEntry::new(*state, 0),
             };
-            root.put(c, path, &parts(path), 0, entry)?;
+            root.put(c, &mut loaded, path, &parts(path), 0, entry)?;
         }
     }
     let mut rows = Vec::new();
@@ -284,6 +288,67 @@ pub fn store_changeset(
     Ok((id, tree))
 }
 
+/// The stored trees on every changed path's directory chain, level by
+/// level: level 0 is the root, and each round reads every directory the
+/// paths' previous level holds, in one `get_trees`. A directory the base
+/// does not store is built as the apply goes, and reads nothing. The
+/// bytes are decoded and checked against their ids, as `get_tree` does.
+fn prefetch(
+    c: &mut dyn MetaTx,
+    base: Option<TreeId>,
+    changes: &BTreeMap<RepoPath, Option<FileState>>,
+) -> Result<HashMap<TreeId, Tree>> {
+    let mut trees = HashMap::new();
+    let Some(root) = base else {
+        return Ok(trees);
+    };
+    // Each changed path's parts; a path of length L has its file at the
+    // last part, so its directories are the parts before it.
+    let paths: Vec<Vec<PathElem>> = changes.keys().map(parts).collect();
+    let depth = paths.iter().map(Vec::len).max().unwrap_or(0);
+    let mut level = vec![root];
+    for _ in 0..depth {
+        let bodies = c.get_trees(&level)?;
+        for (id, body) in level.iter().zip(bodies) {
+            let Some(body) = body else {
+                continue; // a stored tree that is missing fails as it did,
+                // when the apply reaches it
+            };
+            let (tree, actual) = Tree::decode_with_id(&body)
+                .map_err(|e| Error::Corrupt(format!("tree {id}: {e}")))?;
+            if actual != *id {
+                return Err(Error::Corrupt(format!("tree {id} does not match its ID")));
+            }
+            trees.insert(*id, tree);
+        }
+        // The next level's directories: each path's directory at this
+        // depth, resolved through the trees this loop now holds.
+        let mut next: Vec<TreeId> = Vec::new();
+        for path in &paths {
+            let mut id = root;
+            let mut stored = true;
+            for part in path.iter().take(path.len() - 1) {
+                if let Some(Entry::Dir(child)) =
+                    trees.get(&id).and_then(|tree| tree.entries().get(part))
+                {
+                    id = *child;
+                } else {
+                    stored = false;
+                    break;
+                }
+            }
+            if stored && !trees.contains_key(&id) && !next.contains(&id) {
+                next.push(id);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        level = next;
+    }
+    Ok(trees)
+}
+
 /// The parts of a path, as tree entry names.
 pub(crate) fn parts(path: &RepoPath) -> Vec<PathElem> {
     path.as_bytes()
@@ -309,21 +374,27 @@ enum Node {
 }
 
 impl Dir {
-    fn entries(&mut self, c: &mut dyn MetaTx) -> Result<&mut BTreeMap<PathElem, Node>> {
+    fn entries(
+        &mut self,
+        c: &mut dyn MetaTx,
+        loaded: &mut HashMap<TreeId, Tree>,
+    ) -> Result<&mut BTreeMap<PathElem, Node>> {
         if let Self::Stored(id) = *self {
-            let entries = c
-                .get_tree(id)?
-                .entries()
-                .clone()
-                .into_iter()
-                .map(|(name, entry)| {
-                    let node = match entry {
-                        Entry::File(file) => Node::File(file),
-                        Entry::Dir(id) => Node::Dir(Self::Stored(id)),
-                    };
-                    (name, node)
-                })
-                .collect();
+            let entries = match loaded.remove(&id) {
+                // The prefetch read this tree: its entries hand over
+                // whole, no second read and no clone.
+                Some(tree) => tree.into_entries(),
+                None => c.get_tree(id)?.entries().clone(),
+            }
+            .into_iter()
+            .map(|(name, entry)| {
+                let node = match entry {
+                    Entry::File(file) => Node::File(file),
+                    Entry::Dir(id) => Node::Dir(Self::Stored(id)),
+                };
+                (name, node)
+            })
+            .collect();
             *self = Self::Loaded(entries);
         }
         match self {
@@ -333,13 +404,19 @@ impl Dir {
     }
 
     /// Deletes the file at `parts`. Returns whether this directory is now empty.
-    fn delete(&mut self, c: &mut dyn MetaTx, path: &RepoPath, parts: &[PathElem]) -> Result<bool> {
-        let entries = self.entries(c)?;
+    fn delete(
+        &mut self,
+        c: &mut dyn MetaTx,
+        loaded: &mut HashMap<TreeId, Tree>,
+        path: &RepoPath,
+        parts: &[PathElem],
+    ) -> Result<bool> {
+        let entries = self.entries(c, loaded)?;
         let (name, rest) = parts.split_first().expect("a path has at least one part");
         let remove = match (entries.get_mut(name), rest.is_empty()) {
             (Some(Node::File(_)), true) => true,
             (Some(Node::Dir(_)), true) => return Err(ApplyError::NotAFile(path.clone()).into()),
-            (Some(Node::Dir(child)), false) => child.delete(c, path, rest)?,
+            (Some(Node::Dir(child)), false) => child.delete(c, loaded, path, rest)?,
             (Some(Node::File(_)) | None, _) => {
                 return Err(ApplyError::DeleteMissing(path.clone()).into());
             }
@@ -353,12 +430,13 @@ impl Dir {
     fn put(
         &mut self,
         c: &mut dyn MetaTx,
+        loaded: &mut HashMap<TreeId, Tree>,
         path: &RepoPath,
         parts: &[PathElem],
         depth: usize,
         file: FileEntry,
     ) -> Result<()> {
-        let entries = self.entries(c)?;
+        let entries = self.entries(c, loaded)?;
         let name = &parts[depth];
         if depth + 1 == parts.len() {
             if matches!(entries.get(name), Some(Node::Dir(_))) {
@@ -371,7 +449,7 @@ impl Dir {
             .entry(name.clone())
             .or_insert_with(|| Node::Dir(Self::Loaded(BTreeMap::new())));
         match child {
-            Node::Dir(dir) => dir.put(c, path, parts, depth + 1, file),
+            Node::Dir(dir) => dir.put(c, loaded, path, parts, depth + 1, file),
             Node::File(_) => Err(ApplyError::FileInTheWay {
                 path: path.clone(),
                 file: prefix(&parts[..=depth]),

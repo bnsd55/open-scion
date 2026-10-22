@@ -734,6 +734,25 @@ impl MetaTx for SqliteTx<'_> {
         load_tree(self.0, id).map(|(tree, _)| tree)
     }
 
+    /// The stored bytes of the trees the ids name, in the order asked.
+    /// SQLite has one write connection: the existing per-id read, in a
+    /// loop, is the batch.
+    fn get_trees(&mut self, ids: &[TreeId]) -> Result<Vec<Option<Vec<u8>>>> {
+        let mut bodies = Vec::with_capacity(ids.len());
+        let mut stmt = self
+            .0
+            .prepare_cached("SELECT body FROM trees WHERE id = ?1")
+            .map_err(crate::error::from_sqlite)?;
+        for id in ids {
+            let body = stmt
+                .query_row([id.as_bytes()], |row| row.get(0))
+                .optional()
+                .map_err(crate::error::from_sqlite)?;
+            bodies.push(body);
+        }
+        Ok(bodies)
+    }
+
     /// Reads a tree's stored `TreeV1` bytes and checks them against its ID. The
     /// strict decoder accepts only canonical bytes, so they are sent as they are.
     ///

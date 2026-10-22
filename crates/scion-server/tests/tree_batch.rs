@@ -8,13 +8,11 @@
 //! guard owns its binary: no other test speaks SQL in its process. On
 //! SQLite the count is always zero, which is why the guard skips there.
 
-use std::collections::BTreeMap;
-
 use scion_core::{Changeset, FileState, IdentityTime, RepoPath};
 
+use scion_server::Backend;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::tree;
-use scion_server::Backend;
 
 const REPO: &str = "tree";
 
@@ -68,7 +66,7 @@ fn the_derivation_of_a_hundred_directories_costs_four_statements_more() {
             .write(|c| Ok(tree::store_changeset(c, repo, &base, &mut |_| Ok(0))?.0))
             .unwrap();
         let (_base_id, base_root) = store
-            .write(|c| Ok(tree::store_changeset(c, repo, &base, &mut |_| Ok(0))?))
+            .write(|c| tree::store_changeset(c, repo, &base, &mut |_| Ok(0)))
             .unwrap();
         let commit = changeset(
             &(0..d)
@@ -83,14 +81,7 @@ fn the_derivation_of_a_hundred_directories_costs_four_statements_more() {
         // matter, not the tree read this guard pins.
         Backend::test_reset_statement_count();
         store
-            .write(|c| {
-                Ok(tree::apply(
-                    c,
-                    Some(base_root),
-                    commit.changes(),
-                    &mut |_| Ok(0),
-                )?)
-            })
+            .write(|c| tree::apply(c, Some(base_root), commit.changes(), &mut |_| Ok(0)))
             .unwrap();
         counts.push(Backend::test_statement_count());
     }

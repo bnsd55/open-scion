@@ -671,6 +671,13 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn get_trees(&mut self, ids: &[TreeId]) -> Result<Vec<Option<Vec<u8>>>> {
+        match self {
+            Self::Sqlite(tx) => tx.get_trees(ids),
+            Self::Postgres(pg) => pg.get_trees(ids),
+        }
+    }
+
     fn get_tree_body(&mut self, id: TreeId) -> Result<Vec<u8>> {
         match self {
             Self::Sqlite(tx) => tx.get_tree_body(id),
