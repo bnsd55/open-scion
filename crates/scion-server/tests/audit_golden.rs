@@ -504,6 +504,44 @@ async fn write_import_restore_lines(audit: &Audit) {
     }
 }
 
+/// Writes the derive's, the migration's, and the ticket-key
+/// generation's own admin lines, the events those subcommands and opens
+/// record: one intent and one result per run, with the run's counts.
+/// The migration's line has no intent pair: it happened inside the
+/// store's open, before the audit could exist.
+async fn write_derive_migrate_ticket_lines(audit: &Audit) {
+    for line in [
+        Event::new(
+            "admin",
+            "intent",
+            serde_json::json!({ "what": "derive", "kind": "root_tree" }),
+        ),
+        Event::new(
+            "admin",
+            "ok",
+            serde_json::json!({
+                "what": "derive",
+                "kind": "root_tree",
+                "written": 3,
+                "removed": 0,
+            }),
+        ),
+        Event::new(
+            "admin",
+            "ok",
+            serde_json::json!({ "what": "migrate", "from": 1, "to": 2 }),
+        ),
+        Event::new(
+            "admin",
+            "intent",
+            serde_json::json!({ "what": "ticket-key" }),
+        ),
+        Event::new("admin", "ok", serde_json::json!({ "what": "ticket-key" })),
+    ] {
+        audit.record(line).await.unwrap();
+    }
+}
+
 async fn exercise() -> (tempfile::TempDir, std::path::PathBuf) {
     use scion_proto::v1::{PutBlobRequest, ResolveRefRequest};
     use tokio_stream::once;
@@ -618,7 +656,8 @@ async fn exercise() -> (tempfile::TempDir, std::path::PathBuf) {
     // fields against the CLI).
     let audit = Audit::open(&audit_path).unwrap();
     write_import_restore_lines(&audit).await;
-    wait_for_lines(&audit_path, 21).await;
+    write_derive_migrate_ticket_lines(&audit).await;
+    wait_for_lines(&audit_path, 26).await;
     (dir, audit_path)
 }
 

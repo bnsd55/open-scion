@@ -357,6 +357,11 @@ pub trait MetaTx {
     /// Reads a tree, and checks it against its ID.
     fn get_tree(&mut self, id: TreeId) -> Result<Tree>;
 
+    /// The stored bytes of the trees the ids name, in the order asked:
+    /// `None` for an id that is not stored. Unchecked bytes: the caller
+    /// decodes each and checks it against its id, as `get_tree` does.
+    fn get_trees(&mut self, ids: &[TreeId]) -> Result<Vec<Option<Vec<u8>>>>;
+
     /// Reads a tree's stored `TreeV1` bytes, checked against its ID.
     fn get_tree_body(&mut self, id: TreeId) -> Result<Vec<u8>>;
 

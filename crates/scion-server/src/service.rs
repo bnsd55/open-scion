@@ -2978,6 +2978,11 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         call.abort();
+        // The cut ends the deadline when the aborted task's future drops
+        // the call's guard, not when `abort` returns; joining the task
+        // puts the drop before the park's lift, so the job's next check
+        // reads the cut, never the instant before it.
+        assert!(call.await.unwrap_err().is_cancelled());
         std::fs::remove_file(hooks.join(format!("park-{one}"))).unwrap();
         write::PARK_CHECK.lift();
 
