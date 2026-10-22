@@ -165,11 +165,11 @@ SLOW_EXPECTED=$("$TIMEOUT" 60 "$BIN/scn" --server "$SERVER" cat "$SLOW_FILE" | w
 # the point: the clients must resume against a restarted upstream
 # through a live tier.
 start_server() {
-  start server serving "$BIN/scion-server" --data "$WORK/server" serve \
+  start server serving "$BIN/scion-server" --data "$WORK/server" \
+    "${PGFLAGS[@]+"${PGFLAGS[@]}"}" serve \
     --listen "127.0.0.1:$SERVER_PORT" \
     --ticket-key "$WORK/ticket.key" \
-    --metrics-listen "127.0.0.1:$SERVER_METRICS_PORT" \
-    "${PGFLAGS[@]+"${PGFLAGS[@]}"}"
+    --metrics-listen "127.0.0.1:$SERVER_METRICS_PORT"
   server_pid || die "the restarted server does not hold the port"
 }
 
@@ -252,8 +252,9 @@ importer() {
   local n=0
   while [ "$(date +%s)" -lt "$END" ]; do
     n=$((n + 1))
-    "$TIMEOUT" 300 "$BIN/scion-server" --data "$WORK/server" import \
-      "${PGFLAGS[@]+"${PGFLAGS[@]}"}" --rev main "$WORK/src.git" \
+    "$TIMEOUT" 300 "$BIN/scion-server" --data "$WORK/server" \
+      "${PGFLAGS[@]+"${PGFLAGS[@]}"}" import \
+      --rev main "$WORK/src.git" \
       >> "$WORK/import-soak.log" 2>&1 || echo "import $n failed" >> "$WORK/import-fail.log"
     sleep 60
   done
@@ -264,11 +265,11 @@ gcer() {
   local n=0
   while [ "$(date +%s)" -lt "$END" ]; do
     n=$((n + 1))
-    "$TIMEOUT" 120 "$BIN/scion-server" --data "$WORK/server" gc --dry-run \
-      "${PGFLAGS[@]+"${PGFLAGS[@]}"}" >> "$WORK/gc.log" 2>&1 \
+    "$TIMEOUT" 120 "$BIN/scion-server" --data "$WORK/server" \
+      "${PGFLAGS[@]+"${PGFLAGS[@]}"}" gc --dry-run >> "$WORK/gc.log" 2>&1 \
       || echo "gc-dry $n failed" >> "$WORK/gc-fail.log"
-    "$TIMEOUT" 120 "$BIN/scion-server" --data "$WORK/server" gc \
-      "${PGFLAGS[@]+"${PGFLAGS[@]}"}" >> "$WORK/gc.log" 2>&1 \
+    "$TIMEOUT" 120 "$BIN/scion-server" --data "$WORK/server" \
+      "${PGFLAGS[@]+"${PGFLAGS[@]}"}" gc >> "$WORK/gc.log" 2>&1 \
       || echo "gc $n failed" >> "$WORK/gc-fail.log"
     sleep 120
   done
@@ -327,8 +328,8 @@ check_ledger() {
 # fsck_ok: the store and database hold. Safe beside the running server
 # (release-smoke.sh runs it the same way).
 fsck_ok() {
-  "$TIMEOUT" 300 "$BIN/scion-server" --data "$WORK/server" fsck \
-    "${PGFLAGS[@]+"${PGFLAGS[@]}"}" >> "$WORK/fsck.log" 2>&1
+  "$TIMEOUT" 300 "$BIN/scion-server" --data "$WORK/server" \
+    "${PGFLAGS[@]+"${PGFLAGS[@]}"}" fsck >> "$WORK/fsck.log" 2>&1
 }
 
 # pg_restart: the optional Postgres fault. SCION_FAULT_PG_CMD runs the

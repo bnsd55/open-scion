@@ -896,6 +896,28 @@ pub(crate) fn load_batch<K: Kind>(
         .collect()
 }
 
+/// The stored values of `K` on the first-parent chain that starts at
+/// `start`, at most `limit` of them, one statement. A stored byte string
+/// that is not a value is corruption.
+///
+/// # Errors
+///
+/// [`Error::Corrupt`] if a stored byte string is not a value.
+pub(crate) fn load_chain<K: Kind>(
+    c: &mut dyn MetaTx,
+    start: ChangesetId,
+    limit: i64,
+) -> Result<Vec<(ChangesetId, K::Value)>> {
+    c.get_derived_chain(K::NAME, K::VERSION, start, limit)?
+        .into_iter()
+        .map(|(cs, bytes)| {
+            K::decode(&bytes).map(|value| (cs, value)).ok_or_else(|| {
+                Error::Corrupt(format!("derived {} v{} for {cs}", K::NAME, K::VERSION))
+            })
+        })
+        .collect()
+}
+
 fn require(c: &mut dyn MetaTx, repo: RepoId, cs: ChangesetId) -> Result<()> {
     if c.has_changeset(repo, cs)? {
         Ok(())

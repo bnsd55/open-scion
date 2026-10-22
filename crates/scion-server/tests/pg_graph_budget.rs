@@ -154,17 +154,22 @@ fn the_ladder_walks_stay_under_the_statement_budget() {
         run();
         Backend::test_statement_count()
     };
-    // One ancestor walk's budget: 1 statement per merge for the chain's
-    // node reads (the chain is a linked list) plus 1/5th per merge for
-    // the parents batches, the side-parent node batches, the descend
-    // hops, and the steps' transaction overhead, and k = 1,000 for the
-    // single-node loads off the chain. Measured 11,155 and 10,124 here.
-    let search_cap = u64::try_from(merges).unwrap() + u64::try_from(merges).unwrap() / 5 + 1_000;
-    // One merge-base walk's budget: 2 node reads per merge (the merge
-    // and its side parent, one statement each) and 1 parents statement
-    // per merge, plus the steps' overhead. The parents batch does not
-    // touch the Paint walk; measured 30,141 here.
-    let paint_cap = 3 * u64::try_from(merges).unwrap() + 2_000;
+    // One ancestor walk's budget. The steps cost 4 statements to open
+    // and close their read transaction, per 1,000 reads; the walk reads
+    // about 30 nodes per merge on this ladder (the histories it
+    // descends), so the steps cost about 1/8th statement per merge, and
+    // the chain, parents and side-parent batches a fraction more. k =
+    // 200 covers the single-node loads off the chains. Measured 1,171
+    // and 139 here.
+    let search_cap = u64::try_from(merges).unwrap() / 8 + 200;
+    // One merge-base walk's budget: the Paint pop order is unchanged, and
+    // the lookups ride the chain page's caches: a page brings its nodes'
+    // parents in one `parents_many` statement and those parents' nodes in
+    // one batch statement, so a page costs about 4 statements per 1,000
+    // nodes, plus the steps' overhead. Same formula as the search: about
+    // 1/8th statement per merge with k = 200 for the small histories.
+    // Measured 207 here.
+    let paint_cap = u64::try_from(merges).unwrap() / 8 + 200;
     let not_ancestor = statements(&mut || {
         assert!(!read::is_ancestor(&store, REPO, late, tip, &later()).unwrap());
     });

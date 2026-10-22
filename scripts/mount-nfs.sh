@@ -72,13 +72,33 @@ command -v mount.nfs > /dev/null || sudo apt-get install -y -qq nfs-common
 
 note "starting the server"
 "$BIN/scion-server" ticket-key --out "$WORK/ticket.key" > "$WORK/ticket.pub"
-"$BIN/scion-server" --data "$WORK/server" serve \
+# In Postgres mode (SCION_TEST_BACKEND=postgres) the server serves its
+# metadata from the test database; the data directory keeps the marker and
+# the blob files, and the checks below prove which backend served.
+PG_ARG=""
+if [ "${SCION_TEST_BACKEND:-}" = postgres ]; then
+  : "${SCION_TEST_POSTGRES_URL:?SCION_TEST_POSTGRES_URL must name the test database}"
+  PG_ARG="--postgres-url $SCION_TEST_POSTGRES_URL"
+fi
+# shellcheck disable=SC2086 # the URL holds no spaces
+"$BIN/scion-server" --data "$WORK/server" $PG_ARG serve \
   --listen "127.0.0.1:$SERVER_PORT" \
   --ticket-key "$WORK/ticket.key" \
   > "$WORK/server.log" 2>&1 &
 echo $! > "$WORK/server.pid"
 "$TIMEOUT" 30 bash -c 'until grep -q serving '"$WORK"'/server.log 2> /dev/null; do sleep 0.2; done' \
-  || die "the server did not start"
+  || { tail -n 20 "$WORK/server.log"; die "the server did not start"; }
+# The run proves the backend it was asked for: a Postgres-backed server
+# writes the marker and no SQLite database, so a spawn that lost its
+# --postgres-url fails here, not vacuously as a second SQLite run.
+if [ "${SCION_TEST_BACKEND:-}" = postgres ]; then
+  test -f "$WORK/server/backend" || die "the data directory has no backend marker"
+  test "$(head -n 1 "$WORK/server/backend")" = postgres \
+    || die "the server is not Postgres-backed"
+  test ! -e "$WORK/server/scion.db" \
+    || die "a Postgres-backed server must not keep a SQLite database"
+  note "the server is Postgres-backed (marker, no scion.db)"
+fi
 
 # A known changeset with known bytes on main: a one-file git repository,
 # imported (import creates the repo, a commit cannot, so this goes before
@@ -88,7 +108,11 @@ printf 'hello from the mount test\n' > "$WORK/src/README.md"
 git -C "$WORK/src" add README.md
 git -C "$WORK/src" -c user.name=mount-nfs -c user.email=mount-nfs@localhost \
   commit -qm "seed the repo"
-"$TIMEOUT" 120 "$BIN/scion-server" --data "$WORK/server" import \
+# The import opens the same backend beside the serving one, so it takes
+# the same `--postgres-url` in Postgres mode, before the subcommand: the
+# flag belongs to the root command.
+# shellcheck disable=SC2086 # the URL holds no spaces
+"$TIMEOUT" 120 "$BIN/scion-server" --data "$WORK/server" $PG_ARG import \
   --repo main --rev main "$WORK/src" \
   > "$WORK/import.out" 2> "$WORK/import.log" || {
   tail -n 20 "$WORK/import.log" >&2

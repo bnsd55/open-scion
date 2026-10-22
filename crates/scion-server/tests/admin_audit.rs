@@ -7,7 +7,7 @@
 use std::fs;
 use std::process::{Command, Output};
 
-use scion_core::BlobId;
+use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use std::os::unix::fs::PermissionsExt as _;
 
@@ -183,4 +183,431 @@ fn a_gc_audit_names_no_blob() {
         let json: serde_json::Value = serde_json::from_str(line).unwrap();
         assert!(no_blob_ids(&json), "a blob ID in the line: {line}");
     }
+}
+
+/// Runs `scion-server` with `args` after the global `--data`, and returns
+/// its output.
+fn run(data: &std::path::Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_scion-server"))
+        .arg("--data")
+        .arg(data)
+        .args(args)
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap()
+}
+
+/// A world-readable audit file: the audit's open refuses it.
+fn guard_log(dir: &std::path::Path) -> std::path::PathBuf {
+    let guard = dir.join("guard.log");
+    fs::write(&guard, "").unwrap();
+    fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o644)).unwrap();
+    guard
+}
+
+/// One git commit of `message` over the files `dir` currently holds.
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "Ada")
+        .env("GIT_AUTHOR_EMAIL", "ada@example.com")
+        .env("GIT_COMMITTER_NAME", "Ada")
+        .env("GIT_COMMITTER_EMAIL", "ada@example.com")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A git repository whose main holds two commits over two files.
+fn a_git_repo(path: &std::path::Path) {
+    fs::create_dir_all(path).unwrap();
+    git(path, &["init", "-q", "-b", "main"]);
+    fs::write(path.join("a.txt"), "a\n").unwrap();
+    git(path, &["add", "."]);
+    git(path, &["commit", "-q", "-m", "one"]);
+    fs::write(path.join("b.txt"), "b\n").unwrap();
+    git(path, &["add", "."]);
+    git(path, &["commit", "-q", "-m", "two"]);
+}
+
+/// No field of an audit line holds a content address: a git commit's
+/// 40 hex characters or a blob or changeset ID's 64. The lines name
+/// counts, never content.
+fn no_content_ids(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(s) => {
+            let hexish = s.len() == 64 || s.len() == 40;
+            !(hexish && s.chars().all(|c| c.is_ascii_hexdigit()))
+        }
+        serde_json::Value::Array(v) => v.iter().all(no_content_ids),
+        serde_json::Value::Object(m) => m.values().all(no_content_ids),
+        _ => true,
+    }
+}
+
+fn repo_path(p: &str) -> RepoPath {
+    RepoPath::new(p).unwrap()
+}
+
+fn regular(content: &str) -> FileState {
+    FileState::Regular {
+        content: BlobId::of(content.as_bytes()),
+        executable: false,
+    }
+}
+
+fn one_changeset(parents: Vec<ChangesetId>, changes: &[(&str, Option<FileState>)]) -> Changeset {
+    Changeset::new(
+        parents,
+        IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            0,
+        )
+        .expect("identity fits the format"),
+        None,
+        b"change\n".to_vec(),
+        changes.iter().map(|(p, s)| (repo_path(p), *s)).collect(),
+    )
+    .expect("changeset fits the format")
+}
+
+/// A store with a repository `hist` whose main holds one changeset over
+/// one blob. The caller must drop the store before the CLI opens it.
+fn seed_exportable(data: &std::path::Path) {
+    fs::create_dir_all(data).unwrap();
+    let store = scion_server::Backend::open(data, None, None).unwrap();
+    store.blobs().put(b"a\n").unwrap();
+    store
+        .write(|c| {
+            let repo = c.create_repo("hist")?;
+            let cs = one_changeset(Vec::new(), &[("a.txt", Some(regular("a\n")))]);
+            let id =
+                scion_server::test_support::tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0;
+            assert!(c.cas_ref(repo, "main", None, id)?);
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// One real import: one admin intent before, one admin ok after, with
+/// the import's counts.
+#[test]
+fn an_import_writes_an_admin_intent_and_ok_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let hist = dir.path().join("hist");
+    a_git_repo(&hist);
+
+    let out = run(&data, &["import", "--repo", "hist", hist.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "import ran: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let lines = audit_lines(&data);
+    assert_eq!(lines.len(), 2, "one intent and one result: {lines:?}");
+    assert_eq!(lines[0]["event"], "admin");
+    assert_eq!(lines[0]["outcome"], "intent");
+    assert_eq!(lines[0]["what"], "import");
+    assert_eq!(lines[0]["repo"], "hist");
+    assert_eq!(lines[1]["event"], "admin");
+    assert_eq!(lines[1]["outcome"], "ok");
+    assert_eq!(lines[1]["what"], "import");
+    assert_eq!(lines[1]["repo"], "hist");
+    assert_eq!(lines[1]["commits"], 2);
+    assert_eq!(lines[1]["commits_imported"], 2);
+    assert_eq!(lines[1]["refs_moved"], 1);
+    assert!(
+        lines[1]["verified"].is_u64(),
+        "the ok line carries the verified count: {lines:?}"
+    );
+}
+
+/// The import's lines carry counts and a repo name: no commit ID and no
+/// blob ID appears in the audit.
+#[test]
+fn an_import_audit_names_no_commit_or_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let hist = dir.path().join("hist");
+    a_git_repo(&hist);
+
+    let out = run(&data, &["import", "--repo", "hist", hist.to_str().unwrap()]);
+    assert!(out.status.success(), "import ran");
+
+    let text = fs::read_to_string(data.join("audit.log")).unwrap();
+    for line in text.lines() {
+        let json: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(no_content_ids(&json), "a content ID in the line: {line}");
+    }
+}
+
+/// An import whose audit file cannot open refuses before it changes
+/// anything: the repository was not made, and a rerun with a working
+/// audit imports the whole history.
+#[test]
+fn an_import_whose_audit_file_refuses_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let hist = dir.path().join("hist");
+    a_git_repo(&hist);
+    let guard = guard_log(dir.path());
+
+    let out = run(
+        &data,
+        &[
+            "import",
+            "--repo",
+            "hist",
+            "--audit-file",
+            guard.to_str().unwrap(),
+            hist.to_str().unwrap(),
+        ],
+    );
+    assert!(!out.status.success(), "the run refused");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("cannot open audit log"),
+        "the error names the audit log: {err}"
+    );
+    assert!(!data.join("audit.log").exists(), "the run wrote no audit");
+
+    let out = run(&data, &["import", "--repo", "hist", hist.to_str().unwrap()]);
+    assert!(out.status.success(), "the rerun ran");
+    let lines = audit_lines(&data);
+    assert_eq!(lines.len(), 2, "the refused run wrote nothing: {lines:?}");
+    assert_eq!(lines[0]["outcome"], "intent");
+    assert_eq!(lines[1]["outcome"], "ok");
+    assert_eq!(
+        lines[1]["commits_imported"], 2,
+        "nothing was imported before"
+    );
+}
+
+/// One real restore: one admin intent before the replay and one admin ok
+/// after it, in the restored store's own audit file, with the restore's
+/// counts.
+#[test]
+fn a_restore_writes_an_admin_intent_and_ok_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let restored = dir.path().join("restored");
+    let archive = dir.path().join("archive");
+    seed_exportable(&data);
+
+    let out = run(
+        &data,
+        &[
+            "export",
+            "--repo",
+            "hist",
+            "--out",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "export ran: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = run(
+        &restored,
+        &["restore", "--archive", archive.to_str().unwrap()],
+    );
+    assert!(
+        out.status.success(),
+        "restore ran: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let lines = audit_lines(&restored);
+    assert_eq!(lines.len(), 2, "one intent and one result: {lines:?}");
+    assert_eq!(lines[0]["event"], "admin");
+    assert_eq!(lines[0]["outcome"], "intent");
+    assert_eq!(lines[0]["what"], "restore");
+    assert_eq!(lines[1]["event"], "admin");
+    assert_eq!(lines[1]["outcome"], "ok");
+    assert_eq!(lines[1]["what"], "restore");
+    assert_eq!(lines[1]["repos"], 1);
+    assert_eq!(lines[1]["refs"], 1);
+    assert_eq!(lines[1]["lands"], 0);
+}
+
+/// A restore whose audit file cannot open refuses before it changes
+/// anything: the target directory holds no store.
+#[test]
+fn a_restore_whose_audit_file_refuses_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let restored = dir.path().join("restored");
+    seed_exportable(&data);
+    let archive = dir.path().join("archive");
+    let out = run(
+        &data,
+        &[
+            "export",
+            "--repo",
+            "hist",
+            "--out",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "export ran");
+    let guard = guard_log(dir.path());
+
+    let out = run(
+        &restored,
+        &[
+            "restore",
+            "--archive",
+            archive.to_str().unwrap(),
+            "--audit-file",
+            guard.to_str().unwrap(),
+        ],
+    );
+    assert!(!out.status.success(), "the run refused");
+    assert!(
+        !restored.join("scion.db").exists(),
+        "the target holds no store"
+    );
+}
+
+/// The verify subcommand runs without the store-open match that hid an
+/// `unreachable!` behind verify and restore since the archive landed: a
+/// good archive exits 0, a damaged one names its damage and does not.
+#[test]
+fn a_verify_subcommand_reports_a_good_archive_and_names_a_damaged_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let archive = dir.path().join("archive");
+    seed_exportable(&data);
+
+    let out = run(
+        &data,
+        &[
+            "export",
+            "--repo",
+            "hist",
+            "--out",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "export ran: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_scion-server"))
+        .args(["verify", "--archive", archive.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "a good archive verifies");
+    let out_text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out_text.contains("verify: 0 damages"),
+        "the report says what it saw: {out_text}"
+    );
+
+    // A blob file whose bytes another hand changed: the verify names the
+    // blob, and the exit is not 0. The blobs live in a fan-out of two
+    // hex levels under blobs/.
+    let mut blob = None;
+    for first in fs::read_dir(archive.join("blobs")).unwrap().flatten() {
+        for second in fs::read_dir(first.path()).unwrap().flatten() {
+            if second.path().is_file() {
+                blob = Some(second.path());
+                break;
+            }
+        }
+        if blob.is_some() {
+            break;
+        }
+    }
+    let blob = blob.expect("the archive holds a blob file");
+    fs::write(&blob, b"someone changed these bytes\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_scion-server"))
+        .args(["verify", "--archive", archive.to_str().unwrap()])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a damaged archive does not verify");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains("verify: 1 damages"),
+        "the report names the damage count: {text}"
+    );
+}
+
+/// A restore that fails mid-replay still leaves its audit record: the
+/// intent goes back to the target with the failed line after it, and
+/// the target holds nothing else — the evidence an auditor needs is
+/// exactly what a failed run must not delete.
+#[test]
+fn a_restore_that_fails_mid_replay_leaves_its_audit_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let restored = dir.path().join("restored");
+    seed_exportable(&data);
+    let archive = dir.path().join("archive");
+    let out = run(
+        &data,
+        &[
+            "export",
+            "--repo",
+            "hist",
+            "--out",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "export ran");
+    // A blob file whose bytes another hand changed: the replay's check
+    // refuses it.
+    let mut blob = None;
+    for first in fs::read_dir(archive.join("blobs")).unwrap().flatten() {
+        for second in fs::read_dir(first.path()).unwrap().flatten() {
+            if second.path().is_file() {
+                blob = Some(second.path());
+                break;
+            }
+        }
+        if blob.is_some() {
+            break;
+        }
+    }
+    fs::write(blob.expect("the archive holds a blob"), b"damaged\n").unwrap();
+
+    let out = run(
+        &restored,
+        &["restore", "--archive", archive.to_str().unwrap()],
+    );
+    assert!(!out.status.success(), "the run refused");
+
+    let lines = audit_lines(&restored);
+    assert_eq!(lines.len(), 2, "one intent and one result: {lines:?}");
+    assert_eq!(lines[0]["event"], "admin");
+    assert_eq!(lines[0]["outcome"], "intent");
+    assert_eq!(lines[0]["what"], "restore");
+    assert_eq!(lines[1]["event"], "admin");
+    assert_eq!(lines[1]["outcome"], "failed");
+    assert_eq!(lines[1]["why"], "failed");
+    let held: Vec<_> = fs::read_dir(&restored).unwrap().flatten().collect();
+    assert_eq!(held.len(), 1, "the target holds only the audit: {held:?}");
+    assert_eq!(held[0].file_name(), "audit.log");
 }

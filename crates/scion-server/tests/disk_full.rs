@@ -12,10 +12,15 @@
 mod common;
 
 use scion_core::{Changeset, FileState, RepoPath};
+use scion_server::test_support::deadline::Deadline;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::tree;
 use scion_server::test_support::write;
 use scion_server::{Backend, Error};
+
+fn later() -> Deadline {
+    Deadline::new(std::time::Instant::now() + std::time::Duration::from_secs(600))
+}
 
 use crate::common::{REPO, author};
 
@@ -194,7 +199,8 @@ fn a_full_metadata_disk_answers_out_of_space_and_needs_no_repair() {
     }
     if Backend::test_is_postgres() {
         // The metadata lives in the database then; its disk full is the
-        // SQLSTATE 53100 arm, not a data-directory row.
+        // SQLSTATE 53100 arm of the pg mapping, a unit test of pg.rs,
+        // not a data-directory row.
         return;
     }
     let mount = Mount::new("meta", "1m", "4096");
@@ -684,7 +690,7 @@ fn land_until(store: &Backend, from: usize, blob: scion_core::BlobId, dry: bool)
         // The helper stores the changeset and its tree; the ref move is
         // the land's own act, so main advances here and the next land's
         // base tree holds the last land's files.
-        let id = match write::create_changeset(store, REPO, &cs.encode()) {
+        let id = match write::create_changeset(store, REPO, &cs.encode(), &later()) {
             Ok(id) => id,
             Err(e) => return (last, Err((e, cs.encode()))),
         };
@@ -813,7 +819,7 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
     client
         .batch_execute("CHECKPOINT")
         .expect("the checkpoint runs");
-    let retried = write::create_changeset(&store, REPO, &failed)
+    let retried = write::create_changeset(&store, REPO, &failed, &later())
         .expect("the stopped write lands once the database has room");
     move_main(&store, retried);
     assert_eq!(

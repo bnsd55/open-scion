@@ -1388,7 +1388,7 @@ mod tests {
         // A changeset that no ref points to gets its path history when it is
         // written, because its parent has one.
         let draft = changeset(Some(main[1]), &[("a", Some(blob))]);
-        let draft = write::create_changeset(&store, "r", &draft.encode()).unwrap();
+        let draft = write::create_changeset(&store, "r", &draft.encode(), &later()).unwrap();
         assert!(
             store
                 .read(|c| derived::load::<PathHistory>(c, draft))
@@ -1412,7 +1412,7 @@ mod tests {
             store.blobs().put(i.as_bytes()).unwrap();
         }
         let draft = changeset(Some(old[2]), &[("y", Some(blob))]);
-        let draft = write::create_changeset(&store, "r", &draft.encode()).unwrap();
+        let draft = write::create_changeset(&store, "r", &draft.encode(), &later()).unwrap();
         let stored = |cs| store.read(|c| derived::load::<PathHistory>(c, cs)).unwrap();
         assert!(stored(draft).is_none(), "its parent has none");
         let commits = store.commits();

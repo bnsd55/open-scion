@@ -173,6 +173,11 @@ pub struct LandOutcome {
 /// Per-ref state, guarded by the ref's lock.
 type RefSlot = Arc<Mutex<Option<PathIndex>>>;
 
+/// The test step the settle runs after it recorded the land in the
+/// index: it sees the index, and runs under the slot's lock.
+#[cfg(test)]
+type AfterRecord = Box<dyn FnOnce(&mut Option<PathIndex>) + Send>;
+
 /// Serializes lands per ref and keeps each ref's `PathIndex`.
 pub struct Lands {
     /// The most pending lands one principal may hold at once. `None` turns
@@ -196,6 +201,11 @@ pub struct Lands {
     /// for certain, where a timed race depends on the machine.
     #[cfg(test)]
     before_settle: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// A step the tests run inside the slot's critical section, right
+    /// after the land recorded its outcome in the index, once: a test
+    /// poisons the slot there, where the panic unwinds through its lock.
+    #[cfg(test)]
+    after_record: Mutex<Option<AfterRecord>>,
 }
 
 impl Default for Lands {
@@ -221,6 +231,8 @@ impl Lands {
             metrics,
             #[cfg(test)]
             before_settle: Mutex::new(None),
+            #[cfg(test)]
+            after_record: Mutex::new(None),
         }
     }
 
@@ -229,6 +241,17 @@ impl Lands {
     fn set_before_settle(&self, step: Box<dyn FnOnce() + Send>) {
         *self
             .before_settle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(step);
+    }
+
+    /// Sets the step the next settle runs after it recorded the land in
+    /// the ref's index, once. The step runs while the slot's lock is
+    /// still held, so a panic there poisons it.
+    #[cfg(test)]
+    fn set_after_record(&self, step: AfterRecord) {
+        *self
+            .after_record
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(step);
     }
@@ -280,7 +303,7 @@ impl Lands {
             // that is finishing this land wins the race: the sweep then
             // finds the row no longer pending, and leaves it alone.
             let slot = self.slot(repo, &target_ref);
-            let index = slot.lock().unwrap_or_else(PoisonError::into_inner);
+            let index = Self::lock_slot(repo, &target_ref, &slot);
             let detail = format!(
                 "stale: pending for more than {stale_secs} s, so the server stopped \
                      before it finished; retry with a new request key"
@@ -382,7 +405,7 @@ impl Lands {
         // The head whose history this call derived.
         let mut derived = None;
         loop {
-            let mut index = slot.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut index = Self::lock_slot(repo, &req.target_ref, &slot);
             // The outcome check rides the plan's read transaction: a call
             // with the same key may have finished the land while this one
             // waited for the lock, and the plan must not run for a land
@@ -416,6 +439,32 @@ impl Lands {
                 )));
             }
             derive_history(store, repo, head, &req.deadline).map_err(stays_pending)?;
+        }
+    }
+
+    /// Locks the slot of a ref. A poisoned lock means a panic held the
+    /// index mid-update: the index may be half-written, and the conflict
+    /// check would trust it. The index is a cache and the database is the
+    /// truth, so the poisoned one is dropped - the next land rebuilds it
+    /// - and the poison is cleared for the locks that follow.
+    fn lock_slot<'a>(
+        repo: RepoId,
+        name: &str,
+        slot: &'a RefSlot,
+    ) -> MutexGuard<'a, Option<PathIndex>> {
+        match slot.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                *guard = None;
+                slot.clear_poison();
+                tracing::warn!(
+                    repo = ?repo,
+                    target_ref = %name,
+                    "the path index of a ref was dropped after a panic; it rebuilds"
+                );
+                guard
+            }
         }
     }
 
@@ -459,7 +508,7 @@ impl Lands {
     /// could not free enough. Also removes the slots that hold no index and
     /// that no land uses, so the next eviction does not look at them.
     fn evict(&self, bytes: usize) -> bool {
-        let slots: Vec<RefSlot> = {
+        let slots: Vec<((RepoId, String), RefSlot)> = {
             let mut refs = self.lock_refs();
             // No land can clone a slot while `refs` is locked, so a slot that
             // only `refs` holds is not in use.
@@ -467,19 +516,34 @@ impl Lands {
                 Arc::strong_count(slot) > 1
                     || !matches!(slot.try_lock(), Ok(index) if index.is_none())
             });
-            refs.iter().map(|(_, slot)| Arc::clone(slot)).collect()
+            refs.iter()
+                .map(|(key, slot)| (key.clone(), Arc::clone(slot)))
+                .collect()
         };
         let free = MAX_INDEX_BYTES - self.used.load(Ordering::Acquire);
         let short = bytes.saturating_sub(free);
         let mut idle = Vec::new();
         let mut freed = 0;
-        for slot in &slots {
+        for ((repo, name), slot) in &slots {
             if freed >= short {
                 break;
             }
             let index = match slot.try_lock() {
                 Ok(index) => index,
-                Err(TryLockError::Poisoned(e)) => e.into_inner(),
+                Err(TryLockError::Poisoned(e)) => {
+                    // A panic held this index mid-update: it may be
+                    // half-written. Dropped like any evicted index, its
+                    // bytes back in the budget; the next land rebuilds it
+                    // from the database.
+                    let guard = e.into_inner();
+                    slot.clear_poison();
+                    tracing::warn!(
+                        repo = ?repo,
+                        target_ref = %name,
+                        "the path index of a ref was dropped after a panic; it rebuilds"
+                    );
+                    guard
+                }
                 Err(TryLockError::WouldBlock) => continue,
             };
             if let Some(held) = index.as_ref() {
@@ -812,6 +876,18 @@ fn settle(
             if let (Some(index), Some(id)) = (index.as_mut(), outcome.result) {
                 index.record(lands, id, generation, rebased.changes());
             }
+            // The hook runs with the slot's lock still held: a test that
+            // panics here poisons the ref's mutex with a half-written
+            // index.
+            #[cfg(test)]
+            if let Some(step) = lands
+                .after_record
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+            {
+                step(index);
+            }
             tracing::info!(land_id, id = ?outcome.result, target = %target, "landed");
             Ok(Finished::Outcome(outcome))
         }
@@ -943,6 +1019,12 @@ impl PathIndex {
         }
     }
 
+    /// The page one walk reads at a time: one statement per page, where
+    /// a walk that reads one changeset at a time pays a round trip per
+    /// changeset. A page may hold rows past the point the walk stops at;
+    /// that costs rows, not statements.
+    const WALK_PAGE: i64 = 1_000;
+
     /// Indexes the changesets from the current tip forward to `head`. Starts
     /// over at `head` if `head` does not descend from the tip (the ref moved
     /// to other history), if `head` is more than [`MAX_DEPTH`] changesets
@@ -966,45 +1048,49 @@ impl PathIndex {
         let mut most = 0;
         let mut steps = 0;
         let mut cur = Some(head);
-        while let Some(id) = cur {
-            if id == self.tip {
-                let cost = self.cost(walked.iter().map(|(_, g, changes)| (*g, changes)));
-                let grew = self.grow(lands, cost, |index| {
-                    for (id, generation, changes) in walked {
-                        index.add(id, generation, &changes);
+        'walk: while let Some(start) = cur {
+            // One statement per page of first parents: the rows carry the
+            // generation and the body that the two per-changeset reads
+            // fetched. The stop rules below stay per changeset.
+            for (id, generation, body) in c.first_parent_page(repo, start, Self::WALK_PAGE)? {
+                if id == self.tip {
+                    let cost = self.cost(walked.iter().map(|(_, g, changes)| (*g, changes)));
+                    let grew = self.grow(lands, cost, |index| {
+                        for (id, generation, changes) in walked {
+                            index.add(id, generation, &changes);
+                        }
+                    });
+                    if grew {
+                        self.tip = head;
+                        return Ok(());
                     }
-                });
-                if grew {
-                    self.tip = head;
-                    return Ok(());
+                    tracing::info!("the path indexes are full; it starts over at the head");
+                    break 'walk;
                 }
-                tracing::info!("the path indexes are full; it starts over at the head");
-                break;
+                deadline.check()?;
+                steps += 1;
+                if steps > MAX_DEPTH {
+                    tracing::info!(
+                        steps,
+                        "the ref moved far; the path index starts over at the head"
+                    );
+                    break 'walk;
+                }
+                if generation <= tip_gen {
+                    break 'walk;
+                }
+                let cs = decode_page_changeset(id, &body)?;
+                most += added_bytes(cs.changes());
+                if self.bytes + most > MAX_INDEX_BYTES {
+                    tracing::info!(
+                        generation,
+                        "the path indexes are full; it starts over at the head"
+                    );
+                    break 'walk;
+                }
+                walked.push((id, generation, cs.changes().clone()));
+                cur = cs.parents().first().copied();
             }
-            deadline.check()?;
-            steps += 1;
-            if steps > MAX_DEPTH {
-                tracing::info!(
-                    steps,
-                    "the ref moved far; the path index starts over at the head"
-                );
-                break;
-            }
-            let generation = c.generation(repo, id)?;
-            if generation <= tip_gen {
-                break;
-            }
-            let cs = c.get_changeset(repo, id)?;
-            most += added_bytes(cs.changes());
-            if self.bytes + most > MAX_INDEX_BYTES {
-                tracing::info!(
-                    generation,
-                    "the path indexes are full; it starts over at the head"
-                );
-                break;
-            }
-            cur = cs.parents().first().copied();
-            walked.push((id, generation, cs.changes().clone()));
         }
         *self = Self::new(c, repo, head, &self.used)?;
         Ok(())
@@ -1078,23 +1164,26 @@ impl PathIndex {
         deadline: &Deadline,
     ) -> Result<Walk> {
         loop {
-            deadline.check()?;
-            let id = self.floor;
-            let generation = c.generation(repo, id)?;
-            if generation <= base_gen {
-                return Ok(Walk::Missed);
-            }
-            let cs = c.get_changeset(repo, id)?;
-            let cost = self.cost([(generation, cs.changes())]);
-            if !self.grow(lands, cost, |index| index.add(id, generation, cs.changes())) {
-                return Ok(Walk::Stopped);
-            }
-            let Some(&parent) = cs.parents().first() else {
-                return Ok(Walk::Missed);
-            };
-            self.floor = parent;
-            if parent == base {
-                return Ok(Walk::Reached);
+            // One statement per page of first parents; the stop rules
+            // below stay per changeset. A page may hold rows past the
+            // point the walk stops at, which costs rows, not statements.
+            for (id, generation, body) in c.first_parent_page(repo, self.floor, Self::WALK_PAGE)? {
+                deadline.check()?;
+                if generation <= base_gen {
+                    return Ok(Walk::Missed);
+                }
+                let cs = decode_page_changeset(id, &body)?;
+                let cost = self.cost([(generation, cs.changes())]);
+                if !self.grow(lands, cost, |index| index.add(id, generation, cs.changes())) {
+                    return Ok(Walk::Stopped);
+                }
+                let Some(&parent) = cs.parents().first() else {
+                    return Ok(Walk::Missed);
+                };
+                self.floor = parent;
+                if parent == base {
+                    return Ok(Walk::Reached);
+                }
             }
         }
     }
@@ -1235,6 +1324,20 @@ fn entry_bytes(key: &[u8]) -> usize {
 }
 
 /// The most that [`PathIndex::add`] adds for a changeset with `changes`.
+/// The changeset a page row carries: the same decode and ID check
+/// [`MetaTx::get_changeset`] runs, so a page row and a per-changeset read
+/// agree.
+fn decode_page_changeset(id: ChangesetId, body: &[u8]) -> Result<Changeset> {
+    let (cs, actual) = Changeset::decode_with_id(body)
+        .map_err(|e| Error::Corrupt(format!("changeset {id}: {e}")))?;
+    if actual != id {
+        return Err(Error::Corrupt(format!(
+            "changeset {id} does not match its ID"
+        )));
+    }
+    Ok(cs)
+}
+
 fn added_bytes(changes: &BTreeMap<RepoPath, Option<FileState>>) -> usize {
     let paths = changes.keys().map(|path| {
         let path = path.as_bytes();
@@ -1641,6 +1744,39 @@ mod tests {
             f.store.blobs().full_flushes() - before,
             u64::from(FSYNC_LEAVES_DRIVE_CACHE)
         );
+    }
+
+    /// A panic that dies under a ref's lock poisons it with a
+    /// half-written index. The index is a cache and the database is the
+    /// truth, so the poisoned slot must be dropped and rebuilt: a land
+    /// the half-index would wrongly pass still answers conflict. With
+    /// the old recover-and-keep code this test fails: the empty
+    /// half-index sits at the tip, the conflict check reads no path, and
+    /// the land that must conflict lands.
+    #[test]
+    fn a_poisoned_slot_drops_its_index_and_the_next_land_sees_the_database() {
+        let f = fixture_shared();
+        // The index records a/x changing at generation 2.
+        let cs_a = f.commit(f.root, &[put("a/x", "A")]);
+        assert_eq!(f.land(cs_a, "ka").state, LandState::Landed);
+        // The next land lands normally, but its settle's hook tears the
+        // just-recorded path out of the index - the half-written state a
+        // panic mid-add leaves - and panics under the slot's lock.
+        f.lands.set_after_record(Box::new(|index| {
+            if let Some(index) = index.as_mut() {
+                index.files.remove(b"a/x".to_vec().as_slice());
+            }
+            panic!("the slot's index dies half-written");
+        }));
+        let cs_b = f.commit(cs_a, &[put("b/y", "B")]);
+        let panicked =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f.land(cs_b, "kb")));
+        assert!(panicked.is_err(), "the armed panic unwound");
+        // A land whose base predates the a/x change conflicts. The torn
+        // index no longer knows a/x and would land it.
+        let cs_c = f.commit(f.root, &[put("a/x", "C")]);
+        let out = f.land(cs_c, "kc");
+        assert_eq!(out.state, LandState::Conflict, "{}", out.detail);
     }
 
     /// An error reply says the land stays pending and a retry with the

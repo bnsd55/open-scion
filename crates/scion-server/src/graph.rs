@@ -39,7 +39,7 @@ use crate::deadline::Deadline;
 use crate::derived::{self, Kind};
 use crate::error::{Error, Result};
 use crate::meta::Meta as _;
-use crate::meta::{DERIVED_BATCH, MetaTx, RepoId};
+use crate::meta::{DERIVED_BATCH, DERIVED_BATCH_I64, MetaTx, RepoId};
 
 /// A changeset that a [`Node`] points to, with what a query needs to decide
 /// whether to go there.
@@ -217,11 +217,14 @@ pub(crate) fn is_ancestor(
     let floor = store.read(|c| c.generation(repo, ancestor))?;
     let mut search = Search::new(from, ancestor, floor);
     let mut cache = HashMap::new();
+    let mut parents = HashMap::new();
     cache.insert(search.start, from.node);
-    Ok(in_steps(store, deadline, STEPS, &mut cache, |index| {
-        search.next(index)
-    })?
-    .0)
+    Ok(
+        in_steps(store, deadline, STEPS, &mut cache, &mut parents, |index| {
+            search.next(index)
+        })?
+        .0,
+    )
 }
 
 /// The best common ancestors of `a` and `b`, over all parents: every common
@@ -248,16 +251,21 @@ pub(crate) fn merge_bases(
         At::get(store, repo, b, deadline)?,
     );
     let mut cache = HashMap::new();
+    let mut parents = HashMap::new();
     cache.insert(a.id, a.node);
     cache.insert(b.id, b.node);
-    if let Some(bases) = store.read(|c| meeting(&mut Index::new(c, deadline, &mut cache), a, b))? {
+    if let Some(bases) =
+        store.read(|c| meeting(&mut Index::new(c, deadline, &mut cache, &mut parents), a, b))?
+    {
         return Ok(bases);
     }
     let mut paint = Paint::new(a, b);
-    Ok(in_steps(store, deadline, STEPS, &mut cache, |index| {
-        paint.next(index)
-    })?
-    .0)
+    Ok(
+        in_steps(store, deadline, STEPS, &mut cache, &mut parents, |index| {
+            paint.next(index)
+        })?
+        .0,
+    )
 }
 
 /// Whether `base`, of generation `base_gen`, is on the first-parent history
@@ -280,8 +288,9 @@ pub(crate) fn on_first_parents(
         return Ok(None);
     };
     let mut cache = HashMap::new();
+    let mut parents = HashMap::new();
     cache.insert(tip, node);
-    let mut index = Index::new(c, deadline, &mut cache);
+    let mut index = Index::new(c, deadline, &mut cache, &mut parents);
     let from = At { id: tip, node };
     // Generations strictly increase along first parents, so the oldest
     // changeset at or above `base_gen` is the base exactly when the base is
@@ -318,6 +327,7 @@ fn in_steps<T>(
     deadline: &Deadline,
     steps: Steps,
     cache: &mut HashMap<ChangesetId, Node>,
+    parents: &mut HashMap<ChangesetId, Vec<(ChangesetId, i64)>>,
     mut next: impl FnMut(&mut Index) -> Result<Option<T>>,
 ) -> Result<(T, Cost)> {
     let mut cost = Cost::default();
@@ -325,7 +335,7 @@ fn in_steps<T>(
     let result = loop {
         cost.steps += 1;
         let (step, step_seen) = store.read_counted(|c| {
-            let mut index = Index::new(c, deadline, cache);
+            let mut index = Index::new(c, deadline, cache, parents);
             let answer = loop {
                 match next(&mut index) {
                     Ok(None) if index.reads < steps.reads => {}
@@ -638,11 +648,16 @@ impl At {
 /// step holds a fresh read connection, and a node read once costs one
 /// statement per walk, not one per step. Reads still count one per
 /// changeset, so a step's budget and the deadline check stay as they were.
+/// The `parents` map holds the parents of the nodes the walk has fetched:
+/// a chain page brings the parents of all its nodes and the nodes of those
+/// parents in two statements, so the merge pops and the side branches
+/// after them read the maps, not the database.
 struct Index<'a> {
     c: &'a mut dyn MetaTx,
     deadline: &'a Deadline,
     reads: usize,
     nodes: &'a mut HashMap<ChangesetId, Node>,
+    parents: &'a mut HashMap<ChangesetId, Vec<(ChangesetId, i64)>>,
 }
 
 impl<'a> Index<'a> {
@@ -650,12 +665,14 @@ impl<'a> Index<'a> {
         c: &'a mut dyn MetaTx,
         deadline: &'a Deadline,
         nodes: &'a mut HashMap<ChangesetId, Node>,
+        parents: &'a mut HashMap<ChangesetId, Vec<(ChangesetId, i64)>>,
     ) -> Self {
         Self {
             c,
             deadline,
             reads: 0,
             nodes,
+            parents,
         }
     }
 
@@ -694,20 +711,61 @@ impl<'a> Index<'a> {
             .collect()
     }
 
-    /// The node of a changeset, from the cache or one statement.
+    /// The node of a changeset, from the cache or one statement. A miss
+    /// fetches the first-parent chain from the node: up to
+    /// [`DERIVED_BATCH`] nodes in one statement, every one an ancestor of
+    /// the walk's start, so the chain hops that follow hit the cache. The
+    /// same step brings the page's parents in one `parents_many` statement
+    /// and the parents' nodes in one batch statement, so the merge pops and
+    /// the side branches that follow read the maps.
     fn node(&mut self, id: ChangesetId) -> Result<Node> {
         if let Some(node) = self.nodes.get(&id) {
             return Ok(*node);
         }
-        let node = node(self.c, id)?;
-        self.nodes.insert(id, node);
-        Ok(node)
+        let page = derived::load_chain::<CommitGraph>(self.c, id, DERIVED_BATCH_I64)?;
+        let mut found = None;
+        let mut merges = Vec::with_capacity(page.len());
+        for (cs, node) in page {
+            if cs == id {
+                found = Some(node);
+            }
+            merges.push((cs, node.generation));
+            self.nodes.insert(cs, node);
+        }
+        let fetched = self.c.parents_many(&merges)?;
+        let mut batch: Vec<ChangesetId> = Vec::new();
+        let mut asked = HashSet::new();
+        for ((cs, _), parents) in merges.iter().zip(fetched) {
+            self.parents.insert(*cs, parents.clone());
+            for (parent, _) in parents {
+                if !self.nodes.contains_key(&parent) && asked.insert(parent) {
+                    batch.push(parent);
+                }
+            }
+        }
+        for chunk in batch.chunks(DERIVED_BATCH) {
+            let nodes = derived::load_batch::<CommitGraph>(self.c, chunk)?;
+            for (id, node) in chunk.iter().zip(nodes) {
+                if let Some(node) = node {
+                    self.nodes.insert(*id, node);
+                }
+            }
+        }
+        found.ok_or_else(|| Error::Corrupt(format!("commit graph: no node for {id}")))
     }
 
-    /// Every parent of a merge, in order, with its generation.
+    /// Every parent of a merge, in order, with its generation. The walk's
+    /// parents map answers first: a chain page brings the parents of all
+    /// its nodes, so most merges read no statement. The database fills the
+    /// map on a miss.
     fn parents(&mut self, merge: Link) -> Result<Vec<(ChangesetId, i64)>> {
         self.count()?;
-        self.c.parents(merge.id, merge.generation)
+        if let Some(parents) = self.parents.get(&merge.id) {
+            return Ok(parents.clone());
+        }
+        let parents = self.c.parents(merge.id, merge.generation)?;
+        self.parents.insert(merge.id, parents.clone());
+        Ok(parents)
     }
 
     /// Walks down the first-parent history of `from` to the oldest changeset
@@ -946,7 +1004,8 @@ mod tests {
                         walked.push(c.is_ancestor(repo, a, b, usize::MAX)?);
                     }
                     let mut cache = HashMap::new();
-                    let mut index = Index::new(&mut *c, &deadline, &mut cache);
+                    let mut parents = HashMap::new();
+                    let mut index = Index::new(&mut *c, &deadline, &mut cache, &mut parents);
                     let mut out = Vec::new();
                     for (x, y) in (0..ids.len()).flat_map(|x| (0..ids.len()).map(move |y| (x, y))) {
                         let (a, b) = (ids[x], ids[y]);
@@ -984,7 +1043,7 @@ mod tests {
                 let ancestry = ancestors[y].contains(&x);
                 let mut search = Search::new(At { id: b, node: nodes[y] }, a, nodes[x].generation);
                 let (found, _) =
-                    in_steps(&store, &later(), SMALL, &mut HashMap::new(), |index| search.next(index)).unwrap();
+                    in_steps(&store, &later(), SMALL, &mut HashMap::new(), &mut HashMap::new(), |index| search.next(index)).unwrap();
                 proptest::prop_assert_eq!(found, ancestry, "{} {}", x, y);
                 // `merge_bases` answers from where the first-parent
                 // histories meet, or else from the walk. Each that
@@ -992,13 +1051,14 @@ mod tests {
                 let (from, other) = (At { id: b, node: nodes[y] }, At { id: a, node: nodes[x] });
                 let mut paint = Paint::new(other, from);
                 let (painted, _) =
-                    in_steps(&store, &later(), SMALL, &mut HashMap::new(), |index| paint.next(index)).unwrap();
+                    in_steps(&store, &later(), SMALL, &mut HashMap::new(), &mut HashMap::new(), |index| paint.next(index)).unwrap();
                 proptest::prop_assert_eq!(&painted, &best, "{} {}", x, y);
                 let (bases, down, met) = store
                     .read(|c| {
                         let deadline = later();
                         let mut cache = HashMap::new();
-                        let mut index = Index::new(c, &deadline, &mut cache);
+                        let mut parents = HashMap::new();
+                        let mut index = Index::new(c, &deadline, &mut cache, &mut parents);
                         let bases = meeting(&mut index, other, from)?;
                         // The walks down first-parent histories.
                         let down = index.descend(from, nodes[x].generation, |l| l.generation)?;
@@ -1082,9 +1142,14 @@ mod tests {
                 ancestor,
                 floor,
             );
-            let (found, cost) = in_steps(&store, &later(), STEPS, &mut HashMap::new(), |index| {
-                search.next(index)
-            })
+            let (found, cost) = in_steps(
+                &store,
+                &later(),
+                STEPS,
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                |index| search.next(index),
+            )
             .unwrap();
             (found, cost.reads)
         };
@@ -1097,7 +1162,8 @@ mod tests {
                 .read(|c| {
                     let deadline = later();
                     let mut cache = HashMap::new();
-                    let mut index = Index::new(&mut *c, &deadline, &mut cache);
+                    let mut parents = HashMap::new();
+                    let mut index = Index::new(&mut *c, &deadline, &mut cache, &mut parents);
                     Ok((meeting(&mut index, a, b)?, index.reads))
                 })
                 .unwrap()
@@ -1193,14 +1259,24 @@ mod tests {
         let deadline = later();
         let met = store.read(|c| {
             let mut cache = HashMap::new();
-            meeting(&mut Index::new(c, &deadline, &mut cache), a, b)
+            let mut parents = HashMap::new();
+            meeting(
+                &mut Index::new(c, &deadline, &mut cache, &mut parents),
+                a,
+                b,
+            )
         });
         assert_eq!(met.unwrap(), None, "a merge is newer than where they meet");
 
         let mut paint = Paint::new(a, b);
-        let (bases, cost) = in_steps(&store, &deadline, STEPS, &mut HashMap::new(), |index| {
-            paint.next(index)
-        })
+        let (bases, cost) = in_steps(
+            &store,
+            &deadline,
+            STEPS,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            |index| paint.next(index),
+        )
         .unwrap();
         assert_eq!(bases, [ids[history[100]]]);
         // A walk of one changeset at a time takes all 20,000. This one jumps
@@ -1237,13 +1313,20 @@ mod tests {
         let deadline = later();
         let mut call = Some(deadline.guard());
         let mut moves = 0;
-        let answer = in_steps(store, &deadline, SMALL, &mut HashMap::new(), |index| {
-            if moves == stop {
-                drop(call.take());
-            }
-            moves += 1;
-            next(index)
-        });
+        let answer = in_steps(
+            store,
+            &deadline,
+            SMALL,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            |index| {
+                if moves == stop {
+                    drop(call.take());
+                }
+                moves += 1;
+                next(index)
+            },
+        );
         (answer.map(|(answer, _)| answer), moves)
     }
 
@@ -1293,23 +1376,30 @@ mod tests {
             At::get_unbounded(&store, repo, tip).unwrap(),
         );
         let mut other = None;
-        let (bases, _) = in_steps(&store, &later(), STEPS, &mut HashMap::new(), |index| {
-            // In the first move, a write and a read run to the end while the
-            // walk holds its read connection.
-            if other.is_none() {
-                let (done, finished) = mpsc::channel();
-                let store = store.clone();
-                other = Some(std::thread::spawn(move || {
-                    store.write(|c| c.create_repo("other").map(drop)).unwrap();
-                    store.read(|_| Ok(())).unwrap();
-                    done.send(()).unwrap();
-                }));
-                finished
-                    .recv_timeout(Duration::from_secs(10))
-                    .expect("a write or a read waited for the walk");
-            }
-            paint.next(index)
-        })
+        let (bases, _) = in_steps(
+            &store,
+            &later(),
+            STEPS,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            |index| {
+                // In the first move, a write and a read run to the end while the
+                // walk holds its read connection.
+                if other.is_none() {
+                    let (done, finished) = mpsc::channel();
+                    let store = store.clone();
+                    other = Some(std::thread::spawn(move || {
+                        store.write(|c| c.create_repo("other").map(drop)).unwrap();
+                        store.read(|_| Ok(())).unwrap();
+                        done.send(()).unwrap();
+                    }));
+                    finished
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("a write or a read waited for the walk");
+                }
+                paint.next(index)
+            },
+        )
         .unwrap();
         other.unwrap().join().unwrap();
         assert_eq!(bases, [side]);
@@ -1325,15 +1415,22 @@ mod tests {
         );
         let before = store.blobs().full_flushes();
         let mut commits = 0;
-        let (bases, cost) = in_steps(&store, &later(), SMALL, &mut HashMap::new(), |index| {
-            // Each step sees a commit that no flush covers yet.
-            if index.reads == 0 {
-                commits += 1;
-                let name = format!("other {commits}");
-                store.commit(|c| c.create_repo(&name).map(drop))?;
-            }
-            paint.next(index)
-        })
+        let (bases, cost) = in_steps(
+            &store,
+            &later(),
+            SMALL,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            |index| {
+                // Each step sees a commit that no flush covers yet.
+                if index.reads == 0 {
+                    commits += 1;
+                    let name = format!("other {commits}");
+                    store.commit(|c| c.create_repo(&name).map(drop))?;
+                }
+                paint.next(index)
+            },
+        )
         .unwrap();
         assert_eq!(bases, [side]);
         assert!(cost.steps > 1, "{cost:?}");
@@ -1354,9 +1451,14 @@ mod tests {
         let (side, tip) = (ids[1], *ids.last().unwrap());
         let floor = store.read(|c| c.generation(repo, side)).unwrap();
         let mut search = Search::new(At::get_unbounded(&store, repo, tip).unwrap(), side, floor);
-        let (found, cost) = in_steps(&store, &later(), STEPS, &mut HashMap::new(), |index| {
-            search.next(index)
-        })
+        let (found, cost) = in_steps(
+            &store,
+            &later(),
+            STEPS,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            |index| search.next(index),
+        )
         .unwrap();
         assert!(found);
         // 100 merges: a node read for the merge and one for its first
@@ -1367,9 +1469,14 @@ mod tests {
             At::get_unbounded(&store, repo, side).unwrap(),
             At::get_unbounded(&store, repo, tip).unwrap(),
         );
-        let (bases, cost) = in_steps(&store, &later(), STEPS, &mut HashMap::new(), |index| {
-            paint.next(index)
-        })
+        let (bases, cost) = in_steps(
+            &store,
+            &later(),
+            STEPS,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            |index| paint.next(index),
+        )
         .unwrap();
         assert_eq!(bases, [side]);
         assert_eq!(cost.reads, 300, "{cost:?}");

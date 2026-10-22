@@ -129,6 +129,9 @@ pub struct ImportReport {
     pub imported: usize,
     /// Commits whose Scion tree was checked against the git tree.
     pub verified: usize,
+    /// Refs the import moved onto the tip: 1 when `target_ref` took the
+    /// tip, 0 when it already held or contained it.
+    pub refs_moved: usize,
     /// The changeset for the imported revision.
     pub tip: ChangesetId,
 }
@@ -285,18 +288,20 @@ fn import_with_cache(
     // that the server has not flushed yet. A full flush covers it, as it
     // covers every commit that another process made before it.
     store.flush()?;
-    pointed?;
+    let refs_moved = usize::from(pointed?);
     // Every planned check ran, or the import failed above.
     let report = ImportReport {
         commits: plan.reachable,
         imported: plan.todo.len(),
         verified: plan.verify.len(),
+        refs_moved,
         tip,
     };
     tracing::info!(
         commits = report.commits,
         imported = report.imported,
         verified = report.verified,
+        refs_moved,
         secs = started.elapsed().as_secs(),
         %tip,
         "git import done"
@@ -349,20 +354,28 @@ fn store_batch(
                     .map(|(_, blob)| blob),
             )?;
             let result = store.write(|c| {
+                // The provenance of the commits this transaction took, for
+                // the one batch write at its end: a crash then loses whole
+                // commits, never a changeset without its provenance row,
+                // and the busy retry reruns the closure whole, as today.
+                let mut provenance = Vec::new();
                 for (commit, cs, git_tree) in rest {
                     #[cfg(test)]
                     if !slow_record.is_zero() {
                         std::thread::sleep(slow_record);
                     }
-                    let root = record(c, repo_id, *commit, cs, &mut crate::tree::lens_from(&lens))?;
+                    let (id, root) =
+                        record(c, repo_id, *commit, cs, &mut crate::tree::lens_from(&lens))?;
                     if plan.verify.contains(commit) {
                         checker.check(c, *commit, *git_tree, root)?;
                     }
+                    provenance.push((*commit, id));
                     taken += 1;
                     if shared && started_tx.elapsed() >= TX_BUDGET {
                         break;
                     }
                 }
+                c.put_git_imports(repo_id, &provenance)?;
                 Ok(taken)
             });
             match result {
@@ -479,23 +492,23 @@ fn plan(
     })
 }
 
-/// Records that a git commit became the changeset `cs` whose changes build
-/// the tree `root`. Safe to repeat.
+/// Stores the changeset `cs` whose changes build the tree `root`, and
+/// gives the changeset's id with the tree: the caller writes the git
+/// provenance in one batch for the whole transaction.
 fn record(
     c: &mut dyn MetaTx,
     repo: RepoId,
     commit: ObjectId,
     cs: &Changeset,
     lens: crate::tree::BlobLens<'_>,
-) -> Result<TreeId> {
+) -> Result<(ChangesetId, TreeId)> {
     let (id, root) = tree::store_changeset(c, repo, cs, lens).map_err(|e| match e {
         Error::Apply(e) => Error::Corrupt(format!(
             "commit {commit}: changes do not apply to the first parent: {e}"
         )),
         other => other,
     })?;
-    c.put_git_import(repo, commit, id)?;
-    Ok(root)
+    Ok((id, root))
 }
 
 /// Points `name` at `tip`, creating it if missing. Leaves it alone if it is
@@ -508,7 +521,9 @@ fn record(
 /// The move is a compare-and-swap on the ref's version, as a land's is. A
 /// server can land on the ref while the import checks it, so a lost swap
 /// checks the ref again.
-fn point_ref(store: &Backend, repo: RepoId, name: &str, tip: ChangesetId) -> Result<()> {
+/// Returns whether the call moved `name` onto `tip` (`false` when the ref
+/// already held or contained the tip).
+fn point_ref(store: &Backend, repo: RepoId, name: &str, tip: ChangesetId) -> Result<bool> {
     // The check runs in reads, outside any write transaction, so a server
     // that shares the data directory does not wait for it. Each check
     // reads O(log n) nodes of the derived commit graph, and stops at the
@@ -521,7 +536,7 @@ fn point_ref(store: &Backend, repo: RepoId, name: &str, tip: ChangesetId) -> Res
             // Already there, or the ref already contains the tip (changes
             // were landed on top of an earlier import): nothing to do.
             if current.target == tip || contains(current.target, tip)? {
-                return Ok(());
+                return Ok(false);
             }
             if !contains(tip, current.target)? {
                 return Err(Error::FailedPrecondition(format!(
@@ -541,7 +556,7 @@ fn point_ref(store: &Backend, repo: RepoId, name: &str, tip: ChangesetId) -> Res
             move_ref(store, repo, name)?;
         }
         if store.write(|c| c.cas_ref(repo, name, expected, tip))? {
-            return Ok(());
+            return Ok(true);
         }
         tracing::info!(
             name,

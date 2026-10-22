@@ -141,7 +141,15 @@ fn create_many(store: &Backend, bases: &[ChangesetId], files: &[(&str, &str)]) -
         changes,
     )
     .expect("changeset fits the format");
-    write::create_changeset(store, REPO, &cs.encode()).unwrap()
+    write::create_changeset(
+        store,
+        REPO,
+        &cs.encode(),
+        &scion_server::test_support::deadline::Deadline::new(
+            std::time::Instant::now() + Duration::from_secs(600),
+        ),
+    )
+    .unwrap()
 }
 
 /// The access file one principal and one repo: the land must pass the

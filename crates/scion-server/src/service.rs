@@ -1502,6 +1502,13 @@ impl Scion for ScionService {
         &self,
         request: Request<CreateChangesetRequest>,
     ) -> Result<Response<CreateChangesetResponse>, Status> {
+        // The job checks it in its blob loop: a request timeout, or a
+        // client that cancels, drops this call but not a job that is
+        // running. The guard ends the deadline when this call ends or is
+        // dropped. The blob check re-hashes every distinct blob, so a big
+        // changeset would otherwise outlive the call that asked for it.
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
+        let _call = deadline.guard();
         let caller = caller(&request)?;
         let request_id = request_id_of(&request);
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
@@ -1519,6 +1526,7 @@ impl Scion for ScionService {
         let repo_for_write = repo.clone();
         let job_repo = repo.clone();
         let audit = self.audit.clone();
+        let job_deadline = deadline.clone();
         let outcome = self
             .worker
             .run(move |store| {
@@ -1528,8 +1536,10 @@ impl Scion for ScionService {
                     // every blob back.
                     let (cs, _) = write::decode(&changeset)?;
                     access.check_write(&caller, &repo_for_write, cs.changes().keys())?;
-                    Ok(write::create_changeset(&store, &repo_for_write, &changeset)
-                        .map_err(Status::from))
+                    Ok(
+                        write::create_changeset(&store, &repo_for_write, &changeset, &job_deadline)
+                            .map_err(Status::from),
+                    )
                 })();
                 // The job that changed the state writes the state change's
                 // own line, after the commit and outside the write
@@ -2923,6 +2933,152 @@ mod tests {
         assert_eq!(main.unwrap().unwrap().target, b, "main did not move");
     }
 
+    /// A call cut while its `CreateChangeset` hashed blobs: the job stops
+    /// at its next blob, the dead call's answer is the abort, the audit
+    /// gets its one failed line, and nothing is written.
+    #[tokio::test]
+    async fn a_create_cut_mid_check_stops_at_its_next_blob_and_records_nothing() {
+        let (dir, store, repo_id, id, bytes, one) = create_cut_fixture();
+
+        let audit_path = dir.path().join("audit.log");
+        let service = Arc::new(ScionService::new(
+            Worker::new(store.clone()),
+            Arc::new(Access::single("t")),
+            Arc::default(),
+            Quotas::off(),
+            Arc::default(),
+            crate::audit::Audit::open(&audit_path).unwrap(),
+        ));
+
+        // The check parks after the first blob's keep; the call is cut
+        // while it waits, and the park then lets the job reach the next
+        // blob, whose check stops it.
+        let hooks = dir.path().join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        write::PARK_CHECK.arm(&hooks);
+        std::fs::write(hooks.join(format!("park-{one}")), b"").unwrap();
+        let call = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                service
+                    .create_changeset(as_default(scion_proto::v1::CreateChangesetRequest {
+                        repo: "r".into(),
+                        changeset: bytes,
+                    }))
+                    .await
+            }
+        });
+        let parked = hooks.join(format!("parked-{one}"));
+        let started = Instant::now();
+        while !parked.exists() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the check never parked"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        call.abort();
+        // The cut ends the deadline when the aborted task's future drops
+        // the call's guard, not when `abort` returns; joining the task
+        // puts the drop before the park's lift, so the job's next check
+        // reads the cut, never the instant before it.
+        assert!(call.await.unwrap_err().is_cancelled());
+        std::fs::remove_file(hooks.join(format!("park-{one}"))).unwrap();
+        write::PARK_CHECK.lift();
+
+        wait_audit_line(
+            &audit_path,
+            "failed",
+            "\"why\":\"cancelled\"",
+            "the job answers the cut call's intent",
+        )
+        .await;
+        let text = std::fs::read_to_string(&audit_path).unwrap();
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.contains("\"outcome\":\"intent\""))
+                .count(),
+            1,
+            "one intent: {text}"
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.contains("\"outcome\":\"failed\""))
+                .count(),
+            1,
+            "one failed line: {text}"
+        );
+        let there = store.read(|c| c.has_changeset(repo_id, id));
+        assert!(!there.unwrap(), "nothing was written");
+    }
+
+    /// A store whose repo `r` holds two stored blobs, a root on `main`,
+    /// and the encoded `CreateChangeset` request that puts both blobs on
+    /// top of the root: the blob check's raw material, with the id of the
+    /// changeset it would write and its first put's blob.
+    fn create_cut_fixture() -> (
+        tempfile::TempDir,
+        Backend,
+        crate::meta::RepoId,
+        ChangesetId,
+        Vec<u8>,
+        scion_core::BlobId,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let one = store.blobs().put(b"one\n").unwrap();
+        let two = store.blobs().put(b"two\n").unwrap();
+        let state = |blob| {
+            Some(FileState::Regular {
+                content: blob,
+                executable: false,
+            })
+        };
+        // The parent the changeset hangs off, through the seam, as the
+        // dropped-call fixture does.
+        let root = Changeset::new(
+            vec![],
+            IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 0, 0)
+                .expect("changeset fits the format"),
+            None,
+            b"root".to_vec(),
+            [
+                (RepoPath::new("seed").unwrap(), state(one)),
+                (RepoPath::new("seed2").unwrap(), state(two)),
+            ]
+            .into(),
+        )
+        .expect("changeset fits the format");
+        let (root, repo_id) = store
+            .write(|c| {
+                let repo = c.create_repo("r")?;
+                // The puts' blobs must be the repo's, as an upload makes
+                // them: otherwise the member check refuses before the
+                // blob check ever runs.
+                c.add_repo_blobs(repo, &[one, two])?;
+                let root = c.insert_changeset(repo, &root)?;
+                assert!(c.cas_ref(repo, "main", None, root)?);
+                Ok((root, repo))
+            })
+            .unwrap();
+        let cs = Changeset::new(
+            vec![root],
+            IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 0, 0)
+                .expect("changeset fits the format"),
+            None,
+            b"two puts".to_vec(),
+            [
+                (RepoPath::new("a").unwrap(), state(one)),
+                (RepoPath::new("b").unwrap(), state(two)),
+            ]
+            .into(),
+        )
+        .expect("changeset fits the format");
+        let bytes = cs.encode();
+        let (_, id) = write::decode(&bytes).unwrap();
+        (dir, store, repo_id, id, bytes, one)
+    }
+
     /// A service whose land counters the test reads: the service and its
     /// land worker share one metrics registry.
     fn counting_service(store: &Backend, metrics: &Arc<Metrics>) -> ScionService {
@@ -3005,7 +3161,8 @@ mod tests {
         let (_dir, store, cs) = landed_store();
         if Backend::test_is_postgres() {
             // The page cap is a data-directory hook; the Postgres disk
-            // full is the SQLSTATE 53100 arm, counted by the same code.
+            // full is the SQLSTATE 53100 arm of the pg mapping, a unit
+            // test of pg.rs, and it feeds the same counter code.
             return;
         }
         let store = store
