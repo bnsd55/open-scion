@@ -3160,12 +3160,18 @@ impl MetaTx for PgTx<'_> {
             .collect())
     }
 
-    /// The body of changeset `cs`, or `None` when it is not stored.
-    fn stored_changeset_body(&mut self, cs: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .c
-            .query_opt("SELECT body FROM changesets WHERE id = $1", &[P::bytes(cs)])?
-            .map(|row| row.get(0)))
+    /// The bodies of the changesets the ids name, as `(id, body)` for
+    /// every id that has a stored body. One statement: the ids travel as
+    /// one bytea array, and the reply has at most one row per id.
+    fn stored_changeset_bodies(&mut self, ids: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let rows = self.c.query(
+            "SELECT id, body FROM changesets WHERE id = ANY($1)",
+            &[P::bytea_array(ids.to_vec())],
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
     }
 
     /// The blobs that `repo` may name, all of them.
@@ -3182,6 +3188,16 @@ impl MetaTx for PgTx<'_> {
         self.c.execute(
             "DELETE FROM repo_blobs WHERE repo_id = $1 AND blob = $2",
             &[P::i64(repo.0), P::bytes(blob)],
+        )?;
+        Ok(())
+    }
+
+    /// Removes the rows that name any of `blobs` for `repo`. One
+    /// statement: the blobs travel as one bytea array.
+    fn delete_repo_blobs(&mut self, repo: RepoId, blobs: &[Vec<u8>]) -> Result<()> {
+        self.c.execute(
+            "DELETE FROM repo_blobs WHERE repo_id = $1 AND blob = ANY($2)",
+            &[P::i64(repo.0), P::bytea_array(blobs.to_vec())],
         )?;
         Ok(())
     }
