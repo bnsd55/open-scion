@@ -760,10 +760,10 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
-    fn stored_changeset_body(&mut self, cs: &[u8]) -> Result<Option<Vec<u8>>> {
+    fn stored_changeset_bodies(&mut self, ids: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         match self {
-            Self::Sqlite(tx) => tx.stored_changeset_body(cs),
-            Self::Postgres(pg) => pg.stored_changeset_body(cs),
+            Self::Sqlite(tx) => tx.stored_changeset_bodies(ids),
+            Self::Postgres(pg) => pg.stored_changeset_bodies(ids),
         }
     }
 
@@ -802,6 +802,13 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.delete_repo_blob(repo, blob),
             Self::Postgres(pg) => pg.delete_repo_blob(repo, blob),
+        }
+    }
+
+    fn delete_repo_blobs(&mut self, repo: RepoId, blobs: &[Vec<u8>]) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.delete_repo_blobs(repo, blobs),
+            Self::Postgres(pg) => pg.delete_repo_blobs(repo, blobs),
         }
     }
 

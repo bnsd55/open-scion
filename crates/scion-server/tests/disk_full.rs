@@ -194,7 +194,8 @@ fn a_full_metadata_disk_answers_out_of_space_and_needs_no_repair() {
     }
     if Backend::test_is_postgres() {
         // The metadata lives in the database then; its disk full is the
-        // SQLSTATE 53100 arm, not a data-directory row.
+        // SQLSTATE 53100 arm of the pg mapping, a unit test of pg.rs,
+        // not a data-directory row.
         return;
     }
     let mount = Mount::new("meta", "1m", "4096");
@@ -402,6 +403,27 @@ fn a_disk_full_runbook_gcs_then_writes_resume() {
     );
     let freed = store.blobs().put(b"freed\n").unwrap();
     assert_eq!(store.blobs().get(freed).unwrap(), b"freed\n");
+
+    // The audit records the run it could not greet: both runs' intents
+    // failed to go in on the full disk, and the real run's line went in
+    // after the run freed the space, marked with why it was late. The
+    // dry run removed nothing, so its deferred line had nowhere to go.
+    let audit = std::fs::read_to_string(data.join("audit.log")).unwrap();
+    let lines: Vec<serde_json::Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "one deferred intent and one result: {lines:?}"
+    );
+    assert_eq!(lines[0]["event"], "admin");
+    assert_eq!(lines[0]["outcome"], "intent");
+    assert_eq!(lines[0]["what"], "gc");
+    assert_eq!(lines[0]["deferred"], "disk_full");
+    assert_eq!(lines[1]["event"], "admin");
+    assert_eq!(lines[1]["outcome"], "ok");
 
     // Step 2 of the runbook: fsck, and it is clean.
     let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
