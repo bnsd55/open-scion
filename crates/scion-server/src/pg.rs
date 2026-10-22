@@ -2427,7 +2427,6 @@ impl MetaTx for PgTx<'_> {
         Ok(())
     }
 
-
     /// Holds the derived values of the first-parent chain that starts at
     /// `start`, so the batch's reads of them cost nothing.
     fn preload_derived_chain(
