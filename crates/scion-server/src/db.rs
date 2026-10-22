@@ -498,6 +498,30 @@ impl MetaTx for SqliteTx<'_> {
             .map_err(crate::error::from_sqlite)
     }
 
+    fn get_derived_batch(
+        &mut self,
+        kind: &str,
+        version: u32,
+        ids: &[ChangesetId],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        // One prepared statement reused over the batch, inside the caller's
+        // one transaction: a land between two ids of the batch cannot mix
+        // two states.
+        let mut stmt = self
+            .0
+            .prepare_cached(
+                "SELECT value FROM derived WHERE kind = ?1 AND version = ?2 AND cs = ?3",
+            )
+            .map_err(crate::error::from_sqlite)?;
+        ids.iter()
+            .map(|cs| {
+                stmt.query_row(params![kind, version, cs.as_bytes()], |row| row.get(0))
+                    .optional()
+                    .map_err(crate::error::from_sqlite)
+            })
+            .collect()
+    }
+
     /// Records a derived value. A second write must agree with the first:
     /// derivation is deterministic, so a mismatch means corruption.
     ///

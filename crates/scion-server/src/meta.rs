@@ -110,6 +110,12 @@ pub trait Meta: Send + Sync + 'static {
     fn flush(&self) -> Result<()>;
 }
 
+/// Most ids one `get_derived_batch` call fetches. The statement stays
+/// small (1,000 x 32-byte ids as one array parameter, the reply at most
+/// 1,000 rows), and a walk reads at most 1,000 nodes per step, so one
+/// batch covers one step.
+pub(crate) const DERIVED_BATCH: usize = 1_000;
+
 /// The queries on the metadata tables. Every query fails with a database
 /// error, or with the `NotFound` or `Corrupt` error that its doc says; the
 /// docs do not repeat that per method. A query may be called in a read or
@@ -170,6 +176,18 @@ pub trait MetaTx {
     /// The stored bytes of a derived value, if computed.
     fn get_derived(&mut self, kind: &str, version: u32, cs: ChangesetId)
     -> Result<Option<Vec<u8>>>;
+
+    /// The stored bytes of up to [`DERIVED_BATCH`] derived values, in the
+    /// order asked. One read transaction, one statement: a land between two
+    /// ids of the batch cannot mix two states.
+    ///
+    /// [`DERIVED_BATCH`]: crate::meta::DERIVED_BATCH
+    fn get_derived_batch(
+        &mut self,
+        kind: &str,
+        version: u32,
+        ids: &[ChangesetId],
+    ) -> Result<Vec<Option<Vec<u8>>>>;
 
     /// Records a derived value. A second write must agree with the first.
     fn put_derived(

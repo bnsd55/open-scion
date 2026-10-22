@@ -923,6 +923,18 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn get_derived_batch(
+        &mut self,
+        kind: &str,
+        version: u32,
+        ids: &[ChangesetId],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        match self {
+            Self::Sqlite(tx) => tx.get_derived_batch(kind, version, ids),
+            Self::Postgres(pg) => pg.get_derived_batch(kind, version, ids),
+        }
+    }
+
     fn put_derived(
         &mut self,
         kind: &str,

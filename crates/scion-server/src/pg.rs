@@ -2331,6 +2331,38 @@ impl MetaTx for PgTx<'_> {
             .map(|row| row.get(0)))
     }
 
+    fn get_derived_batch(
+        &mut self,
+        kind: &str,
+        version: u32,
+        ids: &[ChangesetId],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        // One statement for the whole batch: the ids travel as one bytea
+        // array, the reply has at most one row per id. The caller's read
+        // transaction holds for the batch, so a land between two ids of the
+        // batch cannot mix two states.
+        let version = i64::from(version);
+        let cs = ids
+            .iter()
+            .map(|id| id_bytes(id.as_bytes()))
+            .collect::<Vec<_>>();
+        let rows = self.c.query(
+            "SELECT cs, value FROM derived
+             WHERE kind = $1 AND version = $2 AND cs = ANY($3)",
+            &[P::text(kind), P::i64(version), P::bytea_array(cs)],
+        )?;
+        let mut found = rows
+            .into_iter()
+            .map(|row| {
+                let cs: Vec<u8> = row.get(0);
+                Ok((to_id(&cs)?, row.get::<_, Option<Vec<u8>>>(1)))
+            })
+            .collect::<Result<std::collections::HashMap<_, _>>>()?;
+        ids.iter()
+            .map(|id| Ok(found.remove(id).flatten()))
+            .collect()
+    }
+
     /// Records a derived value. A second write must agree with the first:
     /// derivation is deterministic, so a mismatch means corruption.
     ///
