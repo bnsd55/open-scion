@@ -180,13 +180,16 @@ type Node = BTreeMap<PathElem, Entry>;
 /// The history tree of a changeset, as the ID of its root node.
 pub struct PathHistory;
 
+use crate::derived::DeriveReport;
+
 /// Derives the path history of `cs`, and removes the rows of older
-/// versions. Returns the kind's name for the `derive` command's report.
+/// versions. Returns the kind's name and the counts the `derive`
+/// command's report carries.
 ///
 /// # Errors
 ///
-/// Errors of the `derived` fill, and of the final flush.
-pub fn backfill_path_history(store: &Backend, repo: &str, cs: ChangesetId) -> Result<&'static str> {
+/// Errors of the derived fill, and of the final flush.
+pub fn backfill_path_history(store: &Backend, repo: &str, cs: ChangesetId) -> Result<DeriveReport> {
     crate::derived::backfill::<PathHistory>(store, repo, cs)
 }
 

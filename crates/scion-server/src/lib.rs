@@ -231,6 +231,16 @@ pub mod test_support {
                 self.as_sqlite()
             }
         }
+
+        /// The schema versions this build migrates to, so a test pins
+        /// the migration story without naming a literal that the next
+        /// migration turns stale.
+        pub mod schema_version {
+            /// The SQLite store's schema version ([`crate::store`]).
+            pub const SQLITE: u32 = crate::store::SCHEMA_VERSION;
+            /// The Postgres schema's version ([`crate::pg`]).
+            pub const POSTGRES: u32 = crate::pg::PG_SCHEMA_VERSION;
+        }
     }
     /// The error a changeset apply can end in, and the conversion the
     /// tests share with the crate, for the write tests.
@@ -264,6 +274,10 @@ pub mod test_support {
     /// The on-disk store, so tests open and inspect one directly.
     pub mod store {
         pub use crate::store::*;
+        /// The schema version this build ships, and the migration runner,
+        /// for a test that makes a store of an older version.
+        #[allow(unreachable_pub)]
+        pub use crate::store::{SCHEMA_VERSION, migrate};
     }
     /// The guide's own commands, so a Proof's test runs the block under
     /// its runbook's heading instead of retyping it.
@@ -291,6 +305,7 @@ pub mod test_support {
 // public the module it sits in looks. The doc(hidden) items are not
 // here, and never were.
 pub use access::Access;
+pub use derived::DeriveReport;
 pub use error::{Error, Git, Result, Storage, StorageClass};
 pub use gc::DEFAULT_GRACE_SECS;
 pub use graph::{CommitGraph, backfill_commit_graph};

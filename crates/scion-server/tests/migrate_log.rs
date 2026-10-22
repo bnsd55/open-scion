@@ -6,8 +6,16 @@
 //! backends.
 
 use scion_server::Backend;
+use scion_server::test_support::backend::schema_version;
 use std::fs;
 use std::sync::{Arc, Mutex};
+
+/// The version this build's SQLite store climbs to, from the build, not
+/// from a literal the next migration turns stale.
+const SQLITE_TOP: u32 = schema_version::SQLITE;
+
+/// The version this build's Postgres schema climbs to.
+const POSTGRES_TOP: u32 = schema_version::POSTGRES;
 
 /// The log of the test binary, into this one buffer. One global
 /// subscriber, set once: a per-thread default cannot serve a test whose
@@ -143,7 +151,7 @@ fn an_open_logs_what_migrated_and_nothing_when_nothing_did() {
     );
     assert_eq!(
         fields(&log, "migrating the metadata schema", "to_version="),
-        vec![9],
+        vec![SQLITE_TOP],
         "the start line climbs to this build's schema"
     );
     // One line per step, in order, each with a time.
@@ -153,16 +161,16 @@ fn an_open_logs_what_migrated_and_nothing_when_nothing_did() {
             "the metadata schema migrated one step",
             "from_version="
         ),
-        vec![7, 8],
-        "the steps are 7 to 8, then 8 to 9; the log was:\n{log}"
+        (7..SQLITE_TOP).collect::<Vec<_>>(),
+        "the steps climb the fixture's 7 to this build's schema; the log was:\n{log}"
     );
     assert_eq!(
         fields(&log, "the metadata schema migrated one step", "to_version="),
-        vec![8, 9]
+        (8..=SQLITE_TOP).collect::<Vec<_>>()
     );
     assert_eq!(
         fields(&log, "the metadata schema migrated one step", "elapsed_ms=").len(),
-        2,
+        (7..SQLITE_TOP).len(),
         "every step line carries its time"
     );
     // The end line closes the story.
@@ -172,7 +180,7 @@ fn an_open_logs_what_migrated_and_nothing_when_nothing_did() {
     );
     assert_eq!(
         fields(&log, "the metadata migration is done", "to_version="),
-        vec![9]
+        vec![SQLITE_TOP]
     );
 }
 
@@ -201,14 +209,18 @@ fn a_postgres_open_of_a_fresh_database_logs_the_same_story() {
         "the metadata schema migrated one step",
         "from_version=",
     );
-    assert_eq!(steps, (0..4).collect::<Vec<_>>(), "four steps, in order");
+    assert_eq!(
+        steps,
+        (0..POSTGRES_TOP).collect::<Vec<_>>(),
+        "one step per version, in order"
+    );
     assert_eq!(
         fields(&log, "the metadata schema migrated one step", "elapsed_ms=").len(),
-        4
+        POSTGRES_TOP as usize
     );
     assert_eq!(
         fields(&log, "the metadata migration is done", "to_version="),
-        vec![4],
-        "the Postgres metadata schema is at 4"
+        vec![POSTGRES_TOP],
+        "the Postgres metadata schema is at this build's version"
     );
 }

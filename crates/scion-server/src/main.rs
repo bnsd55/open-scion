@@ -174,6 +174,11 @@ enum Command {
         /// File to write the secret seed to, as 64 hex characters.
         #[arg(long, value_name = "FILE")]
         out: PathBuf,
+        /// Where the audit log goes. The default is `audit.log` in the
+        /// data directory: the same file the server appends to, so one
+        /// file holds the whole history of a data directory.
+        #[arg(long, value_name = "FILE")]
+        audit_file: Option<PathBuf>,
     },
     /// Import a local git repository, one way. Safe to repeat. It can run
     /// while the server runs.
@@ -290,6 +295,11 @@ enum Command {
         /// `commit_graph`.
         #[arg(long = "ref", default_value = "main")]
         target_ref: String,
+        /// Where the audit log goes. The default is `audit.log` in the
+        /// data directory: the same file the server appends to, so one
+        /// file holds the whole history of a data directory.
+        #[arg(long, value_name = "FILE")]
+        audit_file: Option<PathBuf>,
     },
 }
 
@@ -425,6 +435,26 @@ fn verify_command(archive: &Path) -> ! {
     }
     println!("verify: {} damages", damages.len());
     std::process::exit(i32::from(!damages.is_empty()));
+}
+
+/// Records the line for a schema migration this process's open made:
+/// one `admin`/`ok` line with the versions it moved. The migration ran
+/// inside the store's open, before the audit could open, so the record
+/// goes in as soon as the audit exists. A fresh open creates the schema
+/// and reports no migration; an open that migrates nothing writes
+/// nothing.
+async fn record_migrated(audit: &scion_server::Audit, store: &Backend) -> anyhow::Result<()> {
+    if let Some((from, to)) = store.migrated() {
+        audit
+            .record(scion_server::Event::new(
+                "admin",
+                "ok",
+                serde_json::json!({ "what": "migrate", "from": from, "to": to }),
+            ))
+            .await
+            .with_context(|| "cannot record the migration in the audit log".to_owned())?;
+    }
+    Ok(())
 }
 
 /// Records the `admin`/`failed` line of a run that did not finish: the
@@ -733,7 +763,15 @@ async fn main() -> anyhow::Result<()> {
             )
         }
         Command::HashToken { .. } => return hash_token(),
-        Command::TicketKey { .. } => return write_ticket_key(),
+        Command::TicketKey { out, audit_file } => {
+            // The key file lives wherever the operator says; the audit
+            // log lives in the data directory, as for every other
+            // command. A run that cannot record refuses to make the key.
+            scion_proto::runtime::auth::create_private_dir_all(&cli.data)
+                .with_context(|| format!("cannot create {}", cli.data.display()))?;
+            let audit = cli_audit(&cli.data, audit_file.as_deref())?;
+            return ticket_key_command(audit, &out).await;
+        }
         // `fsck` cannot run when the store cannot open, and its table
         // says that is 2, not the generic open failure's 1.
         Command::Fsck => match Backend::open_shared(
@@ -774,6 +812,8 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|| cli.data.join("audit.log"));
             let audit = scion_server::Audit::open(&audit_path)
                 .with_context(|| format!("cannot open audit log {}", audit_path.display()))?;
+            // The migration predates the start, so its line goes first.
+            record_migrated(&audit, &store).await?;
             audit
                 .record(scion_server::Event::new(
                     "admin",
@@ -830,6 +870,7 @@ async fn main() -> anyhow::Result<()> {
             metrics_file,
         } => {
             let audit = cli_audit(&cli.data, audit_file.as_deref())?;
+            record_migrated(&audit, &store).await?;
             gc_command(
                 audit,
                 &store,
@@ -848,6 +889,7 @@ async fn main() -> anyhow::Result<()> {
             audit_file,
         } => {
             let audit = cli_audit(&cli.data, audit_file.as_deref())?;
+            record_migrated(&audit, &store).await?;
             let opts = ImportOptions {
                 rev,
                 target_ref,
@@ -859,10 +901,23 @@ async fn main() -> anyhow::Result<()> {
             kind,
             repo,
             target_ref,
+            audit_file,
         } => {
-            let (name, tip) = tokio::task::spawn_blocking(move || {
+            let audit = cli_audit(&cli.data, audit_file.as_deref())?;
+            record_migrated(&audit, &store).await?;
+            let kind_name = match kind {
+                KindName::RootTree => "root_tree",
+                KindName::CommitGraph => "commit_graph",
+                KindName::PathHistory => "path_history",
+            };
+            let what = serde_json::json!({ "what": "derive", "kind": kind_name });
+            audit
+                .record(scion_server::Event::new("admin", "intent", what.clone()))
+                .await
+                .with_context(|| "cannot record the derive intent in the audit log".to_owned())?;
+            let run = move || {
                 let tip = store.resolve_ref(&repo, &target_ref)?;
-                let name = match kind {
+                let report = match kind {
                     KindName::RootTree => scion_server::backfill_root_tree(&store, &repo, tip)?,
                     KindName::CommitGraph => {
                         scion_server::backfill_commit_graph(&store, &repo, tip)?
@@ -871,10 +926,33 @@ async fn main() -> anyhow::Result<()> {
                         scion_server::backfill_path_history(&store, &repo, tip)?
                     }
                 };
-                Ok::<_, Error>((name, tip))
-            })
-            .await??;
-            println!("derived {name} for the history of {tip}; older versions are removed");
+                Ok::<_, Error>((report, tip))
+            };
+            let (report, tip) = match tokio::task::spawn_blocking(run).await {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => {
+                    record_admin_failed(&audit, "derive", error_class(&e)).await;
+                    return Err(e.into());
+                }
+                Err(e) => {
+                    record_admin_failed(&audit, "derive", "failed").await;
+                    return Err(e.into());
+                }
+            };
+            let fields = serde_json::json!({
+                "what": "derive",
+                "kind": kind_name,
+                "written": report.written,
+                "removed": report.removed,
+            });
+            audit
+                .record(scion_server::Event::new("admin", "ok", fields))
+                .await
+                .with_context(|| "cannot record the derive result in the audit log".to_owned())?;
+            println!(
+                "derived {} for the history of {tip}; older versions are removed",
+                report.name
+            );
         }
     }
     Ok(())
@@ -1253,17 +1331,49 @@ fn read_hex(file: &Path, secret: bool) -> anyhow::Result<String> {
 /// file is created, never replaced: a second run to the same path fails,
 /// because silently changing the key breaks every tier that was given the
 /// old public half. The file is 0600: the seed mints permissions.
-fn write_ticket_key() -> anyhow::Result<()> {
-    let Cli { command, .. } = Cli::parse();
-    let Command::TicketKey { out } = command else {
-        unreachable!("write_ticket_key handles only the ticket-key command")
+/// Makes the ticket key and records its admin pair: one intent before
+/// the key exists and one ok after it is on the disk. The lines carry
+/// the what and nothing else: never the seed, the key bytes, or the key
+/// file's path. Exits with the run's own status when the line after the
+/// key still fails.
+async fn ticket_key_command(audit: scion_server::Audit, out: &Path) -> anyhow::Result<()> {
+    audit
+        .record(scion_server::Event::new(
+            "admin",
+            "intent",
+            serde_json::json!({ "what": "ticket-key" }),
+        ))
+        .await
+        .with_context(|| "cannot record the ticket-key intent in the audit log".to_owned())?;
+    let made = match make_key_file(out) {
+        Ok(keys) => keys,
+        Err(e) => {
+            record_admin_failed(&audit, "ticket-key", "failed").await;
+            return Err(e)
+                .with_context(|| format!("cannot write the ticket key to {}", out.display()));
+        }
     };
+    audit
+        .record(scion_server::Event::new(
+            "admin",
+            "ok",
+            serde_json::json!({ "what": "ticket-key" }),
+        ))
+        .await
+        .with_context(|| "cannot record the ticket-key result in the audit log".to_owned())?;
+    println!("{}", made.public_hex());
+    Ok(())
+}
+
+/// Generates the key and writes the seed to a new private file. Returns
+/// the key, or the error the caller records and reports.
+fn make_key_file(out: &Path) -> std::result::Result<scion_server::Keys, anyhow::Error> {
     let keys = scion_server::Keys::generate();
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&out)
+        .open(out)
         .with_context(|| {
             format!(
                 "cannot create {} (it exists already? the key must not change under the tiers)",
@@ -1272,8 +1382,7 @@ fn write_ticket_key() -> anyhow::Result<()> {
         })?;
     file.write_all(format!("{}\n", keys.seed_hex()).as_bytes())
         .with_context(|| format!("cannot write {}", out.display()))?;
-    println!("{}", keys.public_hex());
-    Ok(())
+    Ok(keys)
 }
 
 /// Prints the BLAKE3 digest of the token of `hash-token`.

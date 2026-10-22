@@ -56,7 +56,7 @@ use crate::store::Blobs;
 pub(crate) mod test_hooks;
 
 /// The schema version this build makes and reads.
-pub(crate) const PG_SCHEMA_VERSION: u32 = 4;
+pub(crate) const PG_SCHEMA_VERSION: u32 = 5;
 
 /// How long a call may wait for a Postgres reader before the server
 /// answers [`Error::Unavailable`]. Well below the 600 s call deadline:
@@ -86,6 +86,7 @@ const PG_MIGRATIONS: [&str; PG_SCHEMA_VERSION as usize] = [
     include_str!("../migrations/postgres/0002_view_roots.sql"),
     include_str!("../migrations/postgres/0003_view_trees.sql"),
     include_str!("../migrations/postgres/0004_store_uuid.sql"),
+    include_str!("../migrations/postgres/0005_parent_numbering.sql"),
 ];
 
 /// The fence of a process that lost the one-server lock. The worker of
@@ -139,6 +140,9 @@ struct PgInner {
     /// The UUID of this database, written at the first open and carried
     /// by the marker file of the data directory.
     store_uuid: [u8; 16],
+    /// The schema versions this open moved, when it migrated. Version 0's
+    /// first open creates the schema, and reports none.
+    migrated: Option<(u32, u32)>,
     /// Clients for [`Pg::read`], at most [`READERS`](crate::store::READERS)
     /// at once, like the readers of a SQLite store.
     readers: Readers,
@@ -754,7 +758,7 @@ impl Pg {
         } else {
             connect_with(url, ca, &options, schema)?
         };
-        migrate(&mut writer)?;
+        let migrated = migrate(&mut writer)?;
         // The durability of a commit is a promise of this backend: check
         // that the server kept its side of it.
         let on: String = writer.query("SHOW synchronous_commit", &[])?[0].get(0);
@@ -804,7 +808,24 @@ impl Pg {
         } else {
             // A marker that names a store is the identity to adopt: a
             // dump taken before the UUID existed restores next to its
-            // own directory, and they agree. A fresh database mints.
+            // own directory, and they agree. But only a schema that
+            // holds the store it names: a store that ever served wrote
+            // its repo rows, so a schema with no repos row was never
+            // served by the directory's store, and adopting would give
+            // the marker's identity to an empty schema - a wrong
+            // --postgres-url, a typo in its search_path, or one never
+            // served - and every caller would read "repo not found"
+            // with no error at the start. An empty schema refuses while
+            // the marker names a store, and mints when it names none.
+            let served = writer.query("SELECT 1 FROM repos LIMIT 1", &[])?;
+            if let (Some(held), []) = (marker.uuid, served.as_slice()) {
+                return Err(Error::FailedPrecondition(format!(
+                    "this data directory belongs to the store whose UUID \
+                     is {}, but this database holds no store: check \
+                     --postgres-url and its search_path",
+                    hex16(&held)
+                )));
+            }
             let fresh = marker.uuid.unwrap_or_else(uuid_new);
             writer.query(
                 "INSERT INTO store_uuid (one, uuid) VALUES (1, $1) \
@@ -824,6 +845,7 @@ impl Pg {
             writer: Mutex::new(writer),
             fence,
             store_uuid,
+            migrated,
             readers: Readers::new_with(readers, url, ca, &options, schema)?,
             blobs,
             writers: Mutex::new(0),
@@ -863,6 +885,12 @@ impl Pg {
     /// directory also carries.
     pub(crate) fn store_uuid(&self) -> [u8; 16] {
         self.inner.store_uuid
+    }
+
+    /// The schema versions this open moved, when it migrated: the
+    /// process that opened records the move in its audit log.
+    pub(crate) fn migrated(&self) -> Option<(u32, u32)> {
+        self.inner.migrated
     }
 
     /// Fails when the fence tripped: the process lost the database to
@@ -923,7 +951,7 @@ impl Pg {
         self.check_fenced()?;
         let (mut writer, _waiting) = self.lock_writer();
         let mut pending = Vec::new();
-        let mut derived = Vec::new();
+        let mut derived = DerivedPending::default();
         let mut preload = std::collections::HashMap::new();
         let mut pg = PgTx {
             c: &mut writer,
@@ -1977,8 +2005,12 @@ fn make_tls(ca: &Path) -> Result<MakeRustlsConnect> {
 
 /// Brings the database to this build's schema: runs every migration it has
 /// not run yet, in one transaction each, and refuses a schema of a newer
-/// build.
-fn migrate(client: &mut PgClient) -> Result<()> {
+/// build. Returns the `(from, to)` versions when it migrated, and `None`
+/// when the database was at this build's version already. A database of
+/// version 0 was no schema at all: the first open creates one, and a
+/// creation moves nothing.
+#[allow(clippy::needless_pass_by_ref_mut)]
+fn migrate(client: &mut PgClient) -> Result<Option<(u32, u32)>> {
     // One process at a time migrates: a lock of the session, held across
     // the migrations, so a server and an import started together take
     // turns while the migrations are quick, and the version the loser
@@ -1995,7 +2027,7 @@ fn migrate(client: &mut PgClient) -> Result<()> {
 }
 
 /// The migrations themselves, under the session's schema lock.
-fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
+fn migrate_under_lock(client: &mut PgClient) -> Result<Option<(u32, u32)>> {
     // The ledger of the versions, made first, in its own transaction: a
     // migration that fails leaves the ledger and every version before it.
     client.batch(
@@ -2021,7 +2053,7 @@ fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
         )));
     }
     if version == PG_SCHEMA_VERSION {
-        return Ok(());
+        return Ok(None);
     }
     tracing::info!(
         from_version = version,
@@ -2038,7 +2070,7 @@ fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
         // versions before it stand.
         let step = std::time::Instant::now();
         let mut pending = Vec::new();
-        let mut derived = Vec::new();
+        let mut derived = DerivedPending::default();
         let mut preload = std::collections::HashMap::new();
         let mut tx = PgTx::begin(client, &mut pending, &mut derived, &mut preload)?;
         tx.c.batch(&format!(
@@ -2059,7 +2091,14 @@ fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
         to_version = PG_SCHEMA_VERSION,
         "the metadata migration is done"
     );
-    Ok(())
+    // Version 0 was no schema at all: the first open creates one, and a
+    // creation moves nothing.
+    let migrated = if version == 0 {
+        None
+    } else {
+        Some((version, PG_SCHEMA_VERSION))
+    };
+    Ok(migrated)
 }
 
 /// Reads a tree's rows and checks them against its ID.
@@ -2209,8 +2248,8 @@ impl MetaTx for PgTx<'_> {
             return Ok(id);
         }
         // Every parent as one statement, however many a merge has: the
-        // row number is the parent's place in the array, counting from
-        // zero, as the first-parent readers and the seed writer count.
+        // row number is the parent's place in the array. SQLite numbers
+        // the rows from zero, so the ordinality (one-based) shifts down.
         if !parents.is_empty() {
             self.c.execute(
                 "INSERT INTO changeset_parents (cs, n, parent)
@@ -2251,11 +2290,12 @@ impl MetaTx for PgTx<'_> {
     /// transaction inserted while batching, one statement per 1,000 rows
     /// per table, and returns how many statements it wrote. The parents'
     /// row numbers follow the per-commit insert's contract (the parent's
-    /// place in the array, counting from zero). The
-    /// transaction's derived rows land after them, in the order the
-    /// foreign keys read: `changesets`, `changeset_parents`,
-    /// `repo_changesets`, `derived`, `history`, `git_import` - the
-    /// history rows join the batch in the slice after this one.
+    /// place in the array, counting from zero, as the per-commit insert
+    /// numbers them since #540). The transaction's derived rows land
+    /// after them, in the order the foreign keys read: `changesets`,
+    /// `changeset_parents`, `repo_changesets`, `derived`, `history`,
+    /// `git_import` - the history rows join the batch in the slice
+    /// after this one.
     ///
     /// # Errors
     ///
@@ -2490,6 +2530,47 @@ impl MetaTx for PgTx<'_> {
                 &[P::i64(repo.0), P::bytes(&id_bytes(id.as_bytes()))],
             )?
             .is_some())
+    }
+
+    /// One page of the first-parent chain, one statement: the recursive
+    /// term follows the indexed first-parent rows (cs, n = 0), so every
+    /// hop is one index lookup, and the join carries the generation and
+    /// the body. Every fetched changeset is an ancestor of `start`, so
+    /// the repo check rides the start row, as `get_changeset` checks it.
+    fn first_parent_page(
+        &mut self,
+        repo: RepoId,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, i64, Vec<u8>)>> {
+        let rows = self.c.query(
+            "WITH RECURSIVE walk(id, depth) AS (
+                     SELECT rc.cs, 0::bigint FROM repo_changesets rc
+                     WHERE rc.repo_id = $1 AND rc.cs = $2
+                     UNION ALL
+                     SELECT cp.parent, w.depth + 1
+                     FROM walk w
+                     JOIN changeset_parents cp ON cp.cs = w.id AND cp.n = 0
+                     WHERE w.depth < $3
+                 )
+                 SELECT c.id, c.gen, c.body FROM walk
+                 JOIN changesets c ON c.id = walk.id
+                 ORDER BY walk.depth",
+            &[
+                P::i64(repo.0),
+                P::bytes(&id_bytes(start.as_bytes())),
+                P::i64(limit),
+            ],
+        )?;
+        if rows.is_empty() {
+            return Err(Error::NotFound(format!("changeset {start}")));
+        }
+        rows.into_iter()
+            .map(|row| {
+                let cs: Vec<u8> = row.get(0);
+                Ok((to_id(&cs)?, row.get(1), row.get(2)))
+            })
+            .collect()
     }
 
     /// The generation of a changeset that `repo` may see.
@@ -3124,6 +3205,27 @@ impl MetaTx for PgTx<'_> {
     /// decode or match.
     fn get_tree(&mut self, id: TreeId) -> Result<Tree> {
         load_tree(self.c, id).map(|(tree, _)| tree)
+    }
+
+    /// The stored bytes of the trees the ids name, in the order asked.
+    /// One statement per 1,000 ids: the ids travel as one bytea array.
+    fn get_trees(&mut self, ids: &[TreeId]) -> Result<Vec<Option<Vec<u8>>>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(crate::meta::DERIVED_BATCH) {
+            let keys: Vec<Vec<u8>> = chunk.iter().map(|id| id_bytes(id.as_bytes())).collect();
+            let rows = self.c.query(
+                "SELECT id, body FROM trees WHERE id = ANY($1)",
+                &[P::bytea_array(keys.clone())],
+            )?;
+            let mut bodies: std::collections::HashMap<Vec<u8>, Vec<u8>> = rows
+                .into_iter()
+                .map(|row| (row.get::<_, Vec<u8>>(0), row.get::<_, Vec<u8>>(1)))
+                .collect();
+            for key in keys {
+                out.push(bodies.remove(&key));
+            }
+        }
+        Ok(out)
     }
 
     /// Reads a tree's stored `TreeV1` bytes and checks them against its ID.

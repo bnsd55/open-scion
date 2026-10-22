@@ -1019,6 +1019,12 @@ impl PathIndex {
         }
     }
 
+    /// The page one walk reads at a time: one statement per page, where
+    /// a walk that reads one changeset at a time pays a round trip per
+    /// changeset. A page may hold rows past the point the walk stops at;
+    /// that costs rows, not statements.
+    const WALK_PAGE: i64 = 1_000;
+
     /// Indexes the changesets from the current tip forward to `head`. Starts
     /// over at `head` if `head` does not descend from the tip (the ref moved
     /// to other history), if `head` is more than [`MAX_DEPTH`] changesets
@@ -1042,45 +1048,49 @@ impl PathIndex {
         let mut most = 0;
         let mut steps = 0;
         let mut cur = Some(head);
-        while let Some(id) = cur {
-            if id == self.tip {
-                let cost = self.cost(walked.iter().map(|(_, g, changes)| (*g, changes)));
-                let grew = self.grow(lands, cost, |index| {
-                    for (id, generation, changes) in walked {
-                        index.add(id, generation, &changes);
+        'walk: while let Some(start) = cur {
+            // One statement per page of first parents: the rows carry the
+            // generation and the body that the two per-changeset reads
+            // fetched. The stop rules below stay per changeset.
+            for (id, generation, body) in c.first_parent_page(repo, start, Self::WALK_PAGE)? {
+                if id == self.tip {
+                    let cost = self.cost(walked.iter().map(|(_, g, changes)| (*g, changes)));
+                    let grew = self.grow(lands, cost, |index| {
+                        for (id, generation, changes) in walked {
+                            index.add(id, generation, &changes);
+                        }
+                    });
+                    if grew {
+                        self.tip = head;
+                        return Ok(());
                     }
-                });
-                if grew {
-                    self.tip = head;
-                    return Ok(());
+                    tracing::info!("the path indexes are full; it starts over at the head");
+                    break 'walk;
                 }
-                tracing::info!("the path indexes are full; it starts over at the head");
-                break;
+                deadline.check()?;
+                steps += 1;
+                if steps > MAX_DEPTH {
+                    tracing::info!(
+                        steps,
+                        "the ref moved far; the path index starts over at the head"
+                    );
+                    break 'walk;
+                }
+                if generation <= tip_gen {
+                    break 'walk;
+                }
+                let cs = decode_page_changeset(id, &body)?;
+                most += added_bytes(cs.changes());
+                if self.bytes + most > MAX_INDEX_BYTES {
+                    tracing::info!(
+                        generation,
+                        "the path indexes are full; it starts over at the head"
+                    );
+                    break 'walk;
+                }
+                walked.push((id, generation, cs.changes().clone()));
+                cur = cs.parents().first().copied();
             }
-            deadline.check()?;
-            steps += 1;
-            if steps > MAX_DEPTH {
-                tracing::info!(
-                    steps,
-                    "the ref moved far; the path index starts over at the head"
-                );
-                break;
-            }
-            let generation = c.generation(repo, id)?;
-            if generation <= tip_gen {
-                break;
-            }
-            let cs = c.get_changeset(repo, id)?;
-            most += added_bytes(cs.changes());
-            if self.bytes + most > MAX_INDEX_BYTES {
-                tracing::info!(
-                    generation,
-                    "the path indexes are full; it starts over at the head"
-                );
-                break;
-            }
-            cur = cs.parents().first().copied();
-            walked.push((id, generation, cs.changes().clone()));
         }
         *self = Self::new(c, repo, head, &self.used)?;
         Ok(())
@@ -1154,23 +1164,26 @@ impl PathIndex {
         deadline: &Deadline,
     ) -> Result<Walk> {
         loop {
-            deadline.check()?;
-            let id = self.floor;
-            let generation = c.generation(repo, id)?;
-            if generation <= base_gen {
-                return Ok(Walk::Missed);
-            }
-            let cs = c.get_changeset(repo, id)?;
-            let cost = self.cost([(generation, cs.changes())]);
-            if !self.grow(lands, cost, |index| index.add(id, generation, cs.changes())) {
-                return Ok(Walk::Stopped);
-            }
-            let Some(&parent) = cs.parents().first() else {
-                return Ok(Walk::Missed);
-            };
-            self.floor = parent;
-            if parent == base {
-                return Ok(Walk::Reached);
+            // One statement per page of first parents; the stop rules
+            // below stay per changeset. A page may hold rows past the
+            // point the walk stops at, which costs rows, not statements.
+            for (id, generation, body) in c.first_parent_page(repo, self.floor, Self::WALK_PAGE)? {
+                deadline.check()?;
+                if generation <= base_gen {
+                    return Ok(Walk::Missed);
+                }
+                let cs = decode_page_changeset(id, &body)?;
+                let cost = self.cost([(generation, cs.changes())]);
+                if !self.grow(lands, cost, |index| index.add(id, generation, cs.changes())) {
+                    return Ok(Walk::Stopped);
+                }
+                let Some(&parent) = cs.parents().first() else {
+                    return Ok(Walk::Missed);
+                };
+                self.floor = parent;
+                if parent == base {
+                    return Ok(Walk::Reached);
+                }
             }
         }
     }
@@ -1311,6 +1324,20 @@ fn entry_bytes(key: &[u8]) -> usize {
 }
 
 /// The most that [`PathIndex::add`] adds for a changeset with `changes`.
+/// The changeset a page row carries: the same decode and ID check
+/// [`MetaTx::get_changeset`] runs, so a page row and a per-changeset read
+/// agree.
+fn decode_page_changeset(id: ChangesetId, body: &[u8]) -> Result<Changeset> {
+    let (cs, actual) = Changeset::decode_with_id(body)
+        .map_err(|e| Error::Corrupt(format!("changeset {id}: {e}")))?;
+    if actual != id {
+        return Err(Error::Corrupt(format!(
+            "changeset {id} does not match its ID"
+        )));
+    }
+    Ok(cs)
+}
+
 fn added_bytes(changes: &BTreeMap<RepoPath, Option<FileState>>) -> usize {
     let paths = changes.keys().map(|path| {
         let path = path.as_bytes();
