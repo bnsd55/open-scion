@@ -71,6 +71,9 @@ pub(crate) mod error;
 // These two are API, not implementation: a server main runs them by hand,
 // and docs/operations.md documents both. Everything else in the list is
 // an implementation detail of the two binaries, however public it looks.
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "test_support/docs.rs"]
+pub(crate) mod docs_hooks;
 pub mod fsck;
 pub mod gc;
 pub(crate) mod graph;
@@ -85,6 +88,8 @@ pub(crate) mod objects;
 mod pg;
 pub(crate) mod quotas;
 pub(crate) mod read;
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) mod seed;
 pub(crate) mod service;
 pub(crate) mod similar;
 pub(crate) mod store;
@@ -260,6 +265,11 @@ pub mod test_support {
     pub mod store {
         pub use crate::store::*;
     }
+    /// The guide's own commands, so a Proof's test runs the block under
+    /// its runbook's heading instead of retyping it.
+    pub mod docs {
+        pub use crate::docs_hooks::*;
+    }
     /// Tree apply and the per-changeset root tree.
     pub mod tree {
         pub use crate::tree::*;
@@ -267,6 +277,11 @@ pub mod test_support {
     /// The write path: changeset decode and apply, and its limits.
     pub mod write {
         pub use crate::write::*;
+    }
+    /// The bulk seed for deep file-less ladders, for the tests that
+    /// measure the queries instead of the seeding.
+    pub mod seed {
+        pub use crate::seed::*;
     }
 }
 

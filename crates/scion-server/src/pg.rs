@@ -47,7 +47,7 @@ use crate::land::{
     EXPIRE_PER_LAND, LAND_RETENTION_SECS, LandOutcome, LandRequest, LandState, decode_paths,
     encode_paths,
 };
-use crate::meta::{FsckDerivedRow, Meta, MetaTx, RefState, RepoChangeset, RepoId};
+use crate::meta::{FsckDerivedRow, Meta, MetaTx, RefState, RepoChangeset, RepoId, StaleLand};
 use crate::store::Blobs;
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -349,6 +349,12 @@ enum Param {
     OptBytes(Option<Vec<u8>>),
     /// A list of byte strings, for a `= ANY($n)` over `bytea[]`.
     ByteaArray(Vec<Vec<u8>>),
+    /// A list of integers, for the bulk seed's `unnest` over `int8[]`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    I64Array(Vec<i64>),
+    /// A list of strings, for the bulk seed's `unnest` over `text[]`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    TextArray(Vec<&'static str>),
 }
 
 impl Param {
@@ -376,6 +382,18 @@ impl Param {
     fn bytea_array(v: Vec<Vec<u8>>) -> Param {
         Param::ByteaArray(v)
     }
+
+    /// A list of integers, as one `int8[]` parameter.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn i64_array(v: Vec<i64>) -> Param {
+        Param::I64Array(v)
+    }
+
+    /// A list of strings, as one `text[]` parameter.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn text_array(v: Vec<&'static str>) -> Param {
+        Param::TextArray(v)
+    }
 }
 
 impl ToSql for Param {
@@ -391,6 +409,10 @@ impl ToSql for Param {
             Self::Bytes(v) => v.to_sql(t, out),
             Self::OptBytes(v) => v.to_sql(t, out),
             Self::ByteaArray(v) => v.to_sql(t, out),
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::I64Array(v) => v.to_sql(t, out),
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::TextArray(v) => v.to_sql(t, out),
         }
     }
 
@@ -410,6 +432,10 @@ impl ToSql for Param {
             Self::Bytes(v) => v.to_sql(t, out),
             Self::OptBytes(v) => v.to_sql(t, out),
             Self::ByteaArray(v) => v.to_sql(t, out),
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::I64Array(v) => v.to_sql(t, out),
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::TextArray(v) => v.to_sql(t, out),
         }
     }
 }
@@ -1748,22 +1774,21 @@ fn connect_on(url: &str, ca: Option<&Path>, options: &str) -> Result<Client> {
 /// the importer retries a batch on it, and the gRPC status becomes
 /// UNAVAILABLE. The rest keep the engine's error as the source.
 fn map_pg_error(e: postgres::Error) -> Error {
+    let code = e
+        .code()
+        .map(postgres::error::SqlState::code)
+        .map(str::to_owned);
+    pg_error_of(code.as_deref(), e)
+}
+
+/// The mapping on one SQLSTATE, split from [`map_pg_error`] so a unit
+/// test can hand it a code: the `postgres` crate's error type cannot be
+/// built with a chosen one.
+fn pg_error_of(code: Option<&str>, e: postgres::Error) -> Error {
     // A connection the database dropped is as retryable as a busy one.
     if e.is_closed() {
         return Error::Storage(Storage::busy(e));
     }
-    // The SQLSTATE, when the database sent one: a connection error has
-    // none, and a connection it refused or cut maps like a busy one.
-    // The code is a str view of the error, so it is copied before the
-    // error moves into the dispatch.
-    let code = e.code().map(|c| c.code().to_owned());
-    pg_error_of(code.as_deref(), e)
-}
-
-/// The SQLSTATE dispatch of [`map_pg_error`], split from the error it
-/// maps so a test can drive one SQLSTATE through the mapping without a
-/// database that reports it.
-fn pg_error_of(code: Option<&str>, e: postgres::Error) -> Error {
     match code {
         // Deadlock, serialization failure, an administrative shutdown, a
         // database that starts up, a lock another writer holds.
@@ -1788,6 +1813,16 @@ fn pg_error_of(code: Option<&str>, e: postgres::Error) -> Error {
             Error::Storage(Storage::internal(e))
         }
         // Out of space: the same shortage, wherever the metadata lives.
+        // 53100 is the database's one disk-full code - errcode_for_file_access
+        // maps ENOSPC to it for every file, temp files included (elog.c).
+        // The other codes of the same classes stay internal on purpose:
+        // 53200 is out of MEMORY (the fixed reply would name a disk and
+        // lie), 53000 is the class's catch-all (too vague to promise a
+        // disk answer), 53400 is a configured cap - temp_file_limit, or
+        // the replication slots - the same refusal every time, so a
+        // retry-later reply tells the client to retry what cannot
+        // succeed - and 58030 is an io_error - a failing device is the
+        // EIO row's internal, not a space shortage.
         Some("53100") => {
             tracing::error!("the server is out of disk space: {e}");
             Error::Storage(Storage::disk_full(e))
@@ -2328,6 +2363,100 @@ impl MetaTx for PgTx<'_> {
             .map(|row| row.get(0)))
     }
 
+    fn get_derived_batch(
+        &mut self,
+        kind: &str,
+        version: u32,
+        ids: &[ChangesetId],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        // One statement for the whole batch: the ids travel as one bytea
+        // array, the reply has at most one row per id. The caller's read
+        // transaction holds for the batch, so a land between two ids of the
+        // batch cannot mix two states.
+        let version = i64::from(version);
+        let cs = ids
+            .iter()
+            .map(|id| id_bytes(id.as_bytes()))
+            .collect::<Vec<_>>();
+        let rows = self.c.query(
+            "SELECT cs, value FROM derived
+             WHERE kind = $1 AND version = $2 AND cs = ANY($3)",
+            &[P::text(kind), P::i64(version), P::bytea_array(cs)],
+        )?;
+        let mut found = rows
+            .into_iter()
+            .map(|row| {
+                let cs: Vec<u8> = row.get(0);
+                Ok((to_id(&cs)?, row.get::<_, Option<Vec<u8>>>(1)))
+            })
+            .collect::<Result<std::collections::HashMap<_, _>>>()?;
+        ids.iter()
+            .map(|id| Ok(found.remove(id).flatten()))
+            .collect()
+    }
+
+    /// The test seed, in batches: the changesets, their parents, the repo
+    /// membership, and the derived rows, 1,000 rows per statement.
+    /// Parents must come before their children in `css`, so the
+    /// generations compute in order; the derived rows must find an empty
+    /// schema, like the trait doc says.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn bulk_seed(
+        &mut self,
+        repo: RepoId,
+        css: &[scion_core::Changeset],
+        derived: &[(&'static str, u32, ChangesetId, Vec<u8>)],
+    ) -> Result<Vec<ChangesetId>> {
+        let mut gens: std::collections::HashMap<Vec<u8>, i64> = std::collections::HashMap::new();
+        let mut ids = Vec::with_capacity(css.len());
+        let mut cs_rows: Vec<(Vec<u8>, i64, Vec<u8>)> = Vec::new();
+        let mut parent_rows: Vec<(Vec<u8>, i64, Vec<u8>)> = Vec::new();
+        let mut member_rows: Vec<(i64, Vec<u8>)> = Vec::new();
+        for cs in css {
+            let (body, id) = cs.encode_with_id();
+            let key = id_bytes(id.as_bytes());
+            let mut parent_gen = 0;
+            for parent in cs.parents() {
+                let parent_gen_i =
+                    gens.get(&id_bytes(parent.as_bytes()))
+                        .copied()
+                        .ok_or_else(|| {
+                            Error::Corrupt(format!("the seed's {parent} comes after its child"))
+                        })?;
+                parent_gen = parent_gen.max(parent_gen_i);
+            }
+            let generation = 1 + parent_gen;
+            gens.insert(key.clone(), generation);
+            for (n, parent) in cs.parents().iter().enumerate() {
+                let n = i64::try_from(n).map_err(|_| {
+                    Error::Corrupt(format!(
+                        "the seed's {id} holds more parents than i64 counts"
+                    ))
+                })?;
+                parent_rows.push((key.clone(), n, id_bytes(parent.as_bytes())));
+            }
+            member_rows.push((repo.0, key.clone()));
+            cs_rows.push((key, generation, body));
+            ids.push(id);
+        }
+        self.insert_seed_changesets(&cs_rows)?;
+        self.insert_seed_parents(&parent_rows)?;
+        self.insert_seed_members(&member_rows)?;
+        let derived_rows: Vec<(&str, i64, Vec<u8>, Vec<u8>)> = derived
+            .iter()
+            .map(|(kind, version, cs, value)| {
+                (
+                    *kind,
+                    i64::from(*version),
+                    id_bytes(cs.as_bytes()),
+                    value.clone(),
+                )
+            })
+            .collect();
+        self.insert_seed_derived(&derived_rows)?;
+        Ok(ids)
+    }
+
     /// Records a derived value. A second write must agree with the first:
     /// derivation is deterministic, so a mismatch means corruption.
     ///
@@ -2668,16 +2797,24 @@ impl MetaTx for PgTx<'_> {
     }
 
     /// The pending lands that started more than `stale_secs` ago.
-    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<(RepoId, i64, String)>> {
+    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<StaleLand>> {
         let rows = self.c.query(
-            "SELECT repo_id, land_id, target_ref FROM lands
-             WHERE state = 'pending' AND created_at > 0
-                 AND created_at < now_epoch() - $1",
+            "SELECT l.repo_id, l.land_id, l.target_ref, l.caller, l.request_key, r.name
+             FROM lands l JOIN repos r ON r.repo_id = l.repo_id
+             WHERE l.state = 'pending' AND l.created_at > 0
+                 AND l.created_at < now_epoch() - $1",
             &[P::i64(stale_secs)],
         )?;
         Ok(rows
             .iter()
-            .map(|row| (RepoId(row.get(0)), row.get(1), row.get(2)))
+            .map(|row| StaleLand {
+                repo: RepoId(row.get(0)),
+                land_id: row.get(1),
+                target_ref: row.get(2),
+                caller: row.get(3),
+                request_key: row.get(4),
+                repo_name: row.get(5),
+            })
             .collect())
     }
 
@@ -3121,6 +3258,115 @@ impl MetaTx for PgTx<'_> {
                 ))
             })
             .collect()
+    }
+}
+
+/// The statement helpers of [`PgTx::bulk_seed`], outside the trait impl:
+/// each inserts its rows in batches of 1,000 through one `unnest`.
+#[cfg(any(test, feature = "test-hooks"))]
+impl PgTx<'_> {
+    fn insert_seed_changesets(&mut self, rows: &[(Vec<u8>, i64, Vec<u8>)]) -> Result<()> {
+        const CHUNK: usize = 1_000;
+        for chunk in rows.chunks(CHUNK) {
+            let ids = chunk
+                .iter()
+                .map(|(id, _, _)| id.clone())
+                .collect::<Vec<_>>();
+            let gens = chunk
+                .iter()
+                .map(|(_, generation, _)| *generation)
+                .collect::<Vec<_>>();
+            let bodies = chunk
+                .iter()
+                .map(|(_, _, body)| body.clone())
+                .collect::<Vec<_>>();
+            self.c.execute(
+                "INSERT INTO changesets (id, gen, body)
+                 SELECT * FROM unnest($1::bytea[], $2::int8[], $3::bytea[])
+                 ON CONFLICT (id) DO NOTHING",
+                &[
+                    P::bytea_array(ids),
+                    P::i64_array(gens),
+                    P::bytea_array(bodies),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn insert_seed_parents(&mut self, rows: &[(Vec<u8>, i64, Vec<u8>)]) -> Result<()> {
+        const CHUNK: usize = 1_000;
+        for chunk in rows.chunks(CHUNK) {
+            let css = chunk
+                .iter()
+                .map(|(cs, _, _)| cs.clone())
+                .collect::<Vec<_>>();
+            let ns = chunk.iter().map(|(_, n, _)| *n).collect::<Vec<_>>();
+            let parents = chunk
+                .iter()
+                .map(|(_, _, parent)| parent.clone())
+                .collect::<Vec<_>>();
+            self.c.execute(
+                "INSERT INTO changeset_parents (cs, n, parent)
+                 SELECT * FROM unnest($1::bytea[], $2::int8[], $3::bytea[])
+                 ON CONFLICT (cs, n) DO NOTHING",
+                &[
+                    P::bytea_array(css),
+                    P::i64_array(ns),
+                    P::bytea_array(parents),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn insert_seed_members(&mut self, rows: &[(i64, Vec<u8>)]) -> Result<()> {
+        const CHUNK: usize = 1_000;
+        for chunk in rows.chunks(CHUNK) {
+            let repos = chunk.iter().map(|(repo, _)| *repo).collect::<Vec<_>>();
+            let css = chunk.iter().map(|(_, cs)| cs.clone()).collect::<Vec<_>>();
+            self.c.execute(
+                "INSERT INTO repo_changesets (repo_id, cs)
+                 SELECT * FROM unnest($1::int8[], $2::bytea[])
+                 ON CONFLICT (repo_id, cs) DO NOTHING",
+                &[P::i64_array(repos), P::bytea_array(css)],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn insert_seed_derived(
+        &mut self,
+        rows: &[(&'static str, i64, Vec<u8>, Vec<u8>)],
+    ) -> Result<()> {
+        const CHUNK: usize = 1_000;
+        for chunk in rows.chunks(CHUNK) {
+            let kinds = chunk.iter().map(|(kind, ..)| *kind).collect::<Vec<_>>();
+            let versions = chunk
+                .iter()
+                .map(|(_, version, ..)| *version)
+                .collect::<Vec<_>>();
+            let css = chunk
+                .iter()
+                .map(|(_, _, cs, _)| cs.clone())
+                .collect::<Vec<_>>();
+            let values = chunk
+                .iter()
+                .map(|(_, _, _, value)| value.clone())
+                .collect::<Vec<_>>();
+            self.c.execute(
+                "INSERT INTO derived (kind, version, cs, value)
+                 SELECT * FROM unnest($1::text[], $2::int8[], $3::bytea[], $4::bytea[])
+                 ON CONFLICT (kind, version, cs) DO NOTHING",
+                &[
+                    P::text_array(kinds),
+                    P::i64_array(versions),
+                    P::bytea_array(css),
+                    P::bytea_array(values),
+                ],
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -3813,5 +4059,55 @@ mod pool_tests {
             .filter(|out| matches!(out, Err(Error::ResourceExhausted(_))))
             .count();
         assert_eq!((recorded, refused), (1, 1), "{results:?}");
+    }
+
+    /// The out-of-space SQLSTATEs of the Postgres docs' class 53 and 58:
+    /// which map to the fixed `ResourceExhausted` shortage and which
+    /// stay internal, and that the decision is the same for every code.
+    #[test]
+    fn the_disk_full_sqlstates_answer_the_fixed_shortage() {
+        use super::pg_error_of;
+        use crate::{Error, StorageClass};
+        // A source of the right type with no SQLSTATE of its own: a
+        // connect to port 1, which every kernel refuses. The mapping
+        // runs on the SQLSTATE the test hands it, not on this source.
+        let source = || match Client::connect("postgres://127.0.0.1:1/x", NoTls) {
+            Ok(_) => panic!("a connect to port 1 is refused"),
+            Err(refused) => refused,
+        };
+        let full = |code: &str| {
+            let error = pg_error_of(Some(code), source());
+            (
+                matches!(&error, Error::Storage(s) if s.class() == StorageClass::DiskFull),
+                tonic::Status::from(error),
+            )
+        };
+        // 53100: the database's one disk-full code, for every file kind
+        // (elog.c maps ENOSPC to it). The client sees the fixed
+        // retry-later reply.
+        {
+            let (full, status) = full("53100");
+            assert!(full, "53100 must map to the disk-full storage class");
+            assert_eq!(status.code(), tonic::Code::ResourceExhausted, "53100");
+            assert_eq!(
+                status.message(),
+                "the server is out of disk space; retry later",
+                "53100"
+            );
+        }
+        // The codes of the same classes that are NOT a disk shortage
+        // stay internal, on purpose: 53200 is out of memory, 53000 is
+        // the class's catch-all, 53400 is a configured cap (a
+        // temp_file_limit or the replication slots - the same refusal
+        // every time, so a retry-later reply would tell the client to
+        // retry what cannot succeed), and 58030 is an io_error (a
+        // failing device is the EIO row's internal, not a space
+        // shortage). Pinning them keeps a later "helpful" widening from
+        // answering a memory error with a disk reply.
+        for code in ["53200", "53000", "53400", "58030"] {
+            let (full, status) = full(code);
+            assert!(!full, "{code} must not map to the disk-full class");
+            assert_eq!(status.code(), tonic::Code::Internal, "{code}");
+        }
     }
 }

@@ -156,8 +156,81 @@ impl Server {
         TcpStream::connect(addr).is_ok()
     }
 
-    /// Starts a server on `data`, and does not wait for it.
+    /// Starts a server on `data` the guide's own way, and waits until it
+    /// listens. The serve argv comes from the first fenced `sh` block
+    /// under `heading` of docs/operations.md, with the test's data
+    /// directory, token file, and port in place of the documented ones:
+    /// what the server runs is the runbook's line, not a retyped copy.
+    /// The block's token redirect (its umask and printf) is the
+    /// harness's own 0600 token write below.
+    pub(crate) fn start_on(heading: &'static str, data: &Path, log: &Path) -> Self {
+        let mut server = Self::spawn_on(heading, data, log);
+        let start = Instant::now();
+        while !server.listens(log) {
+            if let Some(status) = server.child.try_wait().unwrap() {
+                let log = fs::read_to_string(log).unwrap_or_default();
+                panic!("the server exited with {status}:\n{log}");
+            }
+            assert!(start.elapsed() < Duration::from_secs(60), "no listen");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        server
+    }
+
+    /// The serve argv the guide's block under `heading` prints, with the
+    /// test's values in place of the documented ones. A section whose
+    /// block names no token file or port gets the documented forms
+    /// appended, since a test must not share a port and must not hold
+    /// the token in argv.
+    pub(crate) fn guide_argv(heading: &'static str, data: &Path) -> Vec<String> {
+        use scion_server::test_support::docs::runbook_block;
+        let binary = env!("CARGO_BIN_EXE_scion-server");
+        let raw = runbook_block(heading, &[]);
+        let token = token_file().to_str().unwrap().to_owned();
+        let dir = data.to_str().unwrap().to_owned();
+        let mut subs = vec![("./scion-server", binary), ("/srv/scion", dir.as_str())];
+        if raw.contains("/srv/scion-token") {
+            subs.push(("/srv/scion-token", token.as_str()));
+        }
+        if raw.contains("127.0.0.1:7878") {
+            subs.push(("127.0.0.1:7878", "127.0.0.1:0"));
+        }
+        let block = runbook_block(heading, &subs);
+        let line = block
+            .lines()
+            .find(|l| l.split_whitespace().any(|p| p == "serve"))
+            .expect("the guide's block serves");
+        // The block may lead with env assignments (SCION_TOKEN=<TOKEN>):
+        // they are the documented auth shape, and the harness's
+        // --token-file below is the same auth in the form the runbook
+        // itself prefers for a long-running process.
+        let mut argv: Vec<String> = line
+            .split_whitespace()
+            .skip_while(|p| p.contains('=') && !p.starts_with("--"))
+            .map(str::to_owned)
+            .collect();
+        if !argv.iter().any(|p| p == "--token-file") {
+            argv.push("--token-file".to_owned());
+            argv.push(token);
+        }
+        if !argv.iter().any(|p| p == "--listen") {
+            argv.push("--listen".to_owned());
+            argv.push("127.0.0.1:0".to_owned());
+        }
+        argv
+    }
+
+    /// Starts a server on `data`, and does not wait for it: the
+    /// one-server command of the guide, the shape every default spawn
+    /// takes.
     pub(crate) fn spawn(data: &Path, log: &Path) -> Self {
+        Self::spawn_on("One server", data, log)
+    }
+
+    /// Starts a server on `data` with the guide's own command, and does
+    /// not wait for it.
+    pub(crate) fn spawn_on(heading: &'static str, data: &Path, log: &Path) -> Self {
+        let argv = Self::guide_argv(heading, data);
         let log_file = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -199,18 +272,26 @@ impl Server {
         // The child shares a flock until it execs (see `spawn_guard`): the
         // read side keeps this spawn out of a lock-release window of
         // another test.
+        let serve_args = match argv.first() {
+            Some(p) if p == env!("CARGO_BIN_EXE_scion-server") => &argv[1..],
+            _ => &argv[..],
+        };
         let child = spawn_guard::across_spawn(|| {
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_scion-server"));
-            cmd.arg("--data").arg(data);
+            // The Postgres mode of the fault suites: metadata from the test
+            // database, one schema per data directory, the same name
+            // `Backend::open_test` gives it. The URL carries the schema as a
+            // libpq `options` parameter, which the open merges with its own
+            // options, so the tables and rows of this directory land in it.
+            // It goes before the `serve` subcommand: the flag belongs to
+            // the program, not to the subcommand.
             if let Some(url) = &postgres_url {
                 cmd.arg("--postgres-url").arg(url);
             }
-            cmd.args(["serve", "--token-file"])
-                .arg(token_file)
-                .args(["--listen", "127.0.0.1:0"])
-                // Plain log lines, so the address parses without escape
-                // codes.
-                .env("NO_COLOR", "1")
+            cmd.args(serve_args);
+            // Plain log lines, so the address parses without escape
+            // codes.
+            cmd.env("NO_COLOR", "1")
                 // The write park of the two-process race test: inert
                 // unless a test creates a park file for a blob.
                 .env("SCION_TEST_PARK_WRITES", "1")

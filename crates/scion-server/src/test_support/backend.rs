@@ -172,6 +172,18 @@ impl Backend {
             Inner::Postgres(_) => 0,
         }
     }
+    /// The commit count a completed flush last covered, so every commit
+    /// below it is durable. SQLite only: a Postgres commit is durable when
+    /// it returns (`synchronous_commit = on`).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn flushed_upto(&self) -> u64 {
+        match &self.inner {
+            Inner::Sqlite(store) => store.flushed_upto(),
+            Inner::Postgres(_) => u64::MAX,
+        }
+    }
     /// Sets how many of the next commits of the data directory fail as a
     /// busy database. A Postgres database has no busy error, so this only
     /// reaches SQLite.

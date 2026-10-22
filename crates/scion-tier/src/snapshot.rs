@@ -276,6 +276,32 @@ mod tests {
     }
 
     #[test]
+    fn a_record_with_a_bad_op_is_the_damaged_mark_and_the_report_covers_it() {
+        // The input the fuzzer found (run 39683323899, artifact kept out
+        // of the repo until this fix): a valid header and repo name, then
+        // a full 37-byte head whose op byte is 'a' - not an object
+        // record's - and a torn 8-byte tail. `seed` must answer calmly:
+        // one damaged mark for the bad record, nothing after it counted,
+        // no panic, nothing stored.
+        let mut data = Vec::new();
+        data.extend_from_slice(MAGIC);
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.push(b'r');
+        data.extend_from_slice(b"a");
+        data.extend_from_slice(&[0x8b, 0, 0, 0]);
+        data.extend_from_slice(&[0u8; 43]);
+        let dir = private_dir();
+        let path = dir.path().join("r.scnsnap");
+        fs::write(&path, &data).unwrap();
+        let store = DiskStore::open(&dir.path().join("data"), usize::MAX).unwrap();
+        let seeded = seed(&store, &path).unwrap().unwrap();
+        assert_eq!(seeded.repo, "r");
+        assert_eq!((seeded.stored, seeded.skipped), (0, 0));
+        assert!(seeded.damaged);
+        assert_eq!(seeded.bytes, 0);
+    }
+
+    #[test]
     fn a_cold_store_starts_with_the_snapshot_and_a_warm_one_ignores_it() {
         let dir = private_dir();
         let (objects, path, _) = snapshot_in(dir.path());

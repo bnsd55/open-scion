@@ -161,55 +161,25 @@ async fn runbook() -> Runbook {
     }
 }
 
-/// The first fenced sh block under `heading` of docs/operations.md,
-/// verbatim: the guide's own words, newlines and all.
-fn runbook_block(heading: &str) -> String {
-    let doc = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/operations.md");
-    let text = std::fs::read_to_string(&doc).expect("docs/operations.md opens");
-    let mut lines = text
-        .lines()
-        .skip_while(|line| line.trim() != format!("### {heading}").trim());
-    lines.next();
-    let mut lines = lines.skip_while(|line| line.trim() != "```sh");
-    lines.next();
-    let mut block = Vec::new();
-    for line in lines {
-        if line.trim() == "```" {
-            break;
-        }
-        block.push(line);
-    }
-    assert!(!block.is_empty(), "no sh block under {heading}");
-    block.join("\n")
-}
-
 /// Runs the guide's block off the test's runtime thread: the block
 /// curls the same runtime's metrics endpoint, so a blocking run would
 /// deadlock the single-threaded test runtime against its own server.
+/// The block is the shared helper's: the first fenced sh block under
+/// `heading`, with the real metrics address in place of the
+/// documented one.
 async fn run_guide_block_async(
     heading: &'static str,
     metrics_addr: std::net::SocketAddr,
 ) -> String {
-    tokio::task::spawn_blocking(move || run_guide_block(heading, metrics_addr))
-        .await
-        .expect("the blocking pool runs the guide's block")
-}
-
-/// Runs the guide's block with the real metrics address in place of the
-/// documented one, and returns its stdout.
-fn run_guide_block(heading: &str, metrics_addr: std::net::SocketAddr) -> String {
-    let command = runbook_block(heading).replace("127.0.0.1:9100", &metrics_addr.to_string());
-    let out = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&command)
-        .output()
-        .expect("sh runs the guide's block");
-    assert!(
-        out.status.success(),
-        "the guide's block failed: {command}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).expect("the block's stdout is utf-8")
+    let addr = metrics_addr.to_string();
+    tokio::task::spawn_blocking(move || {
+        scion_server::test_support::docs::run_guide_block(
+            heading,
+            &[("127.0.0.1:9100", addr.as_str())],
+        )
+    })
+    .await
+    .expect("the blocking pool runs the guide's block")
 }
 
 /// The calls that put two RPCs' histograms on the wire: an upload and a

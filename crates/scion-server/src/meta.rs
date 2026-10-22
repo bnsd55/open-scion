@@ -42,6 +42,25 @@ use crate::history::NodeId;
 use crate::land::{LandOutcome, LandRequest, LandState};
 use crate::store::Store;
 
+/// One pending land the stale-land sweep found, with everything the
+/// answer to its intent line names: the repo (by ID for the ref's lock,
+/// by name for the line), the land ID, the target ref, the principal
+/// and the request key.
+pub struct StaleLand {
+    /// The repo the land belongs to, as the ref's lock names it.
+    pub repo: RepoId,
+    /// The land row's ID.
+    pub land_id: i64,
+    /// The ref the land would move.
+    pub target_ref: String,
+    /// The principal that asked for the land.
+    pub caller: String,
+    /// The request key a retry would resume the land with.
+    pub request_key: String,
+    /// The repo's name, as an audit line carries it.
+    pub repo_name: String,
+}
+
 /// The metadata storage of a server. One implementation per backend; a
 /// caller holds a concrete one and calls these methods.
 pub trait Meta: Send + Sync + 'static {
@@ -86,8 +105,9 @@ pub trait Meta: Send + Sync + 'static {
 
     /// Runs `f` in one write transaction. It commits when `f` returns `Ok`
     /// and rolls back otherwise, and returns before the commit is durable.
-    /// A backend with retryable errors may run `f` again; it must not
-    /// change anything outside the transaction.
+    /// Every backend runs `f` exactly once; a retryable error comes back
+    /// from the call instead of rerunning `f`, and `f` changes nothing
+    /// outside the transaction.
     ///
     /// # Errors
     ///
@@ -109,6 +129,12 @@ pub trait Meta: Send + Sync + 'static {
     /// A flush error.
     fn flush(&self) -> Result<()>;
 }
+
+/// Most ids one `get_derived_batch` call fetches. The statement stays
+/// small (1,000 x 32-byte ids as one array parameter, the reply at most
+/// 1,000 rows), and a walk reads at most 1,000 nodes per step, so one
+/// batch covers one step.
+pub(crate) const DERIVED_BATCH: usize = 1_000;
 
 /// The queries on the metadata tables. Every query fails with a database
 /// error, or with the `NotFound` or `Corrupt` error that its doc says; the
@@ -170,6 +196,44 @@ pub trait MetaTx {
     /// The stored bytes of a derived value, if computed.
     fn get_derived(&mut self, kind: &str, version: u32, cs: ChangesetId)
     -> Result<Option<Vec<u8>>>;
+
+    /// The stored bytes of up to [`DERIVED_BATCH`] derived values, in the
+    /// order asked. One read transaction, one statement: a land between two
+    /// ids of the batch cannot mix two states.
+    ///
+    /// [`DERIVED_BATCH`]: crate::meta::DERIVED_BATCH
+    fn get_derived_batch(
+        &mut self,
+        kind: &str,
+        version: u32,
+        ids: &[ChangesetId],
+    ) -> Result<Vec<Option<Vec<u8>>>>;
+
+    /// Writes a test seed: `css` oldest first, every parent before its
+    /// children, file-less (no tree entries, no blobs), and the derived
+    /// values to store beside them. One statement per batch, not per
+    /// changeset, where the backend can. The default writes them one by
+    /// one through the ordinary path; backends where a round trip costs
+    /// real time override it. The rows must find an empty schema: the
+    /// bulk write does not replay the ordinary write's conflict checks.
+    ///
+    /// Returns the ids, in `css` order.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn bulk_seed(
+        &mut self,
+        repo: RepoId,
+        css: &[scion_core::Changeset],
+        derived: &[(&'static str, u32, ChangesetId, Vec<u8>)],
+    ) -> Result<Vec<ChangesetId>> {
+        let mut ids = Vec::with_capacity(css.len());
+        for cs in css {
+            ids.push(self.insert_changeset(repo, cs)?);
+        }
+        for (kind, version, cs, value) in derived {
+            self.put_derived(kind, *version, *cs, value)?;
+        }
+        Ok(ids)
+    }
 
     /// Records a derived value. A second write must agree with the first.
     fn put_derived(
@@ -284,9 +348,10 @@ pub trait MetaTx {
         pending_limit: Option<usize>,
     ) -> Result<(RepoId, LandOutcome)>;
 
-    /// Lists the pending lands that started more than `stale_secs` ago, as
-    /// (repo, land ID, target ref).
-    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<(RepoId, i64, String)>>;
+    /// Lists the pending lands that started more than `stale_secs` ago, with
+    /// what an answer to their intent names: the repo and its name, the land
+    /// ID, the target ref, the principal and the request key.
+    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<StaleLand>>;
 
     /// Rejects a land that is still pending, and returns whether it changed
     /// (1) or was no longer pending (0). The caller holds the ref's lock
