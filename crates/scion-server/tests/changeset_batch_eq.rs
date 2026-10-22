@@ -85,12 +85,13 @@ fn opts(rev: &str) -> ImportOptions {
 
 /// Every table the two paths write, with the columns in the order the
 /// comparison reads them.
-const TABLES: [&str; 7] = [
+const TABLES: [&str; 8] = [
     "SELECT id, gen, body FROM changesets ORDER BY id",
     "SELECT cs, n, parent FROM changeset_parents ORDER BY cs, n",
     "SELECT repo_id, cs FROM repo_changesets ORDER BY repo_id, cs",
     "SELECT id, body FROM trees ORDER BY id",
     "SELECT kind, version, cs, value FROM derived ORDER BY kind, version, cs",
+    "SELECT id, body FROM history_nodes ORDER BY id",
     "SELECT git_algo, git_oid, cs FROM git_import ORDER BY git_oid",
     "SELECT repo_id, name, target, version FROM refs ORDER BY repo_id, name",
 ];
