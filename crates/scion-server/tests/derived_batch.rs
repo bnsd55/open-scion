@@ -79,16 +79,6 @@ impl Git {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    let table = "0123456789abcdef";
-    let mut out = String::new();
-    for b in bytes {
-        out.push(table.chars().nth(usize::from(b >> 4)).unwrap());
-        out.push(table.chars().nth(usize::from(b & 15)).unwrap());
-    }
-    out
-}
-
 fn opts(rev: &str) -> ImportOptions {
     ImportOptions {
         rev: rev.to_owned(),
