@@ -1309,6 +1309,10 @@ enum SetupOutcome {
     /// The database answered and refused the one-server lock: another
     /// session holds it.
     LockRefused,
+    /// The URL's search_path names no existing schema: the database
+    /// answered, only the schema is missing. A refusal, not an
+    /// unreachable: no retry can fix the URL.
+    NoSchema,
     /// The database could not be reached, or refused the schema
     /// statements: nothing is known about the lock.
     Unreachable,
@@ -1368,8 +1372,10 @@ impl Setup {
             };
             // A search_path whose members all miss answers NULL: the
             // connection would create nothing, and no lock names it.
+            // The database answered, so this is a URL mistake, not an
+            // unreachable database: refuse with the fix.
             let Some(current) = row.get::<_, Option<String>>(0) else {
-                return SetupOutcome::Unreachable;
+                return SetupOutcome::NoSchema;
             };
             if !server_lock_raw(client, schema_lock_key(&current)) {
                 // The database answered: another session holds the lock.
@@ -1511,6 +1517,11 @@ fn run_statement(client: &mut Client, job: &Job) -> Result<Reply> {
 /// The reply of a failed setup: a takeover names the loss; an
 /// unreachable database answers what a client retries against.
 fn setup_error(setup: &Setup, ever_held: bool) -> Error {
+    if matches!(setup.outcome, SetupOutcome::NoSchema) {
+        return Error::FailedPrecondition(
+            "the URL's search_path names no existing schema; create it first".into(),
+        );
+    }
     if matches!(setup.outcome, SetupOutcome::Unreachable) {
         return Error::Storage(Storage::busy(std::io::Error::other(
             "the database was unreachable at setup",
@@ -3507,6 +3518,27 @@ mod tests {
         assert_eq!(
             merged_options(Some("--search_path=scion_test_1"), OWN),
             format!("--search_path=scion_test_1 {OWN}")
+        );
+    }
+
+    /// A URL whose search_path names no existing schema refuses with
+    /// the fix named, not 'unreachable': the database answered, and
+    /// only the schema is missing.
+    #[test]
+    fn a_search_path_that_names_no_schema_refuses_with_the_fix() {
+        if !crate::Backend::test_is_postgres() {
+            return;
+        }
+        let url = crate::backend::test_hooks::test_url().unwrap();
+        let mut client = Client::connect(&url, NoTls).unwrap();
+        let setup = super::Setup::new(Some("scion_test_missing"), true, &mut client);
+        assert!(!setup.ok(), "a missing schema cannot hold the setup");
+        let error = super::setup_error(&setup, false);
+        assert!(
+            error
+                .to_string()
+                .contains("the URL's search_path names no existing schema; create it first"),
+            "{error}"
         );
     }
 
