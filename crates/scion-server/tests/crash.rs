@@ -401,17 +401,42 @@ fn a_newer_schema_refuses_the_open_and_a_restore_serves() {
     // server starts and serves. On Postgres the dump is restored over
     // the schema, dropping what the forge had left.
     if Backend::test_is_postgres() {
-        let url = std::env::var("SCION_TEST_POSTGRES_URL").expect("SCION_TEST_POSTGRES_URL");
+        // The forge's rows drop with the schema, and the dump loads in
+        // their place, in the job's Postgres container: its tools match
+        // the server's version, where a client from the runner image
+        // may not.
         let schema_name = Backend::test_schema(&data).expect("the test names a schema");
-        let sql = backup.join("schema.sql");
-        let restore = Command::new("psql")
-            .arg("-v")
-            .arg("ON_ERROR_STOP=1")
-            .args(["-c", &format!("DROP SCHEMA {schema_name} CASCADE")])
-            .args(["-f", &sql.to_string_lossy()])
-            .arg(&url)
+        let container = std::env::var("SCION_TEST_PG_CONTAINER").expect("SCION_TEST_PG_CONTAINER");
+        let db = std::env::var("SCION_TEST_POSTGRES_URL")
+            .expect("SCION_TEST_POSTGRES_URL")
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_owned();
+        let drop = Command::new("docker")
+            .args(["exec", &container, "psql", "-U", "postgres"])
+            .args([
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-d",
+                &db,
+                "-c",
+                &format!("DROP SCHEMA {schema_name} CASCADE"),
+            ])
             .output()
-            .expect("psql runs");
+            .expect("docker runs");
+        assert!(
+            drop.status.success(),
+            "the schema drops: {}",
+            String::from_utf8_lossy(&drop.stderr)
+        );
+        let dump = fs::File::open(backup.join("schema.sql")).unwrap();
+        let restore = Command::new("docker")
+            .args(["exec", "-i", &container, "psql", "-U", "postgres"])
+            .args(["-v", "ON_ERROR_STOP=1", "-d", &db])
+            .stdin(std::process::Stdio::from(dump))
+            .output()
+            .expect("docker runs");
         assert!(
             restore.status.success(),
             "the restore lands: {}",
@@ -434,20 +459,25 @@ fn a_newer_schema_refuses_the_open_and_a_restore_serves() {
 fn backup_dir(data: &Path, backup: &Path) {
     fs::create_dir_all(backup).unwrap();
     if Backend::test_is_postgres() {
-        let url = std::env::var("SCION_TEST_POSTGRES_URL").expect("SCION_TEST_POSTGRES_URL");
+        // The dump runs in the job's Postgres container: its tools
+        // match the server's version, where a client from the runner
+        // image may not.
         let schema = Backend::test_schema(data).expect("the test names a schema");
-        let dump = Command::new("pg_dump")
-            .arg(format!("--schema={schema}"))
-            .arg("--file")
-            .arg(backup.join("schema.sql"))
-            .arg(&url)
-            .output()
-            .expect("pg_dump runs");
-        assert!(
-            dump.status.success(),
-            "the dump lands: {}",
-            String::from_utf8_lossy(&dump.stderr)
-        );
+        let container = std::env::var("SCION_TEST_PG_CONTAINER").expect("SCION_TEST_PG_CONTAINER");
+        let db = std::env::var("SCION_TEST_POSTGRES_URL")
+            .expect("SCION_TEST_POSTGRES_URL")
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_owned();
+        let file = fs::File::create(backup.join("schema.sql")).unwrap();
+        let dump = Command::new("docker")
+            .args(["exec", &container, "pg_dump", "-U", "postgres"])
+            .args(["--no-owner", &format!("--schema={schema}"), &db])
+            .stdout(std::process::Stdio::from(file))
+            .status()
+            .expect("docker runs");
+        assert!(dump.success(), "pg_dump of {schema} failed");
         let text = fs::read_to_string(backup.join("schema.sql")).unwrap();
         eprintln!("dump has repos row: {}", text.contains("repos"));
         eprintln!("dump has the repo r: {}", text.contains("'r'"));
