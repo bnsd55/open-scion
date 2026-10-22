@@ -29,6 +29,76 @@ pub const MAX_COMMIT_MESSAGE_BYTES: usize = 1 << 20;
 /// Longest author name or email in a created changeset, in bytes.
 pub const MAX_IDENTITY_BYTES: usize = 1 << 10;
 
+/// The parks of the two write checks that race the collector: the file
+/// check of [`create_changeset`] parks after [`check_blobs`], and
+/// [`put_blob`] parks after its member read. A test arms a park over a
+/// folder and writes `park-<blob id>` into it; the parked caller holds
+/// nothing the collector respects, and a marker file says it is inside
+/// the park, so the test cannot miss the park in a stat of a cached
+/// kernel answer. The store's write park is the pattern (#268).
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Park {
+    root: std::sync::Mutex<Option<std::path::PathBuf>>,
+}
+
+#[cfg(test)]
+impl Park {
+    /// Arms the park over `root`: every parked caller of this park
+    /// waits while its park file exists there.
+    pub(crate) fn arm(&self, root: &std::path::Path) {
+        *self
+            .root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(root.to_owned());
+    }
+
+    /// Lifts the park: no caller parks any more.
+    pub(crate) fn lift(&self) {
+        *self
+            .root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// Parks the caller while the park file of `id` exists. The ceiling
+    /// bounds a park nobody lifts: it fails the holder, not the store.
+    fn park(&self, id: &BlobId) {
+        let root = self
+            .root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(root) = root else { return };
+        let file = root.join(format!("park-{id}"));
+        let marker = root.join(format!("parked-{id}"));
+        let _ = std::fs::write(&marker, b"");
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while file.exists() {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "the park of {id} was never lifted"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = std::fs::remove_file(&marker);
+    }
+}
+
+/// The park between [`check_blobs`] and the write transaction of
+/// [`create_changeset`], keyed by the changeset's first put's blob.
+#[cfg(test)]
+pub(crate) static PARK_CREATE: Park = Park {
+    root: std::sync::Mutex::new(None),
+};
+
+/// The park of [`put_blob`], between its member read and its upsert.
+#[cfg(test)]
+pub(crate) static PARK_PUT: Park = Park {
+    root: std::sync::Mutex::new(None),
+};
+
 /// Stores a changeset sent as `ChangesetV1` bytes, with the root tree of its
 /// parent plus its changes. Safe to repeat: the ID is the content.
 ///
@@ -58,6 +128,13 @@ pub fn create_changeset(store: &Backend, repo: &str, bytes: &[u8]) -> Result<Cha
     // write transaction. It also reads the blob lengths the tree build
     // needs, so the write connection does no file I/O.
     let lens = check_blobs(store, repo, &cs)?;
+    // The test seam of the collector race: the caller has checked the
+    // file and holds nothing the collector respects, and parks here
+    // while the park file of its first put's blob exists.
+    #[cfg(test)]
+    if let Some((_, blob)) = db::puts(&cs).next() {
+        PARK_CREATE.park(&blob);
+    }
     // See `tree::store_changeset`. The write's flush covers these steps.
     tree::fill_root_tree(store, repo_id, parent)?;
     store.write(|c| {
@@ -95,6 +172,10 @@ pub fn put_blob(store: &Backend, repo: RepoId, upload: Upload) -> Result<BlobId>
     let id = upload.id();
     // The flush below covers what this read saw.
     let member = store.read_unflushed(|c| c.repo_has_blob(repo, id))?;
+    // The test seam of the collector race: the caller parks here, after
+    // the read answered and before the row question is settled.
+    #[cfg(test)]
+    PARK_PUT.park(&id);
     store.blobs().put_upload(upload, member)?;
     if !member {
         // One flush covers the file and this row. A row whose blob a crash

@@ -1083,8 +1083,146 @@ mod tests {
                 chunks.set(chunks.get() + 1);
             }
         });
+        assert_eq!(chunks.get(), 2, "the prune held the key once for every row");
         assert_eq!(report.rows_pruned, blobs.len() as u64, "{report:?}");
         assert_eq!(report.files_removed, blobs.len() as u64, "{report:?}");
-        assert_eq!(chunks.get(), 2, "the prune held the key once for every row");
+    }
+
+    use crate::write::{create_changeset, put_blob, PARK_CREATE, PARK_PUT};
+
+    /// Waits until a writer parked in one of the write parks, named by
+    /// the marker file of `id`.
+    fn wait_parked(hooks: &Path, id: BlobId) {
+        let marker = hooks.join(format!("parked-{id}"));
+        let give_up = std::time::Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "the writer never parked"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The collector takes the row and the file while a `create_changeset`
+
+    /// A writer parked in one of the write path's parks, and the marker
+    /// file that says it is inside.
+    fn parked(hooks: &Path, id: BlobId) {
+        let marker = hooks.join(format!("parked-{id}"));
+        let give_up = std::time::Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "the writer never parked"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The collector takes the row and the file while a `create_changeset`
+    /// sits parked between its file check and its write transaction. The
+    /// commit may not name a blob whose file the collector removed: the
+    /// create refuses (the client uploads again), or it commits and the
+    /// named blob reads back. A commit that names a file the sweep
+    /// unlinked loses the file's bytes for every reader of the path.
+    #[test]
+    fn a_create_over_a_collected_blob_does_not_name_its_lost_file() {
+        let dir = TempDir::new().unwrap();
+        let store = Backend::open_test_shared(dir.path()).unwrap();
+        let repo = store.write(|c| c.create_repo(REPO)).unwrap();
+        let text = b"named\n";
+        let upload = store.blobs().upload().unwrap().append(text).unwrap();
+        let b = put_blob(&store, repo, upload).unwrap();
+        age_file(&store, b, OLD);
+        let root = store
+            .write(|c| c.insert_changeset(repo, &cs(None, &[])))
+            .unwrap();
+        let mut changes = std::collections::BTreeMap::new();
+        changes.insert(
+            RepoPath::new("f").unwrap(),
+            Some(FileState::Regular {
+                content: b,
+                executable: false,
+            }),
+        );
+        let bytes = Changeset::new(
+            vec![root],
+            IdentityTime::new(b"Ada".to_vec(), b"ada@example.com".to_vec(), 1_700_000_000, 0)
+                .expect("identity fits the format"),
+            None,
+            b"write\n".to_vec(),
+            changes,
+        )
+        .expect("changeset fits the format")
+        .encode();
+
+        // The create parks after its file check; the collector then takes
+        // the row and the file the check saw.
+        let hooks = dir.path().join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        PARK_CREATE.arm(&hooks);
+        std::fs::write(hooks.join(format!("park-{b}")), b"").unwrap();
+        let writer = store.clone();
+        let created =
+            std::thread::spawn(move || create_changeset(&writer, REPO, &bytes).map_err(|e| e.to_string()));        wait_parked(&hooks, b);
+        let report = collect(&store, Duration::from_secs(DEFAULT_GRACE_SECS), &mut |_| {});
+        assert_eq!(report.rows_pruned, 1, "{report:?}");
+        assert_eq!(report.files_removed, 1, "{report:?}");
+
+        std::fs::remove_file(hooks.join(format!("park-{b}"))).unwrap();
+        let answer = created.join().expect("the create's thread answers");
+        PARK_CREATE.lift();
+        match answer {
+            // The refuse sends the client to upload again: nothing names
+            // the file the collector removed.
+            Err(why) => assert!(why.contains("is not stored"), "{why}"),
+            // A commit may only name blobs that read back.
+            Ok(_) => assert_eq!(
+                store.blobs().get(b).unwrap(),
+                text,
+                "the named blob reads back"
+            ),
+        }
+    }
+
+    /// The collector takes the row while a `PutBlob` sits parked after
+    /// its member read, and takes the file too. The reply must still
+    /// leave the row behind: a PutBlob that answers ok stores the blob
+    /// for the repo, and the next changeset may name it.
+    #[test]
+    fn a_put_blob_that_answers_ok_names_the_blob_over_a_concurrent_gc() {
+        let dir = TempDir::new().unwrap();
+        let store = Backend::open_test_shared(dir.path()).unwrap();
+        let repo = store.write(|c| c.create_repo(REPO)).unwrap();
+        let upload = store.blobs().upload().unwrap().append(b"kept\n").unwrap();
+        let b = put_blob(&store, repo, upload).unwrap();
+        age_file(&store, b, OLD);
+
+        // The PutBlob parks after its member read said true; the
+        // collector then prunes the row and unlinks the file.
+        let hooks = dir.path().join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        PARK_PUT.arm(&hooks);
+        std::fs::write(hooks.join(format!("park-{b}")), b"").unwrap();
+        let writer = store.clone();
+        let put_thread = std::thread::spawn(move || {
+            let upload = writer.blobs().upload().unwrap().append(b"kept\n").unwrap();
+            put_blob(&writer, repo, upload).map_err(|e| e.to_string())
+        });
+        wait_parked(&hooks, b);
+        let report = collect(&store, Duration::from_secs(DEFAULT_GRACE_SECS), &mut |_| {});
+        assert_eq!(report.rows_pruned, 1, "{report:?}");
+        assert_eq!(report.files_removed, 1, "{report:?}");
+
+        std::fs::remove_file(hooks.join(format!("park-{b}"))).unwrap();
+        let answer = put_thread.join().expect("the PutBlob's thread answers");
+        PARK_PUT.lift();
+        answer.expect("the PutBlob answers ok");
+        assert!(
+            store.read(|c| c.any_repo_names(b.as_bytes())).unwrap(),
+            "the row of a PutBlob that answered ok vanished"
+        );
+        assert_eq!(store.blobs().get(b).unwrap(), b"kept\n", "the blob reads back");
     }
 }
