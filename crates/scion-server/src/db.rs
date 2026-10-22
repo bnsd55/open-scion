@@ -247,6 +247,19 @@ impl MetaTx for SqliteTx<'_> {
             .map_err(crate::error::from_sqlite)
     }
 
+    /// The blobs of the list that the repo does not have. A loop over
+    /// [`repo_has_blob`](Self::repo_has_blob) is fine here: the check is
+    /// local, so a list of any length costs no round trips.
+    fn repo_missing_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<Vec<BlobId>> {
+        let mut missing = Vec::new();
+        for blob in blobs {
+            if !self.repo_has_blob(repo, *blob)? {
+                missing.push(*blob);
+            }
+        }
+        Ok(missing)
+    }
+
     /// Reads a changeset that `repo` may see and checks it against its ID.
     ///
     /// # Errors
