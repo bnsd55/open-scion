@@ -8,6 +8,10 @@
 //! ceiling: adding a call, a field or an enum value passes; removing
 //! one, renumbering one, or changing an rpc's signature is serving a
 //! v2, not changing v1 (docs/compatibility.md).
+//! Updating on purpose: re-pin by replacing `protocol_surface_v1.golden`
+//! with the diff the failure prints, and name the added surface
+//! surface in a changes/ fragment - a removal or a renumber is never a
+//! re-pin, it is serving v2.
 
 use std::collections::BTreeSet;
 

@@ -294,7 +294,7 @@ stop() {
 # key's public half. The daemon only forwards the tickets.
 start_scion() {
   if [ ! -f "$WORK/ticket.key" ]; then
-    "$BIN/scion-server" ticket-key --out "$WORK/ticket.key" > "$WORK/ticket.pub"
+    "$BIN/scion-server" --data "$WORK/server" ticket-key --out "$WORK/ticket.key" > "$WORK/ticket.pub"
   fi
   start server serving "$BIN/scion-server" --data "$WORK/server" serve \
     --listen "127.0.0.1:$SERVER_PORT" \

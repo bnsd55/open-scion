@@ -28,6 +28,11 @@ use scion_server::test_support::land::{LandRequest, LandState, Lands};
 use scion_server::test_support::meta::{Meta as _, MetaTx as _, RefState};
 use scion_server::test_support::{read, tree, write};
 use scion_server::{Backend, Error};
+
+/// A deadline a test does not reach.
+fn later() -> Deadline {
+    Deadline::new(std::time::Instant::now() + std::time::Duration::from_secs(600))
+}
 use scion_server::{ImportOptions, ImportReport, import_git};
 use tempfile::TempDir;
 
@@ -692,6 +697,38 @@ fn assert_diverged(result: Result<ImportReport, Error>, main: ChangesetId, tip: 
 }
 
 #[test]
+fn a_changeset_with_a_repeated_parent_stores_and_reads_back_the_same() {
+    // `Changeset::new` accepts a repeated parent, and git can produce
+    // one (`commit-tree -p X -p X`); whichever backend stores it, it
+    // reads back with the same parents, one row per parent place.
+    let (git, _h) = fixture();
+    let (_dir, store) = open_store();
+    let imported = import(&store, &git, "HEAD").tip;
+
+    let cs = Changeset::new(
+        vec![imported, imported],
+        identity(),
+        None,
+        b"repeated parent\n".to_vec(),
+        BTreeMap::new(),
+    )
+    .expect("changeset fits the format");
+    let id = store
+        .write(|c| {
+            let repo = c.repo_id("r")?;
+            c.insert_changeset(repo, &cs)
+        })
+        .unwrap();
+    let stored = store
+        .read(|c| {
+            let repo = c.repo_id("r")?;
+            c.get_changeset(repo, id)
+        })
+        .unwrap();
+    assert_eq!(stored.parents(), &[imported, imported]);
+}
+
+#[test]
 fn import_never_moves_a_ref_off_a_land() {
     let (git, h) = fixture();
     let (_dir, store) = open_store();
@@ -865,7 +902,7 @@ fn create(store: &Backend, base: ChangesetId, path: &str) -> ChangesetId {
         BTreeMap::from([(self::path(path), Some(file))]),
     )
     .expect("changeset fits the format");
-    write::create_changeset(store, "r", &cs.encode()).unwrap()
+    write::create_changeset(store, "r", &cs.encode(), &later()).unwrap()
 }
 
 /// Lands `cs` on `main`, and retries with the same key while the ref moves.
@@ -1153,7 +1190,7 @@ fn a_second_server_process_is_refused() {
     let said = if extra.is_empty() {
         stderr.contains("in use by another server")
     } else {
-        stderr.contains("another server holds this database")
+        stderr.contains("another server holds this store")
     };
     assert!(said, "{stderr}");
 }

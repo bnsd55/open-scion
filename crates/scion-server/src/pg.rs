@@ -21,7 +21,10 @@
 //! - Land IDs come from an identity sequence, so no ID is handed out
 //!   twice, and the newest land holds the largest one.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-hooks"))]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
@@ -45,7 +48,7 @@ use crate::land::{
     EXPIRE_PER_LAND, LAND_RETENTION_SECS, LandOutcome, LandRequest, LandState, decode_paths,
     encode_paths,
 };
-use crate::meta::{FsckDerivedRow, Meta, MetaTx, RefState, RepoChangeset, RepoId};
+use crate::meta::{FsckDerivedRow, Meta, MetaTx, RefState, RepoChangeset, RepoId, StaleLand};
 use crate::store::Blobs;
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -53,7 +56,7 @@ use crate::store::Blobs;
 pub(crate) mod test_hooks;
 
 /// The schema version this build makes and reads.
-pub(crate) const PG_SCHEMA_VERSION: u32 = 4;
+pub(crate) const PG_SCHEMA_VERSION: u32 = 5;
 
 /// How long a call may wait for a Postgres reader before the server
 /// answers [`Error::Unavailable`]. Well below the 600 s call deadline:
@@ -83,6 +86,7 @@ const PG_MIGRATIONS: [&str; PG_SCHEMA_VERSION as usize] = [
     include_str!("../migrations/postgres/0002_view_roots.sql"),
     include_str!("../migrations/postgres/0003_view_trees.sql"),
     include_str!("../migrations/postgres/0004_store_uuid.sql"),
+    include_str!("../migrations/postgres/0005_parent_numbering.sql"),
 ];
 
 /// The fence of a process that lost the one-server lock. The worker of
@@ -136,6 +140,9 @@ struct PgInner {
     /// The UUID of this database, written at the first open and carried
     /// by the marker file of the data directory.
     store_uuid: [u8; 16],
+    /// The schema versions this open moved, when it migrated. Version 0's
+    /// first open creates the schema, and reports none.
+    migrated: Option<(u32, u32)>,
     /// Clients for [`Pg::read`], at most [`READERS`](crate::store::READERS)
     /// at once, like the readers of a SQLite store.
     readers: Readers,
@@ -347,6 +354,12 @@ enum Param {
     OptBytes(Option<Vec<u8>>),
     /// A list of byte strings, for a `= ANY($n)` over `bytea[]`.
     ByteaArray(Vec<Vec<u8>>),
+    /// A list of integers, for the bulk seed's `unnest` over `int8[]`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    I64Array(Vec<i64>),
+    /// A list of strings, for the bulk seed's `unnest` over `text[]`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    TextArray(Vec<&'static str>),
 }
 
 impl Param {
@@ -374,6 +387,18 @@ impl Param {
     fn bytea_array(v: Vec<Vec<u8>>) -> Param {
         Param::ByteaArray(v)
     }
+
+    /// A list of integers, as one `int8[]` parameter.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn i64_array(v: Vec<i64>) -> Param {
+        Param::I64Array(v)
+    }
+
+    /// A list of strings, as one `text[]` parameter.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn text_array(v: Vec<&'static str>) -> Param {
+        Param::TextArray(v)
+    }
 }
 
 impl ToSql for Param {
@@ -389,6 +414,10 @@ impl ToSql for Param {
             Self::Bytes(v) => v.to_sql(t, out),
             Self::OptBytes(v) => v.to_sql(t, out),
             Self::ByteaArray(v) => v.to_sql(t, out),
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::I64Array(v) => v.to_sql(t, out),
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::TextArray(v) => v.to_sql(t, out),
         }
     }
 
@@ -408,6 +437,10 @@ impl ToSql for Param {
             Self::Bytes(v) => v.to_sql(t, out),
             Self::OptBytes(v) => v.to_sql(t, out),
             Self::ByteaArray(v) => v.to_sql(t, out),
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::I64Array(v) => v.to_sql(t, out),
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::TextArray(v) => v.to_sql(t, out),
         }
     }
 }
@@ -469,7 +502,7 @@ impl PgClient {
                 // reconnect. A lock the database does not give back fails
                 // every statement that follows: another server process may
                 // hold it, and this one must not land beside it.
-                let mut setup = Setup::new(conn.schema.as_deref(), conn.lock_key, &mut client);
+                let mut setup = Setup::new(conn.schema.as_deref(), conn.exclusive, &mut client);
                 // BEGIN opens one; COMMIT and ROLLBACK end it. A
                 // transaction a reconnect lost fails every statement until
                 // its rollback: on the new connection, autocommit would
@@ -542,7 +575,7 @@ impl PgClient {
                     // some while after the connection did. One retry a
                     // job, so the recovery needs no process restart.
                     if !setup.ok() {
-                        setup = Setup::new(conn.schema.as_deref(), conn.lock_key, &mut client);
+                        setup = Setup::new(conn.schema.as_deref(), conn.exclusive, &mut client);
                     }
                     if !setup.ok() {
                         if ever_held && matches!(setup.outcome, SetupOutcome::LockRefused) {
@@ -702,6 +735,10 @@ impl Pg {
         data: &Path,
         marker: Marker,
     ) -> Result<Self> {
+        // The schema the URL rides is the connection's own business: the
+        // setup asks the database `current_schema()` and locks that, so
+        // parallel servers of distinct schemas do not fence each other,
+        // and a plain URL fences the whole default schema.
         Self::open_in(url, ca, readers, data, None, true, marker)
     }
 
@@ -718,26 +755,16 @@ impl Pg {
     ) -> Result<Self> {
         let options = base_options();
         let fence = Arc::new(Fence::new());
-        // The one-server lock of the database, or of one test schema: a
-        // key per schema, so parallel tests do not block each other.
-        let lock_key = if exclusive {
-            Some(schema.map_or(SERVER_LOCK, schema_lock_key))
-        } else {
-            None
-        };
+        // The one-server lock of the schema the connection lands in: the
+        // setup asks the database `current_schema()` and locks that, so a
+        // plain URL and one that rides `--search_path=public` take the
+        // same lock, and schemas ride separately. A reader takes none.
         let mut writer = if exclusive {
-            connect_exclusive(
-                url,
-                ca,
-                &options,
-                schema,
-                lock_key.expect("an exclusive open names a lock"),
-                Arc::clone(&fence),
-            )?
+            connect_exclusive(url, ca, &options, schema, Arc::clone(&fence))?
         } else {
             connect_with(url, ca, &options, schema)?
         };
-        migrate(&mut writer)?;
+        let migrated = migrate(&mut writer)?;
         // The durability of a commit is a promise of this backend: check
         // that the server kept its side of it.
         let on: String = writer.query("SHOW synchronous_commit", &[])?[0].get(0);
@@ -807,6 +834,7 @@ impl Pg {
             writer: Mutex::new(writer),
             fence,
             store_uuid,
+            migrated,
             readers: Readers::new_with(readers, url, ca, &options, schema)?,
             blobs,
             writers: Mutex::new(0),
@@ -846,6 +874,12 @@ impl Pg {
     /// directory also carries.
     pub(crate) fn store_uuid(&self) -> [u8; 16] {
         self.inner.store_uuid
+    }
+
+    /// The schema versions this open moved, when it migrated: the
+    /// process that opened records the move in its audit log.
+    pub(crate) fn migrated(&self) -> Option<(u32, u32)> {
+        self.inner.migrated
     }
 
     /// Fails when the fence tripped: the process lost the database to
@@ -907,6 +941,7 @@ impl Pg {
         let (mut writer, _waiting) = self.lock_writer();
         let mut pg = PgTx {
             c: &mut writer,
+            gen_cache: std::collections::HashMap::new(),
             ended: true,
         };
         f(&mut pg)
@@ -1132,6 +1167,12 @@ impl Drop for PgWriteWaiter<'_> {
 #[allow(unreachable_pub)]
 pub struct PgTx<'a> {
     c: &'a mut PgClient,
+    /// The generations this transaction has already read. A changeset's
+    /// generation is fixed at insert and never updated, so one read per
+    /// transaction is one round trip saved for every later read of the
+    /// same changeset - the derived walks and the land ask for the same
+    /// few ids again and again.
+    gen_cache: std::collections::HashMap<(i64, Vec<u8>), i64>,
     /// The transaction was ended by `commit` or `rollback`; a drop then
     /// leaves the client alone.
     ended: bool,
@@ -1141,7 +1182,11 @@ impl<'a> PgTx<'a> {
     /// Begins one transaction on the client.
     fn begin(c: &'a mut PgClient) -> Result<PgTx<'a>> {
         c.execute("BEGIN", &[])?;
-        Ok(Self { c, ended: false })
+        Ok(Self {
+            c,
+            gen_cache: std::collections::HashMap::new(),
+            ended: false,
+        })
     }
 
     /// Begins one read-only transaction at repeatable read: every
@@ -1169,7 +1214,11 @@ impl<'a> PgTx<'a> {
         // drops this `PgTx`, and its Drop rolls the transaction back, so
         // the pooled client never stays inside one whose statements no
         // longer run.
-        let tx = Self { c, ended: false };
+        let tx = Self {
+            c,
+            gen_cache: std::collections::HashMap::new(),
+            ended: false,
+        };
         tx.c.execute(
             &format!("SET LOCAL statement_timeout = {}", statement.as_millis()),
             &[],
@@ -1189,6 +1238,7 @@ impl<'a> PgTx<'a> {
     pub(crate) fn reborrow(&mut self) -> PgTx<'_> {
         PgTx {
             c: self.c,
+            gen_cache: std::collections::HashMap::new(),
             ended: true,
         }
     }
@@ -1270,6 +1320,10 @@ enum SetupOutcome {
     /// The database answered and refused the one-server lock: another
     /// session holds it.
     LockRefused,
+    /// The URL's `search_path` names no existing schema: the database
+    /// answered, only the schema is missing. A refusal, not an
+    /// unreachable: no retry can fix the URL.
+    NoSchema,
     /// The database could not be reached, or refused the schema
     /// statements: nothing is known about the lock.
     Unreachable,
@@ -1277,20 +1331,20 @@ enum SetupOutcome {
 
 struct Setup {
     schema: Option<String>,
-    /// The advisory lock this session takes, if any: the one-server lock
-    /// of a database, or of one test schema. None for a client that
-    /// takes no lock (a reader, an import).
-    lock_key: Option<i64>,
+    /// Whether this session takes the one-server lock of the schema it
+    /// lands in (an exclusive writer; None-equivalent for a reader, an
+    /// import).
+    exclusive: bool,
     outcome: SetupOutcome,
 }
 
 impl Setup {
     /// Applies the setup to a fresh client. A failed setup leaves the
     /// statements failed until a reconnect applies it again.
-    fn new(schema: Option<&str>, lock_key: Option<i64>, client: &mut Client) -> Self {
+    fn new(schema: Option<&str>, exclusive: bool, client: &mut Client) -> Self {
         let mut setup = Self {
             schema: schema.map(str::to_owned),
-            lock_key,
+            exclusive,
             outcome: SetupOutcome::Unreachable,
         };
         setup.outcome = setup.apply(client);
@@ -1319,11 +1373,25 @@ impl Setup {
                 return SetupOutcome::Unreachable;
             }
         }
-        if let Some(key) = self.lock_key
-            && !server_lock_raw(client, key)
-        {
-            // The database answered: another session holds the lock.
-            return SetupOutcome::LockRefused;
+        if self.exclusive {
+            // What the connection actually writes into, whatever the URL
+            // spelled: a plain URL and one that rides
+            // `--search_path=public` land in the same schema and must
+            // fence each other, and schemas ride separately.
+            let Ok(row) = client.query_one("SELECT current_schema()::text", &[]) else {
+                return SetupOutcome::Unreachable;
+            };
+            // A search_path whose members all miss answers NULL: the
+            // connection would create nothing, and no lock names it.
+            // The database answered, so this is a URL mistake, not an
+            // unreachable database: refuse with the fix.
+            let Some(current) = row.get::<_, Option<String>>(0) else {
+                return SetupOutcome::NoSchema;
+            };
+            if !server_lock_raw(client, schema_lock_key(&current)) {
+                // The database answered: another session holds the lock.
+                return SetupOutcome::LockRefused;
+            }
         }
         SetupOutcome::Applied
     }
@@ -1398,8 +1466,55 @@ fn run_with_retry(
     run_statement(client, job)
 }
 
+/// The statements this process has run against Postgres since the last
+/// reset. A test hook: the land round-trip guard reads the delta around
+/// one land and fails the run when it grows past the budget. The count
+/// lives on the worker thread's side, so the read crosses no lock; the
+/// guard's binary runs one measuring test, so a process-wide total is
+/// one land's count.
+#[cfg(any(test, feature = "test-hooks"))]
+static TEST_STATEMENTS: AtomicU64 = AtomicU64::new(0);
+
+/// The SQL of the statements run since the last reset, for a test that
+/// wants the kinds and not just the count.
+#[cfg(any(test, feature = "test-hooks"))]
+static TEST_STATEMENT_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The SQL of the statements run since the last reset.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn test_statement_log() -> Vec<String> {
+    TEST_STATEMENT_LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// The statement count of this process since the last reset.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn test_statement_count() -> u64 {
+    TEST_STATEMENTS.load(Ordering::Relaxed)
+}
+
+/// Sets the statement count back to zero.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn test_reset_statement_count() {
+    TEST_STATEMENTS.store(0, Ordering::Relaxed);
+    TEST_STATEMENT_LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
 /// Runs one statement of a job on the client.
 fn run_statement(client: &mut Client, job: &Job) -> Result<Reply> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    {
+        TEST_STATEMENTS.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut log) = TEST_STATEMENT_LOG.try_lock() {
+            let sql: String = job.sql.chars().take(90).collect();
+            log.push(sql.replace('\n', " "));
+        }
+    }
     let refs = as_refs(&job.params);
     match job.kind {
         Kind::Batch => client.batch_execute(&job.sql).map(|(): ()| Reply::Count(0)),
@@ -1413,6 +1528,11 @@ fn run_statement(client: &mut Client, job: &Job) -> Result<Reply> {
 /// The reply of a failed setup: a takeover names the loss; an
 /// unreachable database answers what a client retries against.
 fn setup_error(setup: &Setup, ever_held: bool) -> Error {
+    if matches!(setup.outcome, SetupOutcome::NoSchema) {
+        return Error::FailedPrecondition(
+            "the URL's search_path names no existing schema; create it first".into(),
+        );
+    }
     if matches!(setup.outcome, SetupOutcome::Unreachable) {
         return Error::Storage(Storage::busy(std::io::Error::other(
             "the database was unreachable at setup",
@@ -1433,7 +1553,7 @@ fn lost_message(setup_held: bool) -> &'static str {
         "this server process lost the database to another \
          server process; it serves nothing from here on"
     } else {
-        "another server holds this database"
+        "another server holds this store"
     }
 }
 
@@ -1443,7 +1563,7 @@ fn lost_message(setup_held: bool) -> &'static str {
 fn reconnect(client: &mut Client, conn: &Conn) -> Result<Setup> {
     let fresh = connect_on(&conn.url, conn.ca.as_deref(), &conn.options)?;
     *client = fresh;
-    Ok(Setup::new(conn.schema.as_deref(), conn.lock_key, client))
+    Ok(Setup::new(conn.schema.as_deref(), conn.exclusive, client))
 }
 
 /// Whether the worker's client is inside the transaction a `BEGIN`
@@ -1494,9 +1614,9 @@ struct Conn {
     options: String,
     /// The schema a reconnect narrows itself to again.
     schema: Option<String>,
-    /// The advisory lock this session re-takes after every reconnect,
-    /// if any.
-    lock_key: Option<i64>,
+    /// Whether this session re-takes the one-server lock after every
+    /// reconnect (an exclusive writer; a reader takes none).
+    exclusive: bool,
 }
 
 /// What a worker needs to run, and to connect again when its client dies.
@@ -1546,7 +1666,7 @@ fn connect_with(
     options: &str,
     schema: Option<&str>,
 ) -> Result<PgClient> {
-    spawn_client(url, ca, options, schema, None, None)
+    spawn_client(url, ca, options, schema, false, None)
 }
 
 /// Undoes the identity a failed restore's open minted in the database:
@@ -1566,26 +1686,26 @@ fn connect_exclusive(
     ca: Option<&Path>,
     options: &str,
     schema: Option<&str>,
-    lock_key: i64,
     fence: Arc<Fence>,
 ) -> Result<PgClient> {
     // Whether the lock was given is decided at the spawn: one probe job
     // brings a refusal here, to the open, so an operator whose second
     // server starts against a taken database sees it now, and not in the
     // errors of the first call a client makes.
-    let client = spawn_client(url, ca, options, schema, Some(lock_key), Some(fence))?;
+    let client = spawn_client(url, ca, options, schema, true, Some(fence))?;
     client.query_opt("SELECT 1", &[])?;
     Ok(client)
 }
 
-/// Puts one client on its worker thread. A `lock_key` is re-taken after
-/// every reconnect, and its loss trips the fence.
+/// Puts one client on its worker thread. An exclusive client re-takes
+/// the one-server lock after every reconnect, and its loss trips the
+/// fence.
 fn spawn_client(
     url: &str,
     ca: Option<&Path>,
     options: &str,
     schema: Option<&str>,
-    lock_key: Option<i64>,
+    exclusive: bool,
     fence: Option<Arc<Fence>>,
 ) -> Result<PgClient> {
     let client =
@@ -1599,7 +1719,7 @@ fn spawn_client(
             ca: ca.map(Path::to_path_buf),
             options: options.to_owned(),
             schema: schema.map(str::to_owned),
-            lock_key,
+            exclusive,
         },
         fence,
     }))
@@ -1677,16 +1797,27 @@ fn connect_on(url: &str, ca: Option<&Path>, options: &str) -> Result<Client> {
 /// the importer retries a batch on it, and the gRPC status becomes
 /// UNAVAILABLE. The rest keep the engine's error as the source.
 fn map_pg_error(e: postgres::Error) -> Error {
+    let code = e
+        .code()
+        .map(postgres::error::SqlState::code)
+        .map(str::to_owned);
+    pg_error_of(code.as_deref(), e)
+}
+
+/// The mapping on one SQLSTATE, split from [`map_pg_error`] so a unit
+/// test can hand it a code: the `postgres` crate's error type cannot be
+/// built with a chosen one.
+fn pg_error_of(code: Option<&str>, e: postgres::Error) -> Error {
     // A connection the database dropped is as retryable as a busy one.
     if e.is_closed() {
         return Error::Storage(Storage::busy(e));
     }
-    match e.code() {
+    match code {
         // Deadlock, serialization failure, an administrative shutdown, a
         // database that starts up, a lock another writer holds.
         Some(code)
-            if matches!(code.code(), "40P01" | "40001" | "57P01" | "57P03" | "55P03")
-                || code.code().starts_with("08") =>
+            if matches!(code, "40P01" | "40001" | "57P01" | "57P03" | "55P03")
+                || code.starts_with("08") =>
         {
             tracing::warn!("the database is busy: {e}");
             Error::Storage(Storage::busy(e))
@@ -1694,18 +1825,28 @@ fn map_pg_error(e: postgres::Error) -> Error {
         // The lock or the statement waited past its clock, as a SQLite
         // write does past its busy timeout: the caller has been at it
         // too long, and the client retries past its own deadline.
-        Some(code) if code.code() == "57014" => {
+        Some("57014") => {
             tracing::warn!("the database gave the statement up: {e}");
             Error::DeadlineExceeded("the database kept the caller waiting".to_owned())
         }
         // A violation the code handles (a duplicate key, a check, a
         // foreign key) is one answer among many: it logs quietly.
-        Some(code) if code.code().starts_with("23") => {
+        Some(code) if code.starts_with("23") => {
             tracing::debug!("the database refused a statement: {e}");
             Error::Storage(Storage::internal(e))
         }
         // Out of space: the same shortage, wherever the metadata lives.
-        Some(code) if code.code() == "53100" => {
+        // 53100 is the database's one disk-full code - errcode_for_file_access
+        // maps ENOSPC to it for every file, temp files included (elog.c).
+        // The other codes of the same classes stay internal on purpose:
+        // 53200 is out of MEMORY (the fixed reply would name a disk and
+        // lie), 53000 is the class's catch-all (too vague to promise a
+        // disk answer), 53400 is a configured cap - temp_file_limit, or
+        // the replication slots - the same refusal every time, so a
+        // retry-later reply tells the client to retry what cannot
+        // succeed - and 58030 is an io_error - a failing device is the
+        // EIO row's internal, not a space shortage.
+        Some("53100") => {
             tracing::error!("the server is out of disk space: {e}");
             Error::Storage(Storage::disk_full(e))
         }
@@ -1758,8 +1899,12 @@ fn make_tls(ca: &Path) -> Result<MakeRustlsConnect> {
 
 /// Brings the database to this build's schema: runs every migration it has
 /// not run yet, in one transaction each, and refuses a schema of a newer
-/// build.
-fn migrate(client: &mut PgClient) -> Result<()> {
+/// build. Returns the `(from, to)` versions when it migrated, and `None`
+/// when the database was at this build's version already. A database of
+/// version 0 was no schema at all: the first open creates one, and a
+/// creation moves nothing.
+#[allow(clippy::needless_pass_by_ref_mut)]
+fn migrate(client: &mut PgClient) -> Result<Option<(u32, u32)>> {
     // One process at a time migrates: a lock of the session, held across
     // the migrations, so a server and an import started together take
     // turns while the migrations are quick, and the version the loser
@@ -1776,7 +1921,7 @@ fn migrate(client: &mut PgClient) -> Result<()> {
 }
 
 /// The migrations themselves, under the session's schema lock.
-fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
+fn migrate_under_lock(client: &mut PgClient) -> Result<Option<(u32, u32)>> {
     // The ledger of the versions, made first, in its own transaction: a
     // migration that fails leaves the ledger and every version before it.
     client.batch(
@@ -1801,6 +1946,14 @@ fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
              ({PG_SCHEMA_VERSION}); run this build's older server, or upgrade it"
         )));
     }
+    if version == PG_SCHEMA_VERSION {
+        return Ok(None);
+    }
+    tracing::info!(
+        from_version = version,
+        to_version = PG_SCHEMA_VERSION,
+        "migrating the metadata schema"
+    );
     for (n, sql) in PG_MIGRATIONS.iter().enumerate() {
         let n = u32::try_from(n + 1).expect("a schema version fits in a u32");
         if n <= version {
@@ -1809,6 +1962,7 @@ fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
         // One transaction per migration, with its version bump: a
         // migration that fails rolls its own statements back, and the
         // versions before it stand.
+        let step = std::time::Instant::now();
         let mut tx = PgTx::begin(client)?;
         tx.c.batch(&format!(
             "{sql}\nINSERT INTO schema_migrations (version, name) \
@@ -1816,8 +1970,26 @@ fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
             i64::from(n)
         ))?;
         tx.commit()?;
+        tracing::info!(
+            from_version = n - 1,
+            to_version = n,
+            elapsed_ms = u64::try_from(step.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "the metadata schema migrated one step"
+        );
     }
-    Ok(())
+    tracing::info!(
+        from_version = version,
+        to_version = PG_SCHEMA_VERSION,
+        "the metadata migration is done"
+    );
+    // Version 0 was no schema at all: the first open creates one, and a
+    // creation moves nothing.
+    let migrated = if version == 0 {
+        None
+    } else {
+        Some((version, PG_SCHEMA_VERSION))
+    };
+    Ok(migrated)
 }
 
 /// Reads a tree's rows and checks them against its ID.
@@ -1887,8 +2059,33 @@ impl MetaTx for PgTx<'_> {
         // write, on both backends.
         let (body, id) = cs.encode_with_id();
         let mut parent_gen = 0;
-        for parent in cs.parents() {
-            parent_gen = parent_gen.max(self.generation(repo, *parent)?);
+        let parents: Vec<Vec<u8>> = cs
+            .parents()
+            .iter()
+            .map(|parent| id_bytes(parent.as_bytes()))
+            .collect();
+        if !parents.is_empty() {
+            // One round trip for every parent's generation, however many
+            // parents a merge has.
+            let rows = self.c.query(
+                "SELECT id, gen FROM changesets JOIN repo_changesets ON cs = id
+                 WHERE repo_id = $1 AND id = ANY($2)",
+                &[P::i64(repo.0), P::bytea_array(parents.clone())],
+            )?;
+            let gens: std::collections::HashMap<Vec<u8>, i64> = rows
+                .into_iter()
+                .map(|row| (row.get::<_, Vec<u8>>(0), row.get::<_, i64>(1)))
+                .collect();
+            for (parent, key) in cs.parents().iter().zip(&parents) {
+                // A repeated parent reads the same row twice; `get`, not
+                // `remove`, so parents [X, X] store like they did when
+                // each parent was its own statement.
+                let parent_gen_i = *gens
+                    .get(key)
+                    .ok_or_else(|| Error::NotFound(format!("changeset {parent}")))?;
+                parent_gen = parent_gen.max(parent_gen_i);
+                self.gen_cache.insert((repo.0, key.clone()), parent_gen_i);
+            }
         }
         self.c.execute(
             "INSERT INTO changesets (id, gen, body) VALUES ($1, $2, $3)
@@ -1899,14 +2096,18 @@ impl MetaTx for PgTx<'_> {
                 P::bytes(&body),
             ],
         )?;
-        for (n, parent) in (0_i64..).zip(cs.parents()) {
+        // Every parent as one statement, however many a merge has: the
+        // row number is the parent's place in the array. SQLite numbers
+        // the rows from zero, so the ordinality (one-based) shifts down.
+        if !parents.is_empty() {
             self.c.execute(
-                "INSERT INTO changeset_parents (cs, n, parent) VALUES ($1, $2, $3)
+                "INSERT INTO changeset_parents (cs, n, parent)
+                 SELECT $1, ord - 1, parent
+                 FROM unnest($2::bytea[]) WITH ORDINALITY AS parents(parent, ord)
                  ON CONFLICT (cs, n) DO NOTHING",
                 &[
                     P::bytes(&id_bytes(id.as_bytes())),
-                    P::i64(n),
-                    P::bytes(&id_bytes(parent.as_bytes())),
+                    P::bytea_array(parents.clone()),
                 ],
             )?;
         }
@@ -1929,6 +2130,22 @@ impl MetaTx for PgTx<'_> {
         Ok(added == 1)
     }
 
+    /// Adds every blob as one statement, however many the changeset
+    /// puts.
+    fn add_repo_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<()> {
+        if blobs.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<Vec<u8>> = blobs.iter().map(|blob| id_bytes(blob.as_bytes())).collect();
+        self.c.execute(
+            "INSERT INTO repo_blobs (repo_id, blob)
+             SELECT $1, x FROM unnest($2::bytea[]) AS x
+             ON CONFLICT (repo_id, blob) DO NOTHING",
+            &[P::i64(repo.0), P::bytea_array(ids)],
+        )?;
+        Ok(())
+    }
+
     /// Whether `repo` may name `blob`.
     fn repo_has_blob(&mut self, repo: RepoId, blob: BlobId) -> Result<bool> {
         Ok(self
@@ -1938,6 +2155,34 @@ impl MetaTx for PgTx<'_> {
                 &[P::i64(repo.0), P::bytes(&id_bytes(blob.as_bytes()))],
             )?
             .is_some())
+    }
+
+    /// The blobs of the list that the repo does not have. One statement
+    /// per 1,000 ids, the chunk size of [`add_repo_blobs`](Self::add_repo_blobs):
+    /// a changeset may name 100,000 changes, and one query per blob
+    /// would cost one round trip each.
+    fn repo_missing_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<Vec<BlobId>> {
+        const CHUNK: usize = 1_000;
+        let mut missing = Vec::new();
+        for chunk in blobs.chunks(CHUNK) {
+            let ids: Vec<Vec<u8>> = chunk.iter().map(|blob| id_bytes(blob.as_bytes())).collect();
+            let rows = self.c.query(
+                "SELECT x FROM unnest($2::bytea[]) AS x
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM repo_blobs WHERE repo_id = $1 AND blob = x
+                 )",
+                &[P::i64(repo.0), P::bytea_array(ids)],
+            )?;
+            for row in rows {
+                let bytes: Vec<u8> = row.get(0);
+                missing.push(BlobId::from_bytes(
+                    bytes
+                        .try_into()
+                        .expect("the stored blob column holds 32-byte ids"),
+                ));
+            }
+        }
+        Ok(missing)
     }
 
     /// Reads a changeset that `repo` may see and checks it against its ID.
@@ -1977,20 +2222,70 @@ impl MetaTx for PgTx<'_> {
             .is_some())
     }
 
+    /// One page of the first-parent chain, one statement: the recursive
+    /// term follows the indexed first-parent rows (cs, n = 0), so every
+    /// hop is one index lookup, and the join carries the generation and
+    /// the body. Every fetched changeset is an ancestor of `start`, so
+    /// the repo check rides the start row, as `get_changeset` checks it.
+    fn first_parent_page(
+        &mut self,
+        repo: RepoId,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, i64, Vec<u8>)>> {
+        let rows = self.c.query(
+            "WITH RECURSIVE walk(id, depth) AS (
+                     SELECT rc.cs, 0::bigint FROM repo_changesets rc
+                     WHERE rc.repo_id = $1 AND rc.cs = $2
+                     UNION ALL
+                     SELECT cp.parent, w.depth + 1
+                     FROM walk w
+                     JOIN changeset_parents cp ON cp.cs = w.id AND cp.n = 0
+                     WHERE w.depth < $3
+                 )
+                 SELECT c.id, c.gen, c.body FROM walk
+                 JOIN changesets c ON c.id = walk.id
+                 ORDER BY walk.depth",
+            &[
+                P::i64(repo.0),
+                P::bytes(&id_bytes(start.as_bytes())),
+                P::i64(limit),
+            ],
+        )?;
+        if rows.is_empty() {
+            return Err(Error::NotFound(format!("changeset {start}")));
+        }
+        rows.into_iter()
+            .map(|row| {
+                let cs: Vec<u8> = row.get(0);
+                Ok((to_id(&cs)?, row.get(1), row.get(2)))
+            })
+            .collect()
+    }
+
     /// The generation of a changeset that `repo` may see.
     ///
     /// # Errors
     ///
     /// [`Error::NotFound`] if `repo` does not have it.
     fn generation(&mut self, repo: RepoId, id: ChangesetId) -> Result<i64> {
-        self.c
+        let key = (repo.0, id_bytes(id.as_bytes()));
+        if let Some(cached) = self.gen_cache.get(&key) {
+            return Ok(*cached);
+        }
+        let found = self
+            .c
             .query_opt(
                 "SELECT gen FROM changesets JOIN repo_changesets ON cs = id
                  WHERE repo_id = $1 AND id = $2",
-                &[P::i64(repo.0), P::bytes(&id_bytes(id.as_bytes()))],
+                &[P::i64(repo.0), P::bytes(&key.1)],
             )?
             .map(|row| row.get::<_, i64>(0))
-            .ok_or_else(|| Error::NotFound(format!("changeset {id}")))
+            .ok_or_else(|| Error::NotFound(format!("changeset {id}")));
+        if let Ok(found_gen) = &found {
+            self.gen_cache.insert(key, *found_gen);
+        }
+        found
     }
 
     /// The generation of a changeset, in any repo. For derived data.
@@ -2045,6 +2340,53 @@ impl MetaTx for PgTx<'_> {
                 Ok((parent, parent_gen))
             })
             .collect()
+    }
+
+    /// The parents of up to `DERIVED_BATCH` merges, in the order asked,
+    /// in one statement: the ids travel as one `bytea[]`, and the reply
+    /// has at most one row per parent. A merge asked twice gets its
+    /// parents twice, once per ask. The generation check is the one
+    /// [`MetaTx::parents`] makes, with the asked merge's generation.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] if a parent's generation is not below its
+    /// merge's.
+    fn parents_many(
+        &mut self,
+        merges: &[(ChangesetId, i64)],
+    ) -> Result<Vec<Vec<(ChangesetId, i64)>>> {
+        let ids = merges
+            .iter()
+            .map(|(id, _)| id_bytes(id.as_bytes()))
+            .collect::<Vec<_>>();
+        let rows = self.c.query(
+            "SELECT cs, parent, gen FROM changeset_parents JOIN changesets ON id = parent
+             WHERE cs = ANY($1) ORDER BY cs, n",
+            &[P::bytea_array(ids)],
+        )?;
+        let mut out: Vec<Vec<(ChangesetId, i64)>> = vec![Vec::new(); merges.len()];
+        // One id can be asked twice: two histories reach the same merge.
+        let mut asked: HashMap<&[u8], Vec<usize>> = HashMap::new();
+        for (i, (id, _)) in merges.iter().enumerate() {
+            asked.entry(id.as_bytes()).or_default().push(i);
+        }
+        for row in &rows {
+            let cs: Vec<u8> = row.get(0);
+            let parent: Vec<u8> = row.get(1);
+            let parent_gen: i64 = row.get(2);
+            let parent = to_id(&parent)?;
+            for &i in &asked[cs.as_slice()] {
+                let (id, id_gen) = merges[i];
+                if parent_gen >= id_gen {
+                    return Err(Error::Corrupt(format!(
+                        "changeset {id} has generation {id_gen}, its parent {parent} {parent_gen}"
+                    )));
+                }
+                out[i].push((parent, parent_gen));
+            }
+        }
+        Ok(out)
     }
 
     /// Whether `ancestor` is `descendant` or reachable from it through
@@ -2170,6 +2512,140 @@ impl MetaTx for PgTx<'_> {
                 ],
             )?
             .map(|row| row.get(0)))
+    }
+
+    fn get_derived_batch(
+        &mut self,
+        kind: &str,
+        version: u32,
+        ids: &[ChangesetId],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        // One statement for the whole batch: the ids travel as one bytea
+        // array, the reply has at most one row per id. The caller's read
+        // transaction holds for the batch, so a land between two ids of the
+        // batch cannot mix two states.
+        let version = i64::from(version);
+        let cs = ids
+            .iter()
+            .map(|id| id_bytes(id.as_bytes()))
+            .collect::<Vec<_>>();
+        let rows = self.c.query(
+            "SELECT cs, value FROM derived
+             WHERE kind = $1 AND version = $2 AND cs = ANY($3)",
+            &[P::text(kind), P::i64(version), P::bytea_array(cs)],
+        )?;
+        let mut found = rows
+            .into_iter()
+            .map(|row| {
+                let cs: Vec<u8> = row.get(0);
+                Ok((to_id(&cs)?, row.get::<_, Option<Vec<u8>>>(1)))
+            })
+            .collect::<Result<std::collections::HashMap<_, _>>>()?;
+        ids.iter()
+            .map(|id| Ok(found.remove(id).flatten()))
+            .collect()
+    }
+
+    fn get_derived_chain(
+        &mut self,
+        kind: &str,
+        version: u32,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, Vec<u8>)>> {
+        // One statement for the whole chain: the recursive term follows the
+        // indexed first-parent rows (cs, n = 0), so every hop is one index
+        // lookup, and the join keeps only the rows that carry a stored
+        // value. Every fetched changeset is an ancestor of `start`, so no
+        // repo filter is needed.
+        let version = i64::from(version);
+        let rows = self.c.query(
+            "WITH RECURSIVE walk(id, depth) AS (
+                 SELECT $1::bytea, 0::bigint
+                 UNION ALL
+                 SELECT cp.parent, w.depth + 1
+                 FROM walk w
+                 JOIN changeset_parents cp ON cp.cs = w.id AND cp.n = 0
+                 WHERE w.depth < $2
+             )
+             SELECT d.cs, d.value FROM walk
+             JOIN derived d ON d.cs = walk.id
+             WHERE d.kind = $3 AND d.version = $4",
+            &[
+                P::bytes(id_bytes(start.as_bytes()).as_slice()),
+                P::i64(limit),
+                P::text(kind),
+                P::i64(version),
+            ],
+        )?;
+        rows.into_iter()
+            .map(|row| {
+                let cs: Vec<u8> = row.get(0);
+                Ok((to_id(&cs)?, row.get(1)))
+            })
+            .collect()
+    }
+
+    /// The test seed, in batches: the changesets, their parents, the repo
+    /// membership, and the derived rows, 1,000 rows per statement.
+    /// Parents must come before their children in `css`, so the
+    /// generations compute in order; the derived rows must find an empty
+    /// schema, like the trait doc says.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn bulk_seed(
+        &mut self,
+        repo: RepoId,
+        css: &[scion_core::Changeset],
+        derived: &[(&'static str, u32, ChangesetId, Vec<u8>)],
+    ) -> Result<Vec<ChangesetId>> {
+        let mut gens: std::collections::HashMap<Vec<u8>, i64> = std::collections::HashMap::new();
+        let mut ids = Vec::with_capacity(css.len());
+        let mut cs_rows: Vec<(Vec<u8>, i64, Vec<u8>)> = Vec::new();
+        let mut parent_rows: Vec<(Vec<u8>, i64, Vec<u8>)> = Vec::new();
+        let mut member_rows: Vec<(i64, Vec<u8>)> = Vec::new();
+        for cs in css {
+            let (body, id) = cs.encode_with_id();
+            let key = id_bytes(id.as_bytes());
+            let mut parent_gen = 0;
+            for parent in cs.parents() {
+                let parent_gen_i =
+                    gens.get(&id_bytes(parent.as_bytes()))
+                        .copied()
+                        .ok_or_else(|| {
+                            Error::Corrupt(format!("the seed's {parent} comes after its child"))
+                        })?;
+                parent_gen = parent_gen.max(parent_gen_i);
+            }
+            let generation = 1 + parent_gen;
+            gens.insert(key.clone(), generation);
+            for (n, parent) in cs.parents().iter().enumerate() {
+                let n = i64::try_from(n).map_err(|_| {
+                    Error::Corrupt(format!(
+                        "the seed's {id} holds more parents than i64 counts"
+                    ))
+                })?;
+                parent_rows.push((key.clone(), n, id_bytes(parent.as_bytes())));
+            }
+            member_rows.push((repo.0, key.clone()));
+            cs_rows.push((key, generation, body));
+            ids.push(id);
+        }
+        self.insert_seed_changesets(&cs_rows)?;
+        self.insert_seed_parents(&parent_rows)?;
+        self.insert_seed_members(&member_rows)?;
+        let derived_rows: Vec<(&str, i64, Vec<u8>, Vec<u8>)> = derived
+            .iter()
+            .map(|(kind, version, cs, value)| {
+                (
+                    *kind,
+                    i64::from(*version),
+                    id_bytes(cs.as_bytes()),
+                    value.clone(),
+                )
+            })
+            .collect();
+        self.insert_seed_derived(&derived_rows)?;
+        Ok(ids)
     }
 
     /// Records a derived value. A second write must agree with the first:
@@ -2352,6 +2828,26 @@ impl MetaTx for PgTx<'_> {
         Ok(id)
     }
 
+    /// Stores pre-encoded trees, whose ids are their content hashes, as
+    /// one statement however many the chain built.
+    fn put_trees(&mut self, trees: &[(TreeId, Vec<u8>)]) -> Result<()> {
+        if trees.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<Vec<u8>> = trees
+            .iter()
+            .map(|(id, _)| id_bytes(id.as_bytes()))
+            .collect();
+        let bodies: Vec<Vec<u8>> = trees.iter().map(|(_, body)| body.clone()).collect();
+        self.c.execute(
+            "INSERT INTO trees (id, body)
+             SELECT * FROM unnest($1::bytea[], $2::bytea[])
+             ON CONFLICT (id) DO NOTHING",
+            &[P::bytea_array(ids), P::bytea_array(bodies)],
+        )?;
+        Ok(())
+    }
+
     /// Reads a tree and checks it against its ID.
     ///
     /// # Errors
@@ -2360,6 +2856,27 @@ impl MetaTx for PgTx<'_> {
     /// decode or match.
     fn get_tree(&mut self, id: TreeId) -> Result<Tree> {
         load_tree(self.c, id).map(|(tree, _)| tree)
+    }
+
+    /// The stored bytes of the trees the ids name, in the order asked.
+    /// One statement per 1,000 ids: the ids travel as one bytea array.
+    fn get_trees(&mut self, ids: &[TreeId]) -> Result<Vec<Option<Vec<u8>>>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(crate::meta::DERIVED_BATCH) {
+            let keys: Vec<Vec<u8>> = chunk.iter().map(|id| id_bytes(id.as_bytes())).collect();
+            let rows = self.c.query(
+                "SELECT id, body FROM trees WHERE id = ANY($1)",
+                &[P::bytea_array(keys.clone())],
+            )?;
+            let mut bodies: std::collections::HashMap<Vec<u8>, Vec<u8>> = rows
+                .into_iter()
+                .map(|row| (row.get::<_, Vec<u8>>(0), row.get::<_, Vec<u8>>(1)))
+                .collect();
+            for key in keys {
+                out.push(bodies.remove(&key));
+            }
+        }
+        Ok(out)
     }
 
     /// Reads a tree's stored `TreeV1` bytes and checks them against its ID.
@@ -2492,16 +3009,24 @@ impl MetaTx for PgTx<'_> {
     }
 
     /// The pending lands that started more than `stale_secs` ago.
-    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<(RepoId, i64, String)>> {
+    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<StaleLand>> {
         let rows = self.c.query(
-            "SELECT repo_id, land_id, target_ref FROM lands
-             WHERE state = 'pending' AND created_at > 0
-                 AND created_at < now_epoch() - $1",
+            "SELECT l.repo_id, l.land_id, l.target_ref, l.caller, l.request_key, r.name
+             FROM lands l JOIN repos r ON r.repo_id = l.repo_id
+             WHERE l.state = 'pending' AND l.created_at > 0
+                 AND l.created_at < now_epoch() - $1",
             &[P::i64(stale_secs)],
         )?;
         Ok(rows
             .iter()
-            .map(|row| (RepoId(row.get(0)), row.get(1), row.get(2)))
+            .map(|row| StaleLand {
+                repo: RepoId(row.get(0)),
+                land_id: row.get(1),
+                target_ref: row.get(2),
+                caller: row.get(3),
+                request_key: row.get(4),
+                repo_name: row.get(5),
+            })
             .collect())
     }
 
@@ -2553,9 +3078,11 @@ impl MetaTx for PgTx<'_> {
             .transpose()
             .map_err(|e| Error::Corrupt(format!("land {land_id} result: {e}")))?;
         Ok(LandOutcome {
+            moved: false,
             land_id,
             state: LandState::parse(&state)?,
             result,
+            previous: None,
             detail,
             conflict_paths: decode_paths(&paths)
                 .ok_or_else(|| Error::Corrupt(format!("land {land_id} conflict paths")))?,
@@ -2573,8 +3100,8 @@ impl MetaTx for PgTx<'_> {
         conflict_paths: Vec<RepoPath>,
     ) -> Result<LandOutcome> {
         let updated = self.c.execute(
-            "UPDATE lands SET state = $3, result_cs = $4, detail = $5, conflict_paths = $6,
-                 finished_at = now_epoch()
+            "UPDATE lands SET state = $3, result_cs = $4, detail = $5,
+                 conflict_paths = $6, finished_at = now_epoch()
              WHERE repo_id = $1 AND land_id = $2 AND state = 'pending'",
             &[
                 P::i64(repo.0),
@@ -2591,9 +3118,11 @@ impl MetaTx for PgTx<'_> {
             )));
         }
         Ok(LandOutcome {
+            moved: false,
             land_id,
             state,
             result,
+            previous: None,
             detail,
             conflict_paths,
         })
@@ -2611,6 +3140,35 @@ impl MetaTx for PgTx<'_> {
                 P::bytes(&id_bytes(cs.as_bytes())),
             ],
         )?;
+        Ok(())
+    }
+
+    /// Records that the git commits became the changesets. One statement
+    /// per 1,000 pairs: the ids travel as one bytea array each, and the
+    /// conflict rule is the single row's, so a repeated pair is skipped.
+    fn put_git_imports(&mut self, repo: RepoId, pairs: &[(ObjectId, ChangesetId)]) -> Result<()> {
+        for chunk in pairs.chunks(crate::meta::DERIVED_BATCH) {
+            let oids: Vec<Vec<u8>> = chunk
+                .iter()
+                .map(|(oid, _)| oid.as_slice().to_vec())
+                .collect();
+            let css: Vec<Vec<u8>> = chunk
+                .iter()
+                .map(|(_, cs)| id_bytes(cs.as_bytes()))
+                .collect();
+            self.c.execute(
+                "INSERT INTO git_import (repo_id, git_algo, git_oid, cs)
+                 SELECT $1, $2, u.oid, u.cs
+                 FROM unnest($3::bytea[], $4::bytea[]) AS u(oid, cs)
+                 ON CONFLICT (repo_id, git_algo, git_oid) DO NOTHING",
+                &[
+                    P::i64(repo.0),
+                    P::i64(SHA1),
+                    P::bytea_array(oids),
+                    P::bytea_array(css),
+                ],
+            )?;
+        }
         Ok(())
     }
 
@@ -2756,12 +3314,18 @@ impl MetaTx for PgTx<'_> {
             .collect())
     }
 
-    /// The body of changeset `cs`, or `None` when it is not stored.
-    fn stored_changeset_body(&mut self, cs: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .c
-            .query_opt("SELECT body FROM changesets WHERE id = $1", &[P::bytes(cs)])?
-            .map(|row| row.get(0)))
+    /// The bodies of the changesets the ids name, as `(id, body)` for
+    /// every id that has a stored body. One statement: the ids travel as
+    /// one bytea array, and the reply has at most one row per id.
+    fn stored_changeset_bodies(&mut self, ids: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let rows = self.c.query(
+            "SELECT id, body FROM changesets WHERE id = ANY($1)",
+            &[P::bytea_array(ids.to_vec())],
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
     }
 
     /// The blobs that `repo` may name, all of them.
@@ -2778,6 +3342,16 @@ impl MetaTx for PgTx<'_> {
         self.c.execute(
             "DELETE FROM repo_blobs WHERE repo_id = $1 AND blob = $2",
             &[P::i64(repo.0), P::bytes(blob)],
+        )?;
+        Ok(())
+    }
+
+    /// Removes the rows that name any of `blobs` for `repo`. One
+    /// statement: the blobs travel as one bytea array.
+    fn delete_repo_blobs(&mut self, repo: RepoId, blobs: &[Vec<u8>]) -> Result<()> {
+        self.c.execute(
+            "DELETE FROM repo_blobs WHERE repo_id = $1 AND blob = ANY($2)",
+            &[P::i64(repo.0), P::bytea_array(blobs.to_vec())],
         )?;
         Ok(())
     }
@@ -2944,6 +3518,115 @@ impl MetaTx for PgTx<'_> {
     }
 }
 
+/// The statement helpers of [`PgTx::bulk_seed`], outside the trait impl:
+/// each inserts its rows in batches of 1,000 through one `unnest`.
+#[cfg(any(test, feature = "test-hooks"))]
+impl PgTx<'_> {
+    fn insert_seed_changesets(&mut self, rows: &[(Vec<u8>, i64, Vec<u8>)]) -> Result<()> {
+        const CHUNK: usize = 1_000;
+        for chunk in rows.chunks(CHUNK) {
+            let ids = chunk
+                .iter()
+                .map(|(id, _, _)| id.clone())
+                .collect::<Vec<_>>();
+            let gens = chunk
+                .iter()
+                .map(|(_, generation, _)| *generation)
+                .collect::<Vec<_>>();
+            let bodies = chunk
+                .iter()
+                .map(|(_, _, body)| body.clone())
+                .collect::<Vec<_>>();
+            self.c.execute(
+                "INSERT INTO changesets (id, gen, body)
+                 SELECT * FROM unnest($1::bytea[], $2::int8[], $3::bytea[])
+                 ON CONFLICT (id) DO NOTHING",
+                &[
+                    P::bytea_array(ids),
+                    P::i64_array(gens),
+                    P::bytea_array(bodies),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn insert_seed_parents(&mut self, rows: &[(Vec<u8>, i64, Vec<u8>)]) -> Result<()> {
+        const CHUNK: usize = 1_000;
+        for chunk in rows.chunks(CHUNK) {
+            let css = chunk
+                .iter()
+                .map(|(cs, _, _)| cs.clone())
+                .collect::<Vec<_>>();
+            let ns = chunk.iter().map(|(_, n, _)| *n).collect::<Vec<_>>();
+            let parents = chunk
+                .iter()
+                .map(|(_, _, parent)| parent.clone())
+                .collect::<Vec<_>>();
+            self.c.execute(
+                "INSERT INTO changeset_parents (cs, n, parent)
+                 SELECT * FROM unnest($1::bytea[], $2::int8[], $3::bytea[])
+                 ON CONFLICT (cs, n) DO NOTHING",
+                &[
+                    P::bytea_array(css),
+                    P::i64_array(ns),
+                    P::bytea_array(parents),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn insert_seed_members(&mut self, rows: &[(i64, Vec<u8>)]) -> Result<()> {
+        const CHUNK: usize = 1_000;
+        for chunk in rows.chunks(CHUNK) {
+            let repos = chunk.iter().map(|(repo, _)| *repo).collect::<Vec<_>>();
+            let css = chunk.iter().map(|(_, cs)| cs.clone()).collect::<Vec<_>>();
+            self.c.execute(
+                "INSERT INTO repo_changesets (repo_id, cs)
+                 SELECT * FROM unnest($1::int8[], $2::bytea[])
+                 ON CONFLICT (repo_id, cs) DO NOTHING",
+                &[P::i64_array(repos), P::bytea_array(css)],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn insert_seed_derived(
+        &mut self,
+        rows: &[(&'static str, i64, Vec<u8>, Vec<u8>)],
+    ) -> Result<()> {
+        const CHUNK: usize = 1_000;
+        for chunk in rows.chunks(CHUNK) {
+            let kinds = chunk.iter().map(|(kind, ..)| *kind).collect::<Vec<_>>();
+            let versions = chunk
+                .iter()
+                .map(|(_, version, ..)| *version)
+                .collect::<Vec<_>>();
+            let css = chunk
+                .iter()
+                .map(|(_, _, cs, _)| cs.clone())
+                .collect::<Vec<_>>();
+            let values = chunk
+                .iter()
+                .map(|(_, _, _, value)| value.clone())
+                .collect::<Vec<_>>();
+            self.c.execute(
+                "INSERT INTO derived (kind, version, cs, value)
+                 SELECT * FROM unnest($1::text[], $2::int8[], $3::bytea[], $4::bytea[])
+                 ON CONFLICT (kind, version, cs) DO NOTHING",
+                &[
+                    P::text_array(kinds),
+                    P::i64_array(versions),
+                    P::bytea_array(css),
+                    P::bytea_array(values),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+}
+
 impl Meta for Pg {
     type Tx<'a>
         = PgTx<'a>
@@ -3005,6 +3688,54 @@ mod tests {
         assert_eq!(
             merged_options(Some("--search_path=scion_test_1"), OWN),
             format!("--search_path=scion_test_1 {OWN}")
+        );
+    }
+
+    /// A URL whose `search_path` names no existing schema refuses with
+    /// the fix named, not 'unreachable': the database answered, and
+    /// only the schema is missing.
+    #[test]
+    fn a_search_path_that_names_no_schema_refuses_with_the_fix() {
+        if !crate::Backend::test_is_postgres() {
+            return;
+        }
+        let url = crate::backend::test_hooks::test_url().unwrap();
+        let mut client = Client::connect(&url, NoTls).unwrap();
+        let setup = super::Setup::new(Some("scion_test_missing"), true, &mut client);
+        assert!(!setup.ok(), "a missing schema cannot hold the setup");
+        let error = super::setup_error(&setup, false);
+        assert!(
+            error
+                .to_string()
+                .contains("the URL's search_path names no existing schema; create it first"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_53100_database_error_is_disk_full_with_the_fixed_reply() {
+        use super::pg_error_of;
+        use crate::{Error, StorageClass};
+        // A source of the right type with no SQLSTATE of its own: a
+        // connect to port 1, which every kernel refuses. The mapping
+        // runs on the SQLSTATE the test hands it, not on this source.
+        let Err(refused) = Client::connect("postgres://127.0.0.1:1/x", NoTls) else {
+            panic!("a connect to port 1 is refused");
+        };
+        assert!(!refused.is_closed());
+        assert!(refused.code().is_none());
+        let error = pg_error_of(Some("53100"), refused);
+        assert!(
+            matches!(&error, Error::Storage(s) if s.class() == StorageClass::DiskFull),
+            "{error:?}"
+        );
+        // The reply the client sees is the fixed one: it names the
+        // shortage and the retry, not the server path.
+        let status = tonic::Status::from(error);
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            status.message(),
+            "the server is out of disk space; retry later"
         );
     }
 
@@ -3606,5 +4337,55 @@ mod pool_tests {
             .filter(|out| matches!(out, Err(Error::ResourceExhausted(_))))
             .count();
         assert_eq!((recorded, refused), (1, 1), "{results:?}");
+    }
+
+    /// The out-of-space SQLSTATEs of the Postgres docs' class 53 and 58:
+    /// which map to the fixed `ResourceExhausted` shortage and which
+    /// stay internal, and that the decision is the same for every code.
+    #[test]
+    fn the_disk_full_sqlstates_answer_the_fixed_shortage() {
+        use super::pg_error_of;
+        use crate::{Error, StorageClass};
+        // A source of the right type with no SQLSTATE of its own: a
+        // connect to port 1, which every kernel refuses. The mapping
+        // runs on the SQLSTATE the test hands it, not on this source.
+        let source = || match Client::connect("postgres://127.0.0.1:1/x", NoTls) {
+            Ok(_) => panic!("a connect to port 1 is refused"),
+            Err(refused) => refused,
+        };
+        let full = |code: &str| {
+            let error = pg_error_of(Some(code), source());
+            (
+                matches!(&error, Error::Storage(s) if s.class() == StorageClass::DiskFull),
+                tonic::Status::from(error),
+            )
+        };
+        // 53100: the database's one disk-full code, for every file kind
+        // (elog.c maps ENOSPC to it). The client sees the fixed
+        // retry-later reply.
+        {
+            let (full, status) = full("53100");
+            assert!(full, "53100 must map to the disk-full storage class");
+            assert_eq!(status.code(), tonic::Code::ResourceExhausted, "53100");
+            assert_eq!(
+                status.message(),
+                "the server is out of disk space; retry later",
+                "53100"
+            );
+        }
+        // The codes of the same classes that are NOT a disk shortage
+        // stay internal, on purpose: 53200 is out of memory, 53000 is
+        // the class's catch-all, 53400 is a configured cap (a
+        // temp_file_limit or the replication slots - the same refusal
+        // every time, so a retry-later reply would tell the client to
+        // retry what cannot succeed), and 58030 is an io_error (a
+        // failing device is the EIO row's internal, not a space
+        // shortage). Pinning them keeps a later "helpful" widening from
+        // answering a memory error with a disk reply.
+        for code in ["53200", "53000", "53400", "58030"] {
+            let (full, status) = full(code);
+            assert!(!full, "{code} must not map to the disk-full class");
+            assert_eq!(status.code(), tonic::Code::Internal, "{code}");
+        }
     }
 }

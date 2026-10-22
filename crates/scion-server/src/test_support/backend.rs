@@ -65,6 +65,31 @@ impl Backend {
         refuse_postgres_marker(data)?;
         Self::open_shared(data, None, None)
     }
+    /// [`Backend::open_test_shared`], for a store the suite reopens from
+    /// another path than the one its first open used: the power suite
+    /// reopens from the backing directory, whose path would name a
+    /// fresh, empty schema, while the metadata lives in the database the
+    /// first open filled. The schema follows the store, not the path.
+    ///
+    /// # Errors
+    ///
+    /// What the store or the database returns, and a missing test URL.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn open_test_shared_in_schema(data: &Path, schema: &str) -> Result<Self> {
+        if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
+            refuse_damaged_marker(data)?;
+            let marker = Marker::read(data);
+            refuse_sqlite_dir(data)?;
+            let pg = Pg::open_test_shared(&test_url()?, schema, PG_READERS, data, marker)?;
+            marker_agrees(data, pg.store_uuid())?;
+            return Ok(Self {
+                inner: Inner::Postgres(pg),
+            });
+        }
+        refuse_postgres_marker(data)?;
+        Self::open_shared(data, None, None)
+    }
     /// Opens the backend that `SCION_TEST_BACKEND` names, for the
     /// integration tests: `postgres` runs them against a Postgres database,
     /// whose URL comes from `SCION_TEST_POSTGRES_URL`; any other value, or
@@ -98,6 +123,42 @@ impl Backend {
     #[must_use]
     pub fn test_is_postgres() -> bool {
         std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres")
+    }
+
+    /// The Postgres statements this process has run since the last
+    /// reset. The land round-trip guard measures the delta around one
+    /// land; on SQLite the count is always zero, which is why the guard
+    /// skips there.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn test_statement_count() -> u64 {
+        crate::pg::test_statement_count()
+    }
+
+    /// Sets the statement count back to zero.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_reset_statement_count() {
+        crate::pg::test_reset_statement_count();
+    }
+
+    /// Whether the server's first stale-land sweep has finished: a test
+    /// that counts a call's statements waits for it, so the sweep's own
+    /// statements cannot fall inside its window.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn test_first_sweep_done() -> bool {
+        crate::service::TEST_FIRST_SWEEP_DONE.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The SQL of the statements run since the last reset.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn test_statement_log() -> Vec<String> {
+        crate::pg::test_statement_log()
     }
     /// The schema that [`Backend::open_test`] gave this data directory on
     /// Postgres: a test that counts rows through its own Postgres client
@@ -134,6 +195,18 @@ impl Backend {
         match &self.inner {
             Inner::Sqlite(store) => store.commits(),
             Inner::Postgres(_) => 0,
+        }
+    }
+    /// The commit count a completed flush last covered, so every commit
+    /// below it is durable. SQLite only: a Postgres commit is durable when
+    /// it returns (`synchronous_commit = on`).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn flushed_upto(&self) -> u64 {
+        match &self.inner {
+            Inner::Sqlite(store) => store.flushed_upto(),
+            Inner::Postgres(_) => u64::MAX,
         }
     }
     /// Sets how many of the next commits of the data directory fail as a
@@ -226,7 +299,29 @@ pub(crate) fn test_url() -> Result<String> {
 /// test-hooks feature, and so does this.
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn test_schema(data: &Path) -> String {
-    let path = data.canonicalize().unwrap_or_else(|_| data.to_path_buf());
+    // The hash must not move when the leaf directory appears: a first
+    // open of a data directory that does not exist yet would otherwise
+    // hash the raw path (on macOS /var is a symlink to /private/var, so
+    // the raw and the canonical spellings hash apart), and every open
+    // after the directory exists would hash the canonical one. The
+    // canonical form of the deepest existing ancestor, with the missing
+    // tail spelled as the caller spelled it, is one name for both.
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = data.to_path_buf();
+    let base = loop {
+        match cur.canonicalize() {
+            Ok(base) => break base,
+            Err(_) => match cur.file_name() {
+                Some(name) => {
+                    tail.push(name.to_owned());
+                    cur.pop();
+                }
+                None => break cur,
+            },
+        }
+    };
+    let tail: std::path::PathBuf = tail.into_iter().rev().collect();
+    let path = base.join(tail);
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(&path, &mut hasher);
     format!("scion_test_{:016x}", std::hash::Hasher::finish(&hasher))

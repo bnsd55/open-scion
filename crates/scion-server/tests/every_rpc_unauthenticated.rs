@@ -516,11 +516,7 @@ async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
     let (dir, store, root) = store().await;
     let (stop, url) = serve(&store, dir.path(), access()).await;
 
-    let channel = Channel::from_shared(url.clone())
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(&url).await.unwrap();
     let none = client_with(channel.clone(), None);
     let wrong = client_with(channel.clone(), Some("wrong"));
     let mut ci = client_with(channel, Some("ci"));
@@ -648,3 +644,6 @@ async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
 
     stop.send(()).ok();
 }
+
+#[path = "common/mod.rs"]
+mod common;

@@ -90,7 +90,7 @@ die() {
   exit 1
 }
 
-# The stand-in ladder of scripts/store-upgrade.sh (coder3, #428): until
+# The stand-in ladder of scripts/store-upgrade.sh (#428): until
 # the first release tag, N-1 is the newest of these two pinned commits,
 # chosen where the store schema changed (8: read rules per folder, 9:
 # view memo). One resolution, two users: whoever lands second rebases
@@ -517,7 +517,7 @@ pair_5() {
   # A key that is not the server's, made by the OTHER build's tool: if
   # the two versions disagreed on the key format, the refusal below
   # would catch it.
-  "$cache/scion-server" ticket-key --out "$dir/wrong.key" \
+  "$cache/scion-server" --data "$dir/server" ticket-key --out "$dir/wrong.key" \
     >"$dir/wrong.pub" || die "pair '$PAIR' ($SIDE): the second ticket-key failed"
   sport=$(start server "$dir" "$srv/scion-server" port --data "$dir/server" serve \
     --listen 127.0.0.1:0 --ticket-key "$dir/ticket.key")
