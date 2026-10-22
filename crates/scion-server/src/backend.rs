@@ -18,7 +18,7 @@ use crate::db::SqliteTx;
 use crate::error::Result;
 use crate::history::NodeId;
 use crate::land::{LandOutcome, LandRequest, LandState};
-use crate::meta::{FsckDerivedRow, Meta, MetaTx, RefState, RepoChangeset, RepoId};
+use crate::meta::{FsckDerivedRow, Meta, MetaTx, RefState, RepoChangeset, RepoId, StaleLand};
 use crate::pg::{Pg, PgTx};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -699,7 +699,7 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
-    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<(RepoId, i64, String)>> {
+    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<StaleLand>> {
         match self {
             Self::Sqlite(tx) => tx.stale_lands(stale_secs),
             Self::Postgres(pg) => pg.stale_lands(stale_secs),
