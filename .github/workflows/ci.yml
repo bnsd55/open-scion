@@ -309,8 +309,6 @@ jobs:
           PROPTEST_CASES: "64"
           SCION_TEST_BACKEND: postgres
           SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
-          SCION_TEST_BACKEND: postgres
-          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
           # The backup test dumps the live metadata with the job's own
           # Postgres, so its tools match the server: the container name
           # points at the service container above, and the test never
