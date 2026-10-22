@@ -566,6 +566,18 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn first_parent_page(
+        &mut self,
+        repo: RepoId,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, i64, Vec<u8>)>> {
+        match self {
+            Self::Sqlite(tx) => tx.first_parent_page(repo, start, limit),
+            Self::Postgres(pg) => pg.first_parent_page(repo, start, limit),
+        }
+    }
+
     fn generation(&mut self, repo: RepoId, id: ChangesetId) -> Result<i64> {
         match self {
             Self::Sqlite(tx) => tx.generation(repo, id),
@@ -679,6 +691,13 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.get_tree(id),
             Self::Postgres(pg) => pg.get_tree(id),
+        }
+    }
+
+    fn get_trees(&mut self, ids: &[TreeId]) -> Result<Vec<Option<Vec<u8>>>> {
+        match self {
+            Self::Sqlite(tx) => tx.get_trees(ids),
+            Self::Postgres(pg) => pg.get_trees(ids),
         }
     }
 
@@ -970,6 +989,19 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn get_derived_chain(
+        &mut self,
+        kind: &str,
+        version: u32,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, Vec<u8>)>> {
+        match self {
+            Self::Sqlite(tx) => tx.get_derived_chain(kind, version, start, limit),
+            Self::Postgres(pg) => pg.get_derived_chain(kind, version, start, limit),
+        }
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     fn bulk_seed(
         &mut self,
@@ -1038,6 +1070,13 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.put_git_import(repo, oid, cs),
             Self::Postgres(pg) => pg.put_git_import(repo, oid, cs),
+        }
+    }
+
+    fn put_git_imports(&mut self, repo: RepoId, pairs: &[(ObjectId, ChangesetId)]) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.put_git_imports(repo, pairs),
+            Self::Postgres(pg) => pg.put_git_imports(repo, pairs),
         }
     }
 

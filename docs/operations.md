@@ -705,7 +705,9 @@ Proof: crates/scion-server/tests/backup.rs::a_backup_taken_while_serving_restore
 The schema version lives in the database. On open, a server migrates an
 older schema forward, one migration per released version, each in one
 transaction, with its progress in the log (a migration can take a while:
-schema 4 walks every repo's changesets). Two rules:
+schema 4 walks every repo's changesets; on Postgres, schema 5 renumbers
+the changeset parents from one to zero, the numbering SQLite always
+wrote). Two rules:
 
 - A database with a **newer** schema than the binary refuses to open:
   `corrupt data: database schema version 7 is newer than this build (6)`.

@@ -346,4 +346,10 @@ impl Tree {
     pub fn entries(&self) -> &BTreeMap<PathElem, Entry> {
         &self.entries
     }
+
+    /// Takes the entries, by name, sorted by raw name bytes.
+    #[must_use]
+    pub fn into_entries(self) -> BTreeMap<PathElem, Entry> {
+        self.entries
+    }
 }

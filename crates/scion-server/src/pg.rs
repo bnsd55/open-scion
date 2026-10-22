@@ -56,7 +56,7 @@ use crate::store::Blobs;
 pub(crate) mod test_hooks;
 
 /// The schema version this build makes and reads.
-pub(crate) const PG_SCHEMA_VERSION: u32 = 4;
+pub(crate) const PG_SCHEMA_VERSION: u32 = 5;
 
 /// How long a call may wait for a Postgres reader before the server
 /// answers [`Error::Unavailable`]. Well below the 600 s call deadline:
@@ -86,6 +86,7 @@ const PG_MIGRATIONS: [&str; PG_SCHEMA_VERSION as usize] = [
     include_str!("../migrations/postgres/0002_view_roots.sql"),
     include_str!("../migrations/postgres/0003_view_trees.sql"),
     include_str!("../migrations/postgres/0004_store_uuid.sql"),
+    include_str!("../migrations/postgres/0005_parent_numbering.sql"),
 ];
 
 /// The fence of a process that lost the one-server lock. The worker of
@@ -2096,11 +2097,12 @@ impl MetaTx for PgTx<'_> {
             ],
         )?;
         // Every parent as one statement, however many a merge has: the
-        // row number is the parent's place in the array.
+        // row number is the parent's place in the array. SQLite numbers
+        // the rows from zero, so the ordinality (one-based) shifts down.
         if !parents.is_empty() {
             self.c.execute(
                 "INSERT INTO changeset_parents (cs, n, parent)
-                 SELECT $1, ord, parent
+                 SELECT $1, ord - 1, parent
                  FROM unnest($2::bytea[]) WITH ORDINALITY AS parents(parent, ord)
                  ON CONFLICT (cs, n) DO NOTHING",
                 &[
@@ -2218,6 +2220,47 @@ impl MetaTx for PgTx<'_> {
                 &[P::i64(repo.0), P::bytes(&id_bytes(id.as_bytes()))],
             )?
             .is_some())
+    }
+
+    /// One page of the first-parent chain, one statement: the recursive
+    /// term follows the indexed first-parent rows (cs, n = 0), so every
+    /// hop is one index lookup, and the join carries the generation and
+    /// the body. Every fetched changeset is an ancestor of `start`, so
+    /// the repo check rides the start row, as `get_changeset` checks it.
+    fn first_parent_page(
+        &mut self,
+        repo: RepoId,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, i64, Vec<u8>)>> {
+        let rows = self.c.query(
+            "WITH RECURSIVE walk(id, depth) AS (
+                     SELECT rc.cs, 0::bigint FROM repo_changesets rc
+                     WHERE rc.repo_id = $1 AND rc.cs = $2
+                     UNION ALL
+                     SELECT cp.parent, w.depth + 1
+                     FROM walk w
+                     JOIN changeset_parents cp ON cp.cs = w.id AND cp.n = 0
+                     WHERE w.depth < $3
+                 )
+                 SELECT c.id, c.gen, c.body FROM walk
+                 JOIN changesets c ON c.id = walk.id
+                 ORDER BY walk.depth",
+            &[
+                P::i64(repo.0),
+                P::bytes(&id_bytes(start.as_bytes())),
+                P::i64(limit),
+            ],
+        )?;
+        if rows.is_empty() {
+            return Err(Error::NotFound(format!("changeset {start}")));
+        }
+        rows.into_iter()
+            .map(|row| {
+                let cs: Vec<u8> = row.get(0);
+                Ok((to_id(&cs)?, row.get(1), row.get(2)))
+            })
+            .collect()
     }
 
     /// The generation of a changeset that `repo` may see.
@@ -2503,6 +2546,46 @@ impl MetaTx for PgTx<'_> {
             .collect()
     }
 
+    fn get_derived_chain(
+        &mut self,
+        kind: &str,
+        version: u32,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, Vec<u8>)>> {
+        // One statement for the whole chain: the recursive term follows the
+        // indexed first-parent rows (cs, n = 0), so every hop is one index
+        // lookup, and the join keeps only the rows that carry a stored
+        // value. Every fetched changeset is an ancestor of `start`, so no
+        // repo filter is needed.
+        let version = i64::from(version);
+        let rows = self.c.query(
+            "WITH RECURSIVE walk(id, depth) AS (
+                 SELECT $1::bytea, 0::bigint
+                 UNION ALL
+                 SELECT cp.parent, w.depth + 1
+                 FROM walk w
+                 JOIN changeset_parents cp ON cp.cs = w.id AND cp.n = 0
+                 WHERE w.depth < $2
+             )
+             SELECT d.cs, d.value FROM walk
+             JOIN derived d ON d.cs = walk.id
+             WHERE d.kind = $3 AND d.version = $4",
+            &[
+                P::bytes(id_bytes(start.as_bytes()).as_slice()),
+                P::i64(limit),
+                P::text(kind),
+                P::i64(version),
+            ],
+        )?;
+        rows.into_iter()
+            .map(|row| {
+                let cs: Vec<u8> = row.get(0);
+                Ok((to_id(&cs)?, row.get(1)))
+            })
+            .collect()
+    }
+
     /// The test seed, in batches: the changesets, their parents, the repo
     /// membership, and the derived rows, 1,000 rows per statement.
     /// Parents must come before their children in `css`, so the
@@ -2775,6 +2858,27 @@ impl MetaTx for PgTx<'_> {
         load_tree(self.c, id).map(|(tree, _)| tree)
     }
 
+    /// The stored bytes of the trees the ids name, in the order asked.
+    /// One statement per 1,000 ids: the ids travel as one bytea array.
+    fn get_trees(&mut self, ids: &[TreeId]) -> Result<Vec<Option<Vec<u8>>>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(crate::meta::DERIVED_BATCH) {
+            let keys: Vec<Vec<u8>> = chunk.iter().map(|id| id_bytes(id.as_bytes())).collect();
+            let rows = self.c.query(
+                "SELECT id, body FROM trees WHERE id = ANY($1)",
+                &[P::bytea_array(keys.clone())],
+            )?;
+            let mut bodies: std::collections::HashMap<Vec<u8>, Vec<u8>> = rows
+                .into_iter()
+                .map(|row| (row.get::<_, Vec<u8>>(0), row.get::<_, Vec<u8>>(1)))
+                .collect();
+            for key in keys {
+                out.push(bodies.remove(&key));
+            }
+        }
+        Ok(out)
+    }
+
     /// Reads a tree's stored `TreeV1` bytes and checks them against its ID.
     ///
     /// # Errors
@@ -3036,6 +3140,35 @@ impl MetaTx for PgTx<'_> {
                 P::bytes(&id_bytes(cs.as_bytes())),
             ],
         )?;
+        Ok(())
+    }
+
+    /// Records that the git commits became the changesets. One statement
+    /// per 1,000 pairs: the ids travel as one bytea array each, and the
+    /// conflict rule is the single row's, so a repeated pair is skipped.
+    fn put_git_imports(&mut self, repo: RepoId, pairs: &[(ObjectId, ChangesetId)]) -> Result<()> {
+        for chunk in pairs.chunks(crate::meta::DERIVED_BATCH) {
+            let oids: Vec<Vec<u8>> = chunk
+                .iter()
+                .map(|(oid, _)| oid.as_slice().to_vec())
+                .collect();
+            let css: Vec<Vec<u8>> = chunk
+                .iter()
+                .map(|(_, cs)| id_bytes(cs.as_bytes()))
+                .collect();
+            self.c.execute(
+                "INSERT INTO git_import (repo_id, git_algo, git_oid, cs)
+                 SELECT $1, $2, u.oid, u.cs
+                 FROM unnest($3::bytea[], $4::bytea[]) AS u(oid, cs)
+                 ON CONFLICT (repo_id, git_algo, git_oid) DO NOTHING",
+                &[
+                    P::i64(repo.0),
+                    P::i64(SHA1),
+                    P::bytea_array(oids),
+                    P::bytea_array(css),
+                ],
+            )?;
+        }
         Ok(())
     }
 

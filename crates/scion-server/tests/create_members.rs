@@ -5,8 +5,13 @@
 
 use scion_core::{BlobId, Changeset, FileState, IdentityTime, RepoPath};
 use scion_server::Backend;
+use scion_server::test_support::deadline::Deadline;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::write::create_changeset;
+
+fn later() -> Deadline {
+    Deadline::new(std::time::Instant::now() + std::time::Duration::from_secs(600))
+}
 use std::collections::BTreeMap;
 
 const REPO: &str = "main";
@@ -84,7 +89,7 @@ fn refused_statements(store: &Backend, n: usize, parent: scion_core::ChangesetId
     let bytes = refused(n, parent);
     Backend::test_reset_statement_count();
     // No file backs the rows, so the file check refuses the changeset.
-    let err = create_changeset(store, REPO, &bytes).unwrap_err();
+    let err = create_changeset(store, REPO, &bytes, &later()).unwrap_err();
     assert!(
         err.to_string().contains("is not stored"),
         "the refusal is the member check's: {err}"
@@ -132,7 +137,7 @@ fn a_refused_changeset_names_the_first_missing_put() {
         ]),
     )
     .expect("changeset fits the format");
-    let err = create_changeset(&store, REPO, &cs.encode()).unwrap_err();
+    let err = create_changeset(&store, REPO, &cs.encode(), &later()).unwrap_err();
     let text = err.to_string();
     assert!(
         text.contains("\"m/one\""),
@@ -163,7 +168,7 @@ fn a_blob_the_repo_lacks_is_refused_even_when_its_file_is_stored() {
         )]),
     )
     .expect("changeset fits the format");
-    let err = create_changeset(&store, REPO, &cs.encode()).unwrap_err();
+    let err = create_changeset(&store, REPO, &cs.encode(), &later()).unwrap_err();
     let text = err.to_string();
     assert!(
         text.contains("\"s/x\"") && text.contains("is not stored"),

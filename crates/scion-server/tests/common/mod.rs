@@ -227,9 +227,76 @@ impl Server {
         Self::spawn_on("One server", data, log)
     }
 
-    /// Starts a server on `data` with the guide's own command, and does
-    /// not wait for it.
     pub(crate) fn spawn_on(heading: &'static str, data: &Path, log: &Path) -> Self {
+        let postgres_url = if Backend::test_is_postgres() {
+            Some(postgres_url(data))
+        } else {
+            None
+        };
+        Self::spawn_with_url(heading, data, postgres_url.as_deref(), log)
+    }
+
+    /// Starts a server on `data` whose Postgres metadata is the one the
+    /// opens of `schema_source` filled: the power suite reopens a store
+    /// from the backing directory, whose path names another schema, and
+    /// the store it must serve is the one the first open filled. The
+    /// schema follows the store, not the path; SQLite ignores the
+    /// source, because the metadata is the directory either way. It
+    /// waits until the server listens, and proves the backend it was
+    /// asked for before it returns: the data directory carries the
+    /// Postgres marker and no SQLite database, so a run whose spawn lost
+    /// its `--postgres-url` fails here, not vacuously as a second
+    /// SQLite run.
+    pub(crate) fn start_reopened(data: &Path, schema_source: &Path, log: &Path) -> Self {
+        let mut server = Self::spawn_reopened("One server", data, schema_source, log);
+        let start = Instant::now();
+        while !server.listens(log) {
+            if let Some(status) = server.child.try_wait().unwrap() {
+                let log = fs::read_to_string(log).unwrap_or_default();
+                panic!("the server exited with {status}:\n{log}");
+            }
+            assert!(start.elapsed() < Duration::from_secs(60), "no listen");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if Backend::test_is_postgres() {
+            let marker = fs::read_to_string(data.join("backend")).unwrap_or_default();
+            assert_eq!(
+                marker.lines().next(),
+                Some("postgres"),
+                "the server is not Postgres-backed: marker {marker:?}"
+            );
+            assert!(
+                !data.join("scion.db").exists(),
+                "a Postgres-backed server must not keep a SQLite database"
+            );
+        }
+        server
+    }
+
+    /// Starts a server on `data` the guide's own command, and does
+    /// not wait for it. The Postgres schema is the one `schema_source`'s
+    /// opens took, not the one `data`'s path names: the schema follows
+    /// the store, not the path.
+    pub(crate) fn spawn_reopened(
+        heading: &'static str,
+        data: &Path,
+        schema_source: &Path,
+        log: &Path,
+    ) -> Self {
+        let postgres_url = if Backend::test_is_postgres() {
+            Some(postgres_url(schema_source))
+        } else {
+            None
+        };
+        Self::spawn_with_url(heading, data, postgres_url.as_deref(), log)
+    }
+
+    fn spawn_with_url(
+        heading: &'static str,
+        data: &Path,
+        postgres_url: Option<&str>,
+        log: &Path,
+    ) -> Self {
         let argv = Self::guide_argv(heading, data);
         let log_file = fs::OpenOptions::new()
             .create(true)
@@ -264,11 +331,6 @@ impl Server {
         // `Backend::open_test` gives it. The URL carries the schema as a
         // libpq `options` parameter, which the open merges with its own
         // options, so the tables and rows of this directory land in it.
-        let postgres_url = if Backend::test_is_postgres() {
-            Some(postgres_url(data))
-        } else {
-            None
-        };
         // The child shares a flock until it execs (see `spawn_guard`): the
         // read side keeps this spawn out of a lock-release window of
         // another test.
@@ -354,6 +416,21 @@ pub(crate) fn open_store(data: &Path) -> Backend {
 pub(crate) fn open_store_shared(data: &Path) -> Backend {
     if Backend::test_is_postgres() {
         Backend::open_test_shared(data).unwrap()
+    } else {
+        from_store(Store::open_shared(data).unwrap())
+    }
+}
+
+/// [`open_store_shared`], for a store the suite reopens from another
+/// path than the one its first open used: the power suite reopens from
+/// the backing directory, whose path would name a fresh, empty schema,
+/// while the metadata lives in the database the first open filled. The
+/// schema follows the store, not the path; SQLite ignores the source,
+/// because the metadata is the directory either way.
+pub(crate) fn open_store_shared_reopened(data: &Path, schema_source: &Path) -> Backend {
+    if Backend::test_is_postgres() {
+        let schema = Backend::test_schema(schema_source).expect("postgres mode names a schema");
+        Backend::open_test_shared_in_schema(data, &schema).unwrap()
     } else {
         from_store(Store::open_shared(data).unwrap())
     }
@@ -1131,6 +1208,7 @@ pub(crate) fn check_lands(ledger: &Ledger, history: &HashMap<ChangesetId, (&str,
 pub(crate) async fn check(
     url: &str,
     data: &Path,
+    schema_source: &Path,
     ledger: &mut Ledger,
     checked: &mut Checked,
     rng: &mut Rng,
@@ -1182,8 +1260,11 @@ pub(crate) async fn check(
     // file: a file reaches its name only whole. The store is the same
     // backend the server serves: a SQLite open here would create the
     // data directory's scion.db beside a Postgres server, and the
-    // restart after the cut would refuse the directory.
-    let store = open_store_shared(data);
+    // restart after the cut would refuse the directory. The schema
+    // follows the store, not the path: a reopen from the backing
+    // directory walks another path, whose name would be a fresh, empty
+    // schema.
+    let store = open_store_shared_reopened(data, schema_source);
     let (named, pending) = metadata(&store, &mut checked.rows);
     assert_eq!(pending, 0, "every land sent was retried");
     let files = blob_files(data);

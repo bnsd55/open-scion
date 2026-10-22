@@ -136,6 +136,10 @@ pub trait Meta: Send + Sync + 'static {
 /// batch covers one step.
 pub(crate) const DERIVED_BATCH: usize = 1_000;
 
+/// [`DERIVED_BATCH`] as the chain limit the statements take.
+#[allow(clippy::cast_possible_wrap)] // 1,000, far from any wrap
+pub(crate) const DERIVED_BATCH_I64: i64 = DERIVED_BATCH as i64;
+
 /// The queries on the metadata tables. Every query fails with a database
 /// error, or with the `NotFound` or `Corrupt` error that its doc says; the
 /// docs do not repeat that per method. A query may be called in a read or
@@ -153,6 +157,24 @@ pub trait MetaTx {
 
     /// Reads a changeset of `repo`, and checks it against its ID.
     fn get_changeset(&mut self, repo: RepoId, id: ChangesetId) -> Result<Changeset>;
+
+    /// `start` and up to `limit - 1` of its first-parent ancestors, as
+    /// (id, generation, body), newest first, in walk order: the page one
+    /// statement fetches where the backend can. Every row is an ancestor
+    /// of `start`, so the repo check rides the start row alone, as
+    /// [`MetaTx::get_changeset`] checks it. The page is short at the root
+    /// of the history.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if `repo` does not hold `start`.
+    /// [`Error::Corrupt`] if a row's id is not a changeset id.
+    fn first_parent_page(
+        &mut self,
+        repo: RepoId,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, i64, Vec<u8>)>>;
 
     /// Whether `repo` may see changeset `id`.
     fn has_changeset(&mut self, repo: RepoId, id: ChangesetId) -> Result<bool>;
@@ -220,6 +242,21 @@ pub trait MetaTx {
         version: u32,
         ids: &[ChangesetId],
     ) -> Result<Vec<Option<Vec<u8>>>>;
+
+    /// The stored bytes of the derived values on the first-parent chain
+    /// that starts at `start`: `start` itself and up to `limit - 1` of its
+    /// ancestors, following first parents. One statement: the chain follows
+    /// the indexed first-parent rows, and every fetched changeset is an
+    /// ancestor of `start`, so no repo filter is needed. A changeset
+    /// without a stored value has no row, as [`MetaTx::get_derived`]
+    /// would. `limit` bounds the hops.
+    fn get_derived_chain(
+        &mut self,
+        kind: &str,
+        version: u32,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, Vec<u8>)>>;
 
     /// Writes a test seed: `css` oldest first, every parent before its
     /// children, file-less (no tree entries, no blobs), and the derived
@@ -320,6 +357,11 @@ pub trait MetaTx {
     /// Reads a tree, and checks it against its ID.
     fn get_tree(&mut self, id: TreeId) -> Result<Tree>;
 
+    /// The stored bytes of the trees the ids name, in the order asked:
+    /// `None` for an id that is not stored. Unchecked bytes: the caller
+    /// decodes each and checks it against its id, as `get_tree` does.
+    fn get_trees(&mut self, ids: &[TreeId]) -> Result<Vec<Option<Vec<u8>>>>;
+
     /// Reads a tree's stored `TreeV1` bytes, checked against its ID.
     fn get_tree_body(&mut self, id: TreeId) -> Result<Vec<u8>>;
 
@@ -390,6 +432,10 @@ pub trait MetaTx {
 
     /// Records that a git commit became the changeset. Safe to repeat.
     fn put_git_import(&mut self, repo: RepoId, oid: ObjectId, cs: ChangesetId) -> Result<()>;
+
+    /// Records that the git commits became the changesets, all of the
+    /// pairs, in one statement where the backend can. Safe to repeat.
+    fn put_git_imports(&mut self, repo: RepoId, pairs: &[(ObjectId, ChangesetId)]) -> Result<()>;
 
     /// Every git commit already imported into `repo`.
     fn imported_commits(
