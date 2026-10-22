@@ -564,3 +564,82 @@ fn two_urls_that_ride_different_schemas_open_side_by_side() {
         assert_eq!(rows.len(), 1, "{schema} holds {name}");
     }
 }
+
+/// 16 bytes as the 32 lowercase hex digits a marker spells.
+fn hex_of(bytes: &[u8; 16]) -> String {
+    let mut hex = String::with_capacity(32);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// A first open cut between its store's UUID row and its marker opens
+/// again: the row commits early in the open, the marker is written at
+/// its end, and a kill in between left a store that could never open
+/// without hand repair. The store was empty - no repos row, so no blob
+/// of another disk can be named - so the directory that returns takes
+/// the database's store as its own, and this open writes the marker the
+/// cut fell before.
+#[test]
+fn a_first_open_cut_before_its_marker_opens_again() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let db = Throwaway::new("marker_window");
+    let mut admin = postgres::Client::connect(&db.url, postgres::NoTls).unwrap();
+    admin.batch_execute("CREATE SCHEMA a;").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // The first open mints the store's row; the cut takes the marker the
+    // open writes at its end.
+    let first = Backend::open(dir.path(), Some(&db.url_riding(Some("a"))), None)
+        .expect("the first open mints");
+    drop(first);
+    std::fs::remove_file(dir.path().join("backend")).unwrap();
+    // The kill's shape: the row stands, the marker is gone, the schema
+    // holds no repo. The next open serves, and writes the marker back.
+    let again = Backend::open(dir.path(), Some(&db.url_riding(Some("a"))), None)
+        .expect("the first open cut before its marker opens again");
+    again
+        .write(|c| c.create_repo("r").map(|_| ()))
+        .expect("the reopened store serves");
+    drop(again);
+    let row: Vec<u8> = postgres::Client::connect(&db.url_riding(Some("a")), postgres::NoTls)
+        .unwrap()
+        .query("SELECT uuid FROM store_uuid WHERE one = 1", &[])
+        .unwrap()[0]
+        .get(0);
+    let mut minted = [0u8; 16];
+    minted.copy_from_slice(&row);
+    let marker = std::fs::read_to_string(dir.path().join("backend")).unwrap();
+    let written = marker.lines().nth(1).unwrap().trim();
+    assert_eq!(
+        written,
+        hex_of(&minted),
+        "the marker names the store the row minted"
+    );
+}
+
+/// A served store whose marker went missing still refuses a directory
+/// that names no store: the schema holds repos, so a fresh directory
+/// here would serve metadata whose blobs are not on this disk.
+#[test]
+fn a_served_store_without_its_marker_refuses_a_fresh_directory() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let db = Throwaway::new("marker_served");
+    let mut admin = postgres::Client::connect(&db.url, postgres::NoTls).unwrap();
+    admin.batch_execute("CREATE SCHEMA a;").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let served = Backend::open(dir.path(), Some(&db.url_riding(Some("a"))), None)
+        .expect("the first open mints");
+    served.write(|c| c.create_repo("r").map(|_| ())).unwrap();
+    drop(served);
+    std::fs::remove_file(dir.path().join("backend")).unwrap();
+    let Err(error) = Backend::open(dir.path(), Some(&db.url_riding(Some("a"))), None) else {
+        panic!("a fresh directory serves a served store");
+    };
+    assert!(error.to_string().contains("carries no marker"), "{error}");
+}

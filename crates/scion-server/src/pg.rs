@@ -786,13 +786,27 @@ impl Pg {
             let uuid = uuid_of(row.get::<_, Vec<u8>>("uuid"));
             match marker.uuid {
                 None => {
-                    return Err(Error::FailedPrecondition(format!(
-                        "this database names the store {}, but the data \
-                         directory carries no marker of it: give the \
-                         directory the database was served with, or a \
-                         directory it has never served",
-                        hex16(&uuid)
-                    )));
+                    // A first open cut between its store's UUID row and
+                    // its marker: the row commits early in the open, the
+                    // marker is written at its end, and a kill in that
+                    // window left a store that could never open again. A
+                    // schema with no repos row served nothing, so no
+                    // blob of another disk can be named: the directory
+                    // takes the database's store as its own, and this
+                    // open writes the marker the cut fell before. A
+                    // schema that holds repos was served by a store
+                    // whose marker went missing - a fresh directory
+                    // pointed at a served store - and refuses.
+                    let served = writer.query("SELECT 1 FROM repos LIMIT 1", &[])?;
+                    if !served.is_empty() {
+                        return Err(Error::FailedPrecondition(format!(
+                            "this database names the store {}, but the data \
+                             directory carries no marker of it: give the \
+                             directory the database was served with, or a \
+                             directory it has never served",
+                            hex16(&uuid)
+                        )));
+                    }
                 }
                 Some(held) if held != uuid => {
                     return Err(Error::FailedPrecondition(format!(
