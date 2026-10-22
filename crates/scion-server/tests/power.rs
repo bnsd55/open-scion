@@ -336,11 +336,13 @@ async fn every_reply_survives_a_power_cut() {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
             _ => {
-                wait_until_bounded("a land is pending in the database", 5, || pending(data) > 0)
-                    .await;
+                wait_until_bounded("a land is pending in the database", 5, || {
+                    pending(&data) > 0
+                })
+                .await;
             }
         }
-        let pending_at_kill = pending(data) > 0;
+        let pending_at_kill = pending(&data) > 0;
         if pending_at_kill {
             pending_kills += 1;
         }
