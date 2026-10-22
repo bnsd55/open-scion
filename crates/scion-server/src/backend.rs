@@ -959,6 +959,19 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn get_derived_chain(
+        &mut self,
+        kind: &str,
+        version: u32,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, Vec<u8>)>> {
+        match self {
+            Self::Sqlite(tx) => tx.get_derived_chain(kind, version, start, limit),
+            Self::Postgres(pg) => pg.get_derived_chain(kind, version, start, limit),
+        }
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     fn bulk_seed(
         &mut self,

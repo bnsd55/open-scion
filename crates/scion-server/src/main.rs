@@ -193,6 +193,11 @@ enum Command {
         verify: usize,
         /// Path to the git repository.
         git_dir: PathBuf,
+        /// Where the audit log goes. The default is `audit.log` in the
+        /// data directory: the same file the server appends to, so one
+        /// file holds the whole history of a data directory.
+        #[arg(long, value_name = "FILE")]
+        audit_file: Option<PathBuf>,
     },
     /// Check a data directory and report the damage it finds. Read-only: it
     /// changes nothing, and it can run while the server runs. It reads in
@@ -236,6 +241,11 @@ enum Command {
         /// The archive directory to replay.
         #[arg(long)]
         archive: PathBuf,
+        /// Where the audit log goes. The default is `audit.log` in the
+        /// new data directory: the restored store's own audit file, so
+        /// the restore's lines open its history.
+        #[arg(long, value_name = "FILE")]
+        audit_file: Option<PathBuf>,
     },
     /// Collect the blob files and the rows that nothing names any more: a
     /// row whose blob no stored changeset of its repo puts, and a file that
@@ -374,6 +384,155 @@ fn error_class(e: &Error) -> &'static str {
     }
 }
 
+/// Whether an audit write failed because the disk is out of space: the
+/// collector is the remedy for exactly this, so a gc must run anyway.
+fn is_disk_full(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    )
+}
+
+/// Writes the intent line a disk-full audit deferred: the run freed the
+/// space, so the line goes in now, marked with why it was late. An
+/// append that still fails ends the process with the run's own status:
+/// the report is already on stdout, and there is nothing left to record
+/// it with.
+async fn write_deferred_intent(audit: &scion_server::Audit, dry_run: bool, run_ok: bool) {
+    let mut what = serde_json::json!({ "what": "gc", "dry_run": dry_run });
+    what["deferred"] = serde_json::json!("disk_full");
+    if let Err(why) = audit
+        .record(scion_server::Event::new("admin", "intent", what))
+        .await
+    {
+        eprintln!("scion-server gc: the run's intent line is still not recorded: {why}");
+        std::process::exit(i32::from(!run_ok));
+    }
+}
+
+/// Checks an archive against its format and prints one line per damage.
+/// Exits 2 when it could not run, 1 when it saw damage.
+fn verify_command(archive: &Path) -> ! {
+    let damages = match archive::verify(archive) {
+        Ok(damages) => damages,
+        Err(e) => {
+            eprintln!("scion-server verify: {e:#}");
+            std::process::exit(2);
+        }
+    };
+    for line in &damages {
+        println!("{line}");
+    }
+    println!("verify: {} damages", damages.len());
+    std::process::exit(i32::from(!damages.is_empty()));
+}
+
+/// Records the `admin`/`failed` line of a run that did not finish: the
+/// error's class, never its message, which can carry a path. A line that
+/// itself fails to become durable is logged, not fatal: the run's own
+/// error is what the caller reports.
+async fn record_admin_failed(audit: &scion_server::Audit, what: &str, why: &str) {
+    let fields = serde_json::json!({ "what": what, "why": why });
+    if let Err(record_why) = audit
+        .record(scion_server::Event::new("admin", "failed", fields))
+        .await
+    {
+        tracing::error!(reason = %record_why, "a failed run's audit line was not made durable");
+    }
+}
+
+/// Runs `import` and prints what it stored: one admin intent before the
+/// import and one result after it, in the data directory's audit log.
+async fn import_command(
+    audit: scion_server::Audit,
+    store: Backend,
+    repo: String,
+    git_dir: PathBuf,
+    opts: ImportOptions,
+) -> anyhow::Result<()> {
+    let what = serde_json::json!({ "what": "import", "repo": repo });
+    audit
+        .record(scion_server::Event::new("admin", "intent", what.clone()))
+        .await
+        .with_context(|| "cannot record the import intent in the audit log".to_owned())?;
+    let repo_for_run = repo.clone();
+    let run = move || import_git(&store, &repo_for_run, &git_dir, &opts);
+    let report = match tokio::task::spawn_blocking(run).await {
+        Ok(Ok(report)) => report,
+        Ok(Err(e)) => {
+            record_admin_failed(&audit, "import", error_class(&e)).await;
+            return Err(e.into());
+        }
+        Err(e) => {
+            record_admin_failed(&audit, "import", "failed").await;
+            return Err(e.into());
+        }
+    };
+    let fields = serde_json::json!({
+        "what": "import",
+        "repo": repo,
+        "commits": report.commits,
+        "commits_imported": report.imported,
+        "verified": report.verified,
+        "refs_moved": report.refs_moved,
+    });
+    audit
+        .record(scion_server::Event::new("admin", "ok", fields))
+        .await
+        .with_context(|| "cannot record the import result in the audit log".to_owned())?;
+    println!(
+        "imported {} of {} commits, verified {}, tip {}",
+        report.imported, report.commits, report.verified, report.tip
+    );
+    Ok(())
+}
+
+/// Runs `restore` and prints what it replayed: one admin intent before
+/// the replay and one result after it, in the restored store's own audit
+/// file. Exits 2 when the restore could not finish. The replay blocks
+/// this task, as it always has.
+async fn restore_command(
+    audit: scion_server::Audit,
+    data: &Path,
+    archive: &Path,
+    postgres_url: Option<&str>,
+    postgres_ca: Option<&Path>,
+) -> anyhow::Result<()> {
+    let what = serde_json::json!({ "what": "restore" });
+    audit
+        .record(scion_server::Event::new("admin", "intent", what.clone()))
+        .await
+        .with_context(|| "cannot record the restore intent in the audit log".to_owned())?;
+    let report = match archive::restore(archive, data, postgres_url, postgres_ca) {
+        Ok(report) => report,
+        Err(e) => {
+            record_admin_failed(&audit, "restore", error_class(&e)).await;
+            eprintln!("scion-server restore: {e:#}");
+            std::process::exit(2);
+        }
+    };
+    let fields = serde_json::json!({
+        "what": "restore",
+        "repos": report.repos.len(),
+        "refs": report.refs,
+        "lands": report.lands,
+    });
+    audit
+        .record(scion_server::Event::new("admin", "ok", fields))
+        .await
+        .with_context(|| "cannot record the restore result in the audit log".to_owned())?;
+    for name in &report.repos {
+        println!("{name}");
+    }
+    println!(
+        "restore: {} repos, {} refs, {} lands",
+        report.repos.len(),
+        report.refs,
+        report.lands
+    );
+    Ok(())
+}
+
 /// Runs `gc` against `store` and prints what it collected. Exits 2 when it
 /// could not run.
 async fn gc_command(
@@ -459,32 +618,6 @@ async fn gc_command(
     Ok(())
 }
 
-/// Whether an audit write failed because the disk is out of space: the
-/// collector is the remedy for exactly this, so a gc must run anyway.
-fn is_disk_full(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
-    )
-}
-
-/// Writes the intent line a disk-full audit deferred: the run freed the
-/// space, so the line goes in now, marked with why it was late. An
-/// append that still fails ends the process with the run's own status:
-/// the report is already on stdout, and there is nothing left to record
-/// it with.
-async fn write_deferred_intent(audit: &scion_server::Audit, dry_run: bool, run_ok: bool) {
-    let mut what = serde_json::json!({ "what": "gc", "dry_run": dry_run });
-    what["deferred"] = serde_json::json!("disk_full");
-    if let Err(why) = audit
-        .record(scion_server::Event::new("admin", "intent", what))
-        .await
-    {
-        eprintln!("scion-server gc: the run's intent line is still not recorded: {why}");
-        std::process::exit(i32::from(!run_ok));
-    }
-}
-
 /// Writes the metrics file of `scion-server gc --metrics-file`: the
 /// gauges of one finished run, in the Prometheus text format the node
 /// exporter's textfile collector reads. A failed run never touches the
@@ -563,6 +696,34 @@ async fn main() -> anyhow::Result<()> {
     // The Postgres URL of the flags: the file form wins (the two cannot
     // be given together), the argv form warns, the env is quiet.
     let postgres_url = postgres_url_of(&cli)?;
+    // `verify` and `restore` run without a store: verify reads only the
+    // archive, and restore makes a data directory of its own. Handle them
+    // before the store opens, so a restore's empty target stays empty of
+    // one, and an archive check opens nothing at all.
+    match cli.command {
+        Command::Verify { archive } => verify_command(&archive),
+        Command::Restore {
+            archive,
+            audit_file,
+        } => {
+            // The restore's audit file is the restored store's own: the
+            // data directory may not exist yet, and its one file rides
+            // the publication rename into place. A run that cannot
+            // record refuses before it changes anything.
+            scion_proto::runtime::auth::create_private_dir_all(&cli.data)
+                .with_context(|| format!("cannot create {}", cli.data.display()))?;
+            let audit = cli_audit(&cli.data, audit_file.as_deref())?;
+            return restore_command(
+                audit,
+                &cli.data,
+                &archive,
+                cli.postgres_url.as_deref(),
+                cli.postgres_ca.as_deref(),
+            )
+            .await;
+        }
+        _ => {}
+    }
     let store = match cli.command {
         Command::Import { .. } | Command::Gc { .. } | Command::Export { .. } => {
             Backend::open_shared(
@@ -589,7 +750,11 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(2);
             }
         },
-        Command::Verify { .. } | Command::Restore { .. } => unreachable!("handled below"),
+        // `verify` and `restore` ended the function above: verify exits,
+        // and restore returns.
+        Command::Verify { .. } | Command::Restore { .. } => {
+            unreachable!("handled before the store opens")
+        }
         Command::Serve { .. } | Command::Derive { .. } => Backend::open(
             &cli.data,
             postgres_url.as_deref(),
@@ -646,40 +811,11 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
         }
-        Command::HashToken { .. } | Command::TicketKey { .. } => {
+        Command::HashToken { .. }
+        | Command::TicketKey { .. }
+        | Command::Verify { .. }
+        | Command::Restore { .. } => {
             unreachable!("handled before the store opens")
-        }
-        Command::Verify { archive } => {
-            let damages = match archive::verify(&archive) {
-                Ok(damages) => damages,
-                Err(e) => {
-                    eprintln!("scion-server verify: {e:#}");
-                    std::process::exit(2);
-                }
-            };
-            for line in &damages {
-                println!("{line}");
-            }
-            println!("verify: {} damages", damages.len());
-            std::process::exit(i32::from(!damages.is_empty()));
-        }
-        Command::Restore { archive } => {
-            let names = match archive::restore(
-                &archive,
-                &cli.data,
-                cli.postgres_url.as_deref(),
-                cli.postgres_ca.as_deref(),
-            ) {
-                Ok(names) => names,
-                Err(e) => {
-                    eprintln!("scion-server restore: {e:#}");
-                    std::process::exit(2);
-                }
-            };
-            for name in &names {
-                println!("{name}");
-            }
-            println!("restore: {} repos", names.len());
         }
         Command::Export { repo, all, out } => {
             archive_export(&store, &cli.data, repo.as_deref(), all, &out);
@@ -709,19 +845,15 @@ async fn main() -> anyhow::Result<()> {
             target_ref,
             verify,
             git_dir,
+            audit_file,
         } => {
+            let audit = cli_audit(&cli.data, audit_file.as_deref())?;
             let opts = ImportOptions {
                 rev,
                 target_ref,
                 verify_sample: verify,
             };
-            let report =
-                tokio::task::spawn_blocking(move || import_git(&store, &repo, &git_dir, &opts))
-                    .await??;
-            println!(
-                "imported {} of {} commits, verified {}, tip {}",
-                report.imported, report.commits, report.verified, report.tip
-            );
+            import_command(audit, store, repo, git_dir, opts).await?;
         }
         Command::Derive {
             kind,
