@@ -256,34 +256,25 @@ fn seed() -> u64 {
     seed
 }
 
+/// The lands pending in this directory's metadata, whatever backend
+/// holds it: a SQLite file beside the blobs, or the schema the test
+/// database names for the directory. The read runs on threads of its
+/// own, because the sync client blocks on its connection's runtime and
+/// the test's async worker already hosts one.
+fn pending(data: &std::path::Path) -> i64 {
+    std::thread::scope(|s| {
+        s.spawn(|| common::LandsReader::open(data).counts().1)
+            .join()
+            .unwrap()
+    })
+}
+
 /// The real server, several clients, and a cut at three kinds of moment, as
 /// in the crash suite: at a random moment, in the middle of a large upload,
 /// and while a land is pending. Every reply the clients got must survive:
 /// the cut takes what was never fsynced, so a missing sync before a reply
 /// loses that reply.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-/// The lands pending in this directory's metadata, whatever backend
-/// holds it: a SQLite file beside the blobs, or the schema the test
-/// database names for the directory.
-fn pending(data: &std::path::Path) -> i64 {
-    if Backend::test_is_postgres() {
-        let url = std::env::var("SCION_TEST_POSTGRES_URL").expect("SCION_TEST_POSTGRES_URL");
-        let schema = Backend::test_schema(data).expect("the test names a schema");
-        let sep = if url.contains('?') { '&' } else { '?' };
-        let mut c = postgres::Client::connect(
-            &format!("{url}{sep}options=--search_path%3D{schema}"),
-            postgres::NoTls,
-        )
-        .expect("the test database is up");
-        c.query_one("SELECT count(*) FROM lands WHERE state = 'pending'", &[])
-            .expect("the lands read")
-            .get::<_, i64>(0)
-    } else {
-        let db = rusqlite::Connection::open(data.join("scion.db")).unwrap();
-        pending_lands(&db)
-    }
-}
-
 async fn every_reply_survives_a_power_cut() {
     if !may_run() {
         return;
