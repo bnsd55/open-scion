@@ -554,3 +554,60 @@ fn a_verify_subcommand_reports_a_good_archive_and_names_a_damaged_one() {
         "the report names the damage count: {text}"
     );
 }
+
+/// A restore that fails mid-replay still leaves its audit record: the
+/// intent goes back to the target with the failed line after it, and
+/// the target holds nothing else — the evidence an auditor needs is
+/// exactly what a failed run must not delete.
+#[test]
+fn a_restore_that_fails_mid_replay_leaves_its_audit_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let restored = dir.path().join("restored");
+    seed_exportable(&data);
+    let archive = dir.path().join("archive");
+    let out = run(
+        &data,
+        &[
+            "export",
+            "--repo",
+            "hist",
+            "--out",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "export ran");
+    // A blob file whose bytes another hand changed: the replay's check
+    // refuses it.
+    let mut blob = None;
+    for first in fs::read_dir(archive.join("blobs")).unwrap().flatten() {
+        for second in fs::read_dir(first.path()).unwrap().flatten() {
+            if second.path().is_file() {
+                blob = Some(second.path());
+                break;
+            }
+        }
+        if blob.is_some() {
+            break;
+        }
+    }
+    fs::write(blob.expect("the archive holds a blob"), b"damaged\n").unwrap();
+
+    let out = run(
+        &restored,
+        &["restore", "--archive", archive.to_str().unwrap()],
+    );
+    assert!(!out.status.success(), "the run refused");
+
+    let lines = audit_lines(&restored);
+    assert_eq!(lines.len(), 2, "one intent and one result: {lines:?}");
+    assert_eq!(lines[0]["event"], "admin");
+    assert_eq!(lines[0]["outcome"], "intent");
+    assert_eq!(lines[0]["what"], "restore");
+    assert_eq!(lines[1]["event"], "admin");
+    assert_eq!(lines[1]["outcome"], "failed");
+    assert_eq!(lines[1]["why"], "failed");
+    let held: Vec<_> = fs::read_dir(&restored).unwrap().flatten().collect();
+    assert_eq!(held.len(), 1, "the target holds only the audit: {held:?}");
+    assert_eq!(held[0].file_name(), "audit.log");
+}

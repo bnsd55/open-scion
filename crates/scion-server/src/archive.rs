@@ -451,6 +451,15 @@ fn restore_impl(
     match replayed {
         Ok(report) => {
             if let Err(error) = fs::rename(&staging, data) {
+                if !carry_back_audit(&staging, data) {
+                    return Err(Error::FailedPrecondition(format!(
+                        "the restore replayed whole, but {} could not take {}'s place, and the \
+                         run's audit file could not move back: the run's lines stay in {}: {error}",
+                        data.display(),
+                        staging.display(),
+                        staging.display()
+                    )));
+                }
                 let _ = fs::remove_dir_all(&staging);
                 return Err(Error::FailedPrecondition(format!(
                     "the restore replayed whole, but {} could not take {}'s place: {error}",
@@ -461,6 +470,20 @@ fn restore_impl(
             Ok(report)
         }
         Err(error) => {
+            // The run's audit lines (its intent, and any line after it)
+            // went into the staging store's audit file: carry them back
+            // to the target before the scratch goes, so a failed restore
+            // leaves the evidence an auditor needs. The caller's audit
+            // handle holds the file's fd, so the failed line it writes
+            // next lands in the carried-back file.
+            if !carry_back_audit(&staging, data) {
+                return Err(Error::FailedPrecondition(format!(
+                    "the replay failed, and the run's audit file could not move back to {}: \
+                     the run's lines stay in {}: {error}",
+                    data.display(),
+                    staging.display()
+                )));
+            }
             let _ = fs::remove_dir_all(&staging);
             // On Postgres the store's identity was minted by this
             // restore's open (a database that already named a store
@@ -474,6 +497,18 @@ fn restore_impl(
             Err(error)
         }
     }
+}
+
+/// Moves the staging store's audit file back to the target on a failed
+/// restore: it is the record of the run that failed, and the scratch
+/// must not take it. Returns whether the staging directory may go: it
+/// stays when it still holds the audit file's only copy.
+fn carry_back_audit(staging: &Path, data: &Path) -> bool {
+    let staged = staging.join("audit.log");
+    if !staged.exists() {
+        return true;
+    }
+    fs::rename(&staged, data.join("audit.log")).is_ok()
 }
 
 /// The replay itself, into whatever directory the caller named: the
