@@ -144,6 +144,7 @@ fn the_ladder_walks_stay_under_the_statement_budget() {
     // plus the first changeset's ordinary write. A fallback to one
     // statement per row would cost about 360,000.
     let seed_statements = Backend::test_statement_count();
+    println!("PROBE seed: {seed_statements}");
     assert!(
         seed_statements <= 500,
         "the bulk seed wrote {seed_statements} statements"
@@ -168,6 +169,7 @@ fn the_ladder_walks_stay_under_the_statement_budget() {
     let not_ancestor = statements(&mut || {
         assert!(!read::is_ancestor(&store, REPO, late, tip, &later()).unwrap());
     });
+    println!("PROBE not-ancestor: {not_ancestor} (cap {search_cap})");
     assert!(
         not_ancestor <= search_cap,
         "the not-ancestor walk took {not_ancestor} statements"
@@ -175,6 +177,7 @@ fn the_ladder_walks_stay_under_the_statement_budget() {
     let ancestor = statements(&mut || {
         assert!(read::is_ancestor(&store, REPO, sides[0], tip, &later()).unwrap());
     });
+    println!("PROBE ancestor: {ancestor}");
     assert!(
         ancestor <= search_cap,
         "the ancestor walk took {ancestor} statements"

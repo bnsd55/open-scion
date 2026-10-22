@@ -533,6 +533,55 @@ impl MetaTx for SqliteTx<'_> {
             .collect()
     }
 
+    fn get_derived_chain(
+        &mut self,
+        kind: &str,
+        version: u32,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, Vec<u8>)>> {
+        // One statement for the whole chain: the recursive term follows the
+        // indexed first-parent rows (cs, n = 0), and the join keeps the
+        // rows that carry a stored value. Every fetched changeset is an
+        // ancestor of `start`, so no repo filter is needed.
+        let mut stmt = self
+            .0
+            .prepare_cached(
+                "WITH RECURSIVE walk(id, depth) AS (
+                 SELECT ?1, 0
+                 UNION ALL
+                 SELECT cp.parent, w.depth + 1
+                 FROM walk w
+                 JOIN changeset_parents cp ON cp.cs = w.id AND cp.n = 0
+                 WHERE w.depth < ?2
+             )
+             SELECT d.cs, d.value FROM walk
+             JOIN derived d ON d.cs = walk.id
+             WHERE d.kind = ?3 AND d.version = ?4",
+            )
+            .map_err(crate::error::from_sqlite)?;
+        let rows = stmt
+            .query_map(
+                params![start.as_bytes(), limit, kind, version],
+                |row| {
+                    let cs: Vec<u8> = row.get(0)?;
+                    let value: Vec<u8> = row.get(1)?;
+                    Ok((cs, value))
+                },
+            )
+            .map_err(crate::error::from_sqlite)?;
+        rows.map(|row| {
+            let (cs, value) = row.map_err(crate::error::from_sqlite)?;
+            Ok((
+                ChangesetId::try_from(cs.as_slice()).map_err(|_| {
+                    Error::Corrupt("a derived row's changeset is not a changeset id".to_owned())
+                })?,
+                value,
+            ))
+        })
+        .collect()
+    }
+
     /// Records a derived value. A second write must agree with the first:
     /// derivation is deterministic, so a mismatch means corruption.
     ///

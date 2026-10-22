@@ -136,6 +136,10 @@ pub trait Meta: Send + Sync + 'static {
 /// batch covers one step.
 pub(crate) const DERIVED_BATCH: usize = 1_000;
 
+/// [`DERIVED_BATCH`] as the chain limit the statements take.
+#[allow(clippy::cast_possible_wrap)] // 1,000, far from any wrap
+pub(crate) const DERIVED_BATCH_I64: i64 = DERIVED_BATCH as i64;
+
 /// The queries on the metadata tables. Every query fails with a database
 /// error, or with the `NotFound` or `Corrupt` error that its doc says; the
 /// docs do not repeat that per method. A query may be called in a read or
@@ -220,6 +224,21 @@ pub trait MetaTx {
         version: u32,
         ids: &[ChangesetId],
     ) -> Result<Vec<Option<Vec<u8>>>>;
+
+    /// The stored bytes of the derived values on the first-parent chain
+    /// that starts at `start`: `start` itself and up to `limit - 1` of its
+    /// ancestors, following first parents. One statement: the chain follows
+    /// the indexed first-parent rows, and every fetched changeset is an
+    /// ancestor of `start`, so no repo filter is needed. A changeset
+    /// without a stored value has no row, as [`MetaTx::get_derived`]
+    /// would. `limit` bounds the hops.
+    fn get_derived_chain(
+        &mut self,
+        kind: &str,
+        version: u32,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, Vec<u8>)>>;
 
     /// Writes a test seed: `css` oldest first, every parent before its
     /// children, file-less (no tree entries, no blobs), and the derived

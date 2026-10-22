@@ -39,7 +39,7 @@ use crate::deadline::Deadline;
 use crate::derived::{self, Kind};
 use crate::error::{Error, Result};
 use crate::meta::Meta as _;
-use crate::meta::{DERIVED_BATCH, MetaTx, RepoId};
+use crate::meta::{DERIVED_BATCH, DERIVED_BATCH_I64, MetaTx, RepoId};
 
 /// A changeset that a [`Node`] points to, with what a query needs to decide
 /// whether to go there.
@@ -694,14 +694,22 @@ impl<'a> Index<'a> {
             .collect()
     }
 
-    /// The node of a changeset, from the cache or one statement.
+    /// The node of a changeset, from the cache or one statement. A miss
+    /// fetches the first-parent chain from the node: up to
+    /// [`DERIVED_BATCH`] nodes in one statement, every one an ancestor of
+    /// the walk's start, so the chain hops that follow hit the cache.
     fn node(&mut self, id: ChangesetId) -> Result<Node> {
         if let Some(node) = self.nodes.get(&id) {
             return Ok(*node);
         }
-        let node = node(self.c, id)?;
-        self.nodes.insert(id, node);
-        Ok(node)
+        let mut found = None;
+        for (cs, node) in derived::load_chain::<CommitGraph>(self.c, id, DERIVED_BATCH_I64)? {
+            if cs == id {
+                found = Some(node);
+            }
+            self.nodes.insert(cs, node);
+        }
+        found.ok_or_else(|| Error::Corrupt(format!("commit graph: no node for {id}")))
     }
 
     /// Every parent of a merge, in order, with its generation.
