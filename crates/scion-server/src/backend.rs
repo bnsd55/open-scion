@@ -935,6 +935,19 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn bulk_seed(
+        &mut self,
+        repo: RepoId,
+        css: &[scion_core::Changeset],
+        derived: &[(&'static str, u32, ChangesetId, Vec<u8>)],
+    ) -> Result<Vec<ChangesetId>> {
+        match self {
+            Self::Sqlite(tx) => tx.bulk_seed(repo, css, derived),
+            Self::Postgres(pg) => pg.bulk_seed(repo, css, derived),
+        }
+    }
+
     fn put_derived(
         &mut self,
         kind: &str,

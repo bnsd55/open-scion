@@ -189,6 +189,32 @@ pub trait MetaTx {
         ids: &[ChangesetId],
     ) -> Result<Vec<Option<Vec<u8>>>>;
 
+    /// Writes a test seed: `css` oldest first, every parent before its
+    /// children, file-less (no tree entries, no blobs), and the derived
+    /// values to store beside them. One statement per batch, not per
+    /// changeset, where the backend can. The default writes them one by
+    /// one through the ordinary path; backends where a round trip costs
+    /// real time override it. The rows must find an empty schema: the
+    /// bulk write does not replay the ordinary write's conflict checks.
+    ///
+    /// Returns the ids, in `css` order.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn bulk_seed(
+        &mut self,
+        repo: RepoId,
+        css: &[scion_core::Changeset],
+        derived: &[(&'static str, u32, ChangesetId, Vec<u8>)],
+    ) -> Result<Vec<ChangesetId>> {
+        let mut ids = Vec::with_capacity(css.len());
+        for cs in css {
+            ids.push(self.insert_changeset(repo, cs)?);
+        }
+        for (kind, version, cs, value) in derived {
+            self.put_derived(kind, *version, *cs, value)?;
+        }
+        Ok(ids)
+    }
+
     /// Records a derived value. A second write must agree with the first.
     fn put_derived(
         &mut self,
