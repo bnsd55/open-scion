@@ -1542,7 +1542,7 @@ fn lost_message(setup_held: bool) -> &'static str {
         "this server process lost the database to another \
          server process; it serves nothing from here on"
     } else {
-        "another server holds this database"
+        "another server holds this store"
     }
 }
 

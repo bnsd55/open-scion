@@ -1185,7 +1185,7 @@ fn a_second_server_process_is_refused() {
     let said = if extra.is_empty() {
         stderr.contains("in use by another server")
     } else {
-        stderr.contains("another server holds this database")
+        stderr.contains("another server holds this store")
     };
     assert!(said, "{stderr}");
 }

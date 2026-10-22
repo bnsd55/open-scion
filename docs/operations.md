@@ -264,9 +264,10 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
   transaction per migration, under a database lock with the same 5 s clock:
   an open that waits longer answers busy, and the caller retries. A
   database of a newer build is refused: run that build's server.
-- One server process serves one database: a second `serve` on the same
-  `--postgres-url` fails at its open with "another server holds this
-  database". An import does not take that lock and runs beside a server.
+- One server process serves one store - a data directory, or a Postgres
+  schema: a second `serve` on the same `--postgres-url` (and schema)
+  fails at its open with "another server holds this store". An import
+  does not take that lock and runs beside a server.
 - The server opens one write connection and a pool of 8 read
   connections, plus the short-lived connections of a migration or an
   import. Size the database's `max_connections` for all of it: the
