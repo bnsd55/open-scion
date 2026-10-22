@@ -1054,6 +1054,15 @@ impl MetaTx for SqliteTx<'_> {
         Ok(())
     }
 
+    /// Records that the git commits became the changesets. SQLite has
+    /// one write connection: the existing per-row statement, in a loop.
+    fn put_git_imports(&mut self, repo: RepoId, pairs: &[(ObjectId, ChangesetId)]) -> Result<()> {
+        for (oid, cs) in pairs {
+            self.put_git_import(repo, *oid, *cs)?;
+        }
+        Ok(())
+    }
+
     /// Every git commit already imported into `repo`.
     fn imported_commits(&mut self, repo: RepoId) -> Result<HashMap<ObjectId, ChangesetId>> {
         let mut stmt = self

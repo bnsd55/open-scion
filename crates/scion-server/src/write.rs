@@ -16,6 +16,7 @@ use scion_core::{BlobId, Changeset, ChangesetId, RepoPath};
 
 use crate::backend::Backend;
 use crate::db;
+use crate::deadline::Deadline;
 use crate::error::{Error, Result};
 use crate::meta::Meta as _;
 use crate::meta::{MetaTx, RepoId};
@@ -92,6 +93,13 @@ pub(crate) static PARK_CREATE: Park = Park {
     root: std::sync::Mutex::new(None),
 };
 
+/// The park inside [`check_blobs`], after a blob's keep, keyed by that
+/// blob: a test holds the caller between two blobs' checks.
+#[cfg(test)]
+pub(crate) static PARK_CHECK: Park = Park {
+    root: std::sync::Mutex::new(None),
+};
+
 /// The park of [`put_blob`], between its member read and its upsert.
 #[cfg(test)]
 pub(crate) static PARK_PUT: Park = Park {
@@ -108,7 +116,14 @@ pub(crate) static PARK_PUT: Park = Park {
 /// has, no committer, fits the request limits, and every blob it names is in
 /// the repo and stored intact. [`Error::Apply`] if the changes do not apply
 /// to the parent's tree. [`Error::Io`] if a blob cannot be read.
-pub fn create_changeset(store: &Backend, repo: &str, bytes: &[u8]) -> Result<ChangesetId> {
+/// [`Error::Cancelled`] once the call has gone, or [`Error::DeadlineExceeded`]
+/// once the call's deadline has passed: nothing is written then.
+pub fn create_changeset(
+    store: &Backend,
+    repo: &str,
+    bytes: &[u8],
+    deadline: &Deadline,
+) -> Result<ChangesetId> {
     let (cs, id) = decode(bytes)?;
     let parent = check_request(&cs)?;
     // A cheap read first, so a request on a missing repo or parent, or one
@@ -125,8 +140,10 @@ pub fn create_changeset(store: &Backend, repo: &str, bytes: &[u8]) -> Result<Cha
     })?;
     // The blob check touches only the object folder, so it runs before the
     // write transaction. It also reads the blob lengths the tree build
-    // needs, so the write connection does no file I/O.
-    let lens = check_blobs(store, repo, &cs)?;
+    // needs, so the write connection does no file I/O. It re-hashes every
+    // distinct blob, which over a big changeset outlives a client that
+    // gave up, so it stops at the call's deadline.
+    let lens = check_blobs(store, repo, &cs, deadline)?;
     // The test seam of the collector race: the caller has checked the
     // file and holds nothing the collector respects, and parks here
     // while the park file of its first put's blob exists.
@@ -295,6 +312,7 @@ fn check_blobs(
     store: &Backend,
     repo: &str,
     cs: &Changeset,
+    deadline: &Deadline,
 ) -> Result<std::collections::HashMap<scion_core::BlobId, u64>> {
     let mut blobs = store.blobs().batch();
     // A blob seen before was intact, or the loop would have stopped.
@@ -304,8 +322,13 @@ fn check_blobs(
         if !seen.insert(blob) {
             continue;
         }
+        // The call may have gone, or its deadline passed, while the last
+        // blob hashed: stop before the next one hashes.
+        deadline.check()?;
         let problem = match blobs.keep(blob)? {
             BlobStatus::Valid => {
+                #[cfg(test)]
+                PARK_CHECK.park(&blob);
                 lens.insert(blob, store.blobs().size(blob)? as u64);
                 continue;
             }
@@ -328,6 +351,11 @@ mod tests {
 
     use super::*;
     use crate::store::FSYNC_LEAVES_DRIVE_CACHE;
+
+    /// A deadline a test does not reach.
+    fn later() -> Deadline {
+        Deadline::new(std::time::Instant::now() + std::time::Duration::from_secs(600))
+    }
 
     fn changeset(parents: Vec<ChangesetId>) -> Changeset {
         Changeset::new(
@@ -405,7 +433,7 @@ mod tests {
     /// The `InvalidArgument` text of a `create_changeset` that fails, with
     /// the blob IDs in it replaced.
     fn refusal(store: &Backend, bytes: &[u8], blobs: &[BlobId]) -> String {
-        match create_changeset(store, "main", bytes) {
+        match create_changeset(store, "main", bytes, &later()) {
             Err(Error::InvalidArgument(why)) => blobs
                 .iter()
                 .fold(why, |why, blob| why.replace(&blob.to_string(), "<blob>")),
@@ -469,7 +497,7 @@ mod tests {
         assert_eq!(store.blobs().verifies(), before);
         // Once uploaded to `main` too, it is accepted.
         upload(&store, repo(&store, "main"), b"secret");
-        create_changeset(&store, "main", &names(secret)).unwrap();
+        create_changeset(&store, "main", &names(secret), &later()).unwrap();
     }
 
     #[test]
@@ -503,7 +531,7 @@ mod tests {
             changes,
         )
         .expect("changeset fits the format");
-        let with_module = create_changeset(&store, "main", &cs.encode()).unwrap();
+        let with_module = create_changeset(&store, "main", &cs.encode(), &later()).unwrap();
         // Storing the gitlink did not make the blob `main`'s.
         let named = child(with_module, &[("f", theirs)]);
         let why = refusal(&store, &named, &[theirs]);
@@ -520,7 +548,7 @@ mod tests {
         give_main(&store, blob);
 
         let before = store.blobs().full_flushes();
-        create_changeset(&store, "main", &child(root, &[("f", blob)])).unwrap();
+        create_changeset(&store, "main", &child(root, &[("f", blob)]), &later()).unwrap();
         // One flush for the blob before the commit, and one for the commit
         // where a plain fsync leaves it in the drive cache.
         assert_eq!(
@@ -542,7 +570,7 @@ mod tests {
             })
             .unwrap();
         let commits = store.commits();
-        create_changeset(&store, "main", &child(tip, &[])).unwrap();
+        create_changeset(&store, "main", &child(tip, &[]), &later()).unwrap();
         // Five root trees in steps, then the write.
         assert_eq!(store.commits() - commits, crate::derived::steps(5) + 1);
     }
@@ -554,7 +582,7 @@ mod tests {
         let paths: Vec<String> = (0..100).map(|i| format!("f{i}")).collect();
         let puts: Vec<(&str, BlobId)> = paths.iter().map(|p| (p.as_str(), blob)).collect();
         let before = store.blobs().verifies();
-        create_changeset(&store, "main", &child(root, &puts)).unwrap();
+        create_changeset(&store, "main", &child(root, &puts), &later()).unwrap();
         assert_eq!(store.blobs().verifies() - before, 1);
     }
 
@@ -565,12 +593,12 @@ mod tests {
         let before = store.blobs().verifies();
         let ok = child(root, &[("f", blob)]);
         assert!(matches!(
-            create_changeset(&store, "absent", &ok),
+            create_changeset(&store, "absent", &ok, &later()),
             Err(Error::NotFound(_))
         ));
         let orphan = child(ChangesetId::from_bytes([7; 32]), &[("f", blob)]);
         assert!(matches!(
-            create_changeset(&store, "main", &orphan),
+            create_changeset(&store, "main", &orphan, &later()),
             Err(Error::InvalidArgument(why)) if why.contains("is not in repo")
         ));
         assert_eq!(store.blobs().verifies(), before);
@@ -583,7 +611,7 @@ mod tests {
         let (x, y) = (BlobId::of(b"x"), BlobId::of(b"y"));
         let (first, second) = (x.max(y), x.min(y));
         let cs = child(root, &[("a", first), ("b", second)]);
-        match create_changeset(&store, "main", &cs) {
+        match create_changeset(&store, "main", &cs, &later()) {
             Err(Error::InvalidArgument(why)) => {
                 assert!(why.contains(&first.to_string()), "{why}");
             }

@@ -410,6 +410,10 @@ pub trait MetaTx {
     /// Records that a git commit became the changeset. Safe to repeat.
     fn put_git_import(&mut self, repo: RepoId, oid: ObjectId, cs: ChangesetId) -> Result<()>;
 
+    /// Records that the git commits became the changesets, all of the
+    /// pairs, in one statement where the backend can. Safe to repeat.
+    fn put_git_imports(&mut self, repo: RepoId, pairs: &[(ObjectId, ChangesetId)]) -> Result<()>;
+
     /// Every git commit already imported into `repo`.
     fn imported_commits(
         &mut self,

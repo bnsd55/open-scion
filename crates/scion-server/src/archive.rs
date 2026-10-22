@@ -606,9 +606,7 @@ fn restore_into_with(
                     None,
                 )?;
             }
-            for (oid, cs) in provenance {
-                c.put_git_import(repo_id, *oid, *cs)?;
-            }
+            c.put_git_imports(repo_id, provenance)?;
         }
         Ok(())
     })?;
