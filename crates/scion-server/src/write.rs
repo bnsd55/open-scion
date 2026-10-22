@@ -50,8 +50,7 @@ impl Park {
         *self
             .root
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(root.to_owned());
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(root.to_owned());
     }
 
     /// Lifts the park: no caller parks any more.
@@ -143,6 +142,22 @@ pub fn create_changeset(store: &Backend, repo: &str, bytes: &[u8]) -> Result<Cha
             // A retry. Its tree was checked and recorded the first time.
             return Ok(id);
         }
+        // The file re-check rides the write transaction, because the
+        // collector's sweep unlinks inside its own write transaction:
+        // the two transactions order on the write (the one write
+        // connection, or the collector's key), so the sweep ran either
+        // wholly before this one began - the stat below fails, and the
+        // refuse sends the client to upload again - or wholly after it
+        // commits, and its row check then sees the row that names the
+        // blob. The check outside (`check_blobs`) cannot give that: it
+        // holds nothing the sweep respects, and its file read is not
+        // the write that adds a row.
+        let mut checked = BTreeSet::new();
+        for (path, blob) in db::puts(&cs) {
+            if checked.insert(blob) && !store.blobs().location(blob).1.exists() {
+                return Err(bad_blob(blob, path, "is not stored", repo));
+            }
+        }
         tree::store_changeset(c, repo_id, &cs, &mut tree::lens_from(&lens)).map(|(id, _)| id)
     })
 }
@@ -177,11 +192,14 @@ pub fn put_blob(store: &Backend, repo: RepoId, upload: Upload) -> Result<BlobId>
     #[cfg(test)]
     PARK_PUT.park(&id);
     store.blobs().put_upload(upload, member)?;
-    if !member {
-        // One flush covers the file and this row. A row whose blob a crash
-        // lost grants nothing: `create_changeset` reads every blob back.
-        store.commit(|c| c.add_repo_blob(repo, id))?;
-    }
+    // The upsert runs even when the read said the row is there: the
+    // collector's prune may have taken the row between the read and
+    // this transaction (no stored changeset names the blob yet, and the
+    // file's age is the row's age). The reply must leave the row behind,
+    // or a PutBlob that answered ok would store nothing for the repo.
+    // One statement either way, and the file the row names is on the
+    // drive: `put_upload` kept it and touched it, or wrote it again.
+    store.commit(|c| c.add_repo_blob(repo, id))?;
     store.flush()?;
     Ok(id)
 }

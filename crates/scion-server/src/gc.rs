@@ -1088,27 +1088,11 @@ mod tests {
         assert_eq!(report.files_removed, blobs.len() as u64, "{report:?}");
     }
 
-    use crate::write::{create_changeset, put_blob, PARK_CREATE, PARK_PUT};
+    use crate::write::{PARK_CREATE, PARK_PUT, create_changeset, put_blob};
 
     /// Waits until a writer parked in one of the write parks, named by
     /// the marker file of `id`.
     fn wait_parked(hooks: &Path, id: BlobId) {
-        let marker = hooks.join(format!("parked-{id}"));
-        let give_up = std::time::Instant::now() + Duration::from_secs(10);
-        while !marker.exists() {
-            assert!(
-                std::time::Instant::now() < give_up,
-                "the writer never parked"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-
-    /// The collector takes the row and the file while a `create_changeset`
-
-    /// A writer parked in one of the write path's parks, and the marker
-    /// file that says it is inside.
-    fn parked(hooks: &Path, id: BlobId) {
         let marker = hooks.join(format!("parked-{id}"));
         let give_up = std::time::Instant::now() + Duration::from_secs(10);
         while !marker.exists() {
@@ -1148,8 +1132,13 @@ mod tests {
         );
         let bytes = Changeset::new(
             vec![root],
-            IdentityTime::new(b"Ada".to_vec(), b"ada@example.com".to_vec(), 1_700_000_000, 0)
-                .expect("identity fits the format"),
+            IdentityTime::new(
+                b"Ada".to_vec(),
+                b"ada@example.com".to_vec(),
+                1_700_000_000,
+                0,
+            )
+            .expect("identity fits the format"),
             None,
             b"write\n".to_vec(),
             changes,
@@ -1164,8 +1153,10 @@ mod tests {
         PARK_CREATE.arm(&hooks);
         std::fs::write(hooks.join(format!("park-{b}")), b"").unwrap();
         let writer = store.clone();
-        let created =
-            std::thread::spawn(move || create_changeset(&writer, REPO, &bytes).map_err(|e| e.to_string()));        wait_parked(&hooks, b);
+        let created = std::thread::spawn(move || {
+            create_changeset(&writer, REPO, &bytes).map_err(|e| e.to_string())
+        });
+        wait_parked(&hooks, b);
         let report = collect(&store, Duration::from_secs(DEFAULT_GRACE_SECS), &mut |_| {});
         assert_eq!(report.rows_pruned, 1, "{report:?}");
         assert_eq!(report.files_removed, 1, "{report:?}");
@@ -1188,7 +1179,7 @@ mod tests {
 
     /// The collector takes the row while a `PutBlob` sits parked after
     /// its member read, and takes the file too. The reply must still
-    /// leave the row behind: a PutBlob that answers ok stores the blob
+    /// leave the row behind: a `PutBlob` that answers ok stores the blob
     /// for the repo, and the next changeset may name it.
     #[test]
     fn a_put_blob_that_answers_ok_names_the_blob_over_a_concurrent_gc() {
@@ -1223,6 +1214,10 @@ mod tests {
             store.read(|c| c.any_repo_names(b.as_bytes())).unwrap(),
             "the row of a PutBlob that answered ok vanished"
         );
-        assert_eq!(store.blobs().get(b).unwrap(), b"kept\n", "the blob reads back");
+        assert_eq!(
+            store.blobs().get(b).unwrap(),
+            b"kept\n",
+            "the blob reads back"
+        );
     }
 }
