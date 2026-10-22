@@ -614,7 +614,7 @@ fn a_directory_that_names_a_store_refuses_an_empty_schema() {
     assert!(text.contains("holds no store"), "{error}");
     assert!(
         text.contains(&uuid),
-        "the refusal names store {uuid}: {text}"
+        "the refusal names the marker's store: {text}"
     );
     assert!(
         text.contains("search_path"),
