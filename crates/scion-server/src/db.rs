@@ -317,6 +317,56 @@ impl MetaTx for SqliteTx<'_> {
             .map_err(crate::error::from_sqlite)
     }
 
+    /// One page of the first-parent chain, one statement: the recursive
+    /// term follows the indexed first-parent rows (cs, n = 0), and the
+    /// join carries the generation and the body. Every fetched changeset
+    /// is an ancestor of `start`, so the repo check rides the start row,
+    /// as `get_changeset` checks it.
+    fn first_parent_page(
+        &mut self,
+        repo: RepoId,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, i64, Vec<u8>)>> {
+        let mut stmt = self
+            .0
+            .prepare_cached(
+                "WITH RECURSIVE walk(id, depth) AS (
+                     SELECT id, 0 FROM changesets JOIN repo_changesets ON cs = id
+                     WHERE repo_id = ?1 AND id = ?2
+                     UNION ALL
+                     SELECT cp.parent, w.depth + 1 FROM walk w
+                     JOIN changeset_parents cp ON cp.cs = w.id AND cp.n = 0
+                     WHERE w.depth < ?3
+                 )
+                 SELECT c.id, c.gen, c.body FROM walk
+                 JOIN changesets c ON c.id = walk.id
+                 ORDER BY walk.depth",
+            )
+            .map_err(crate::error::from_sqlite)?;
+        let rows = stmt
+            .query_map(params![repo.0, start.as_bytes(), limit], |row| {
+                let cs: Vec<u8> = row.get(0)?;
+                let generation: i64 = row.get(1)?;
+                let body: Vec<u8> = row.get(2)?;
+                Ok((cs, generation, body))
+            })
+            .map_err(crate::error::from_sqlite)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(crate::error::from_sqlite)?;
+        if rows.is_empty() {
+            return Err(Error::NotFound(format!("changeset {start}")));
+        }
+        rows.into_iter()
+            .map(|(cs, generation, body)| {
+                let id = ChangesetId::try_from(cs.as_slice()).map_err(|_| {
+                    Error::Corrupt("a changeset row's id is not a changeset id".to_owned())
+                })?;
+                Ok((id, generation, body))
+            })
+            .collect()
+    }
+
     /// The generation of a changeset that `repo` may see: 1 for a root, else 1 +
     /// the highest parent generation.
     ///
@@ -792,6 +842,25 @@ impl MetaTx for SqliteTx<'_> {
     /// match.
     fn get_tree(&mut self, id: TreeId) -> Result<Tree> {
         load_tree(self.0, id).map(|(tree, _)| tree)
+    }
+
+    /// The stored bytes of the trees the ids name, in the order asked.
+    /// SQLite has one write connection: the existing per-id read, in a
+    /// loop, is the batch.
+    fn get_trees(&mut self, ids: &[TreeId]) -> Result<Vec<Option<Vec<u8>>>> {
+        let mut bodies = Vec::with_capacity(ids.len());
+        let mut stmt = self
+            .0
+            .prepare_cached("SELECT body FROM trees WHERE id = ?1")
+            .map_err(crate::error::from_sqlite)?;
+        for id in ids {
+            let body = stmt
+                .query_row([id.as_bytes()], |row| row.get(0))
+                .optional()
+                .map_err(crate::error::from_sqlite)?;
+            bodies.push(body);
+        }
+        Ok(bodies)
     }
 
     /// Reads a tree's stored `TreeV1` bytes and checks them against its ID. The

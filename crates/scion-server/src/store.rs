@@ -62,7 +62,8 @@ pub(crate) mod test_hooks;
 use test_hooks::{DurabilityLog, DurabilityStep, WritePark};
 
 /// The schema version this build makes and reads.
-pub(crate) const SCHEMA_VERSION: u32 = 9;
+#[allow(unreachable_pub)]
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Schema migrations in order. Migration `n`, from 1, moves the database from
 /// version `n - 1` to version `n`. A released migration never changes.
@@ -128,6 +129,9 @@ struct Inner {
     readers: Readers,
     /// The write connection, for every commit and [`Store::read_unflushed`].
     db: Mutex<Connection>,
+    /// The schema versions this open moved, when it migrated. Version 0's
+    /// first open creates the schema, and reports none.
+    migrated: Option<(u32, u32)>,
     /// Commits that a read may see. It grows under the `db` lock, right
     /// before each COMMIT runs.
     committing: AtomicU64,
@@ -170,6 +174,12 @@ struct Inner {
 }
 
 impl Store {
+    /// The schema versions this open moved, when it migrated: the
+    /// process that opened records the move in its audit log.
+    pub(crate) fn migrated(&self) -> Option<(u32, u32)> {
+        self.inner.migrated
+    }
+
     /// Gives the blob folder and the derive walks the server's metrics
     /// registry, once, before the server serves. Import, fsck and gc
     /// pass none, and nothing records.
@@ -350,7 +360,7 @@ impl Store {
                 dir.display()
             )));
         }
-        migrate(&db, SCHEMA_VERSION)?;
+        let migrated = migrate(&db, SCHEMA_VERSION)?;
         drop(opening);
         // After the migrations, so no read sees an older schema.
         let readers = Readers::open(&path)?;
@@ -358,6 +368,7 @@ impl Store {
             inner: Arc::new(Inner {
                 readers,
                 db: Mutex::new(db),
+                migrated,
                 committing: AtomicU64::new(0),
                 committed: AtomicU64::new(0),
                 flushed: AtomicU64::new(0),
@@ -804,7 +815,16 @@ fn user_version(db: &mut SqliteTx<'_>) -> Result<u32> {
 
 /// Runs the migrations from the database's version up to `target`. Only
 /// tests stop below [`SCHEMA_VERSION`], to make an older database.
-pub(crate) fn migrate(db: &Connection, target: u32) -> Result<()> {
+/// Returns the `(from, to)` versions when it migrated, and `None` when
+/// the database was at `target` already. A fresh database's first open
+/// (version 0) creates the schema, and reports no migration: nothing is
+/// there for a migration to move.
+///
+/// # Errors
+///
+/// What the version read and the migrations' SQL return.
+#[allow(unreachable_pub)]
+pub fn migrate(db: &Connection, target: u32) -> Result<Option<(u32, u32)>> {
     let version = user_version(&mut SqliteTx(db))?;
     if version > SCHEMA_VERSION {
         return Err(Error::Corrupt(format!(
@@ -812,7 +832,7 @@ pub(crate) fn migrate(db: &Connection, target: u32) -> Result<()> {
         )));
     }
     if version == target {
-        return Ok(());
+        return Ok(None);
     }
     tracing::info!(
         from_version = version,
@@ -844,7 +864,14 @@ pub(crate) fn migrate(db: &Connection, target: u32) -> Result<()> {
         to_version = target,
         "the metadata migration is done"
     );
-    Ok(())
+    // Version 0 was no schema at all: the first open creates one, and a
+    // creation moves nothing.
+    let migrated = if version == 0 {
+        None
+    } else {
+        Some((version, target))
+    };
+    Ok(migrated)
 }
 
 /// What is stored under a blob ID.

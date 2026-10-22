@@ -425,7 +425,7 @@ fn in_one_walk<K: Kind>(
             // The walk's permit: walks beyond the cap only repeat work,
             // and starve the writes. Wait for one until the deadline.
             let _permit = take_walk_permit(walks, deadline)?;
-            let value = fill_until::<K>(store, repo, cs, deadline);
+            let value = fill_until::<K>(store, repo, cs, deadline).map(|(value, _)| value);
             retire(walks, &flight);
             return value;
         }
@@ -466,7 +466,7 @@ fn in_one_walk<K: Kind>(
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
 /// [`Kind::derive`].
 pub(crate) fn fill<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
-    fill_until::<K>(store, repo, cs, None)
+    Ok(fill_until::<K>(store, repo, cs, None)?.0)
 }
 
 /// [`fill`], but it stops between steps once `deadline` has passed. The
@@ -481,7 +481,7 @@ pub(crate) fn fill_by<K: Kind>(
     cs: ChangesetId,
     deadline: &Deadline,
 ) -> Result<K::Value> {
-    fill_until::<K>(store, repo, cs, Some(deadline))
+    Ok(fill_until::<K>(store, repo, cs, Some(deadline))?.0)
 }
 
 fn fill_until<K: Kind>(
@@ -489,7 +489,7 @@ fn fill_until<K: Kind>(
     repo: RepoId,
     cs: ChangesetId,
     deadline: Option<&Deadline>,
-) -> Result<K::Value> {
+) -> Result<(K::Value, usize)> {
     let check = || deadline.map_or(Ok(()), Deadline::check);
     // A walk that answers a request holds its frontier inside the store's
     // byte budget, so that however deep the repo, the walks in flight hold
@@ -498,39 +498,61 @@ fn fill_until<K: Kind>(
     let budget = deadline.map(|_| store.derive_flights().walk_bytes());
     let mut held = Vec::new();
     let pending = match walk_all::<K>(store, repo, cs, check, budget.as_ref(), &mut held)? {
-        ControlFlow::Break(value) => return Ok(value),
+        ControlFlow::Break(value) => return Ok((value, 0)),
         ControlFlow::Continue(pending) => pending,
     };
     // The walk's frontier stays in memory through the derives, so its
     // bytes stay taken until they are done.
-    let value = derive_steps::<K>(store, repo, &pending, deadline, check)?;
+    let filled = derive_steps::<K>(store, repo, &pending, deadline, check)?;
     drop(held);
-    value.ok_or_else(|| Error::NotFound(format!("changeset {cs}")))
+    filled.ok_or_else(|| Error::NotFound(format!("changeset {cs}")))
 }
 
-/// Fills `K` for `cs` and its history, then removes every
-/// row of an older version of `K`, at most [`STEP`] rows per transaction.
-/// Returns once all of it is durable.
+/// What one backfill run did: the kind's name, the rows it derived and
+/// stored, and the rows of older versions it removed. The `derive`
+/// command reports both counts in its admin line.
+#[derive(Clone, Debug)]
+pub struct DeriveReport {
+    /// The kind's name, as the store rows name it.
+    pub name: &'static str,
+    /// The rows this run derived and stored.
+    pub written: usize,
+    /// The rows of older versions this run removed.
+    pub removed: usize,
+}
+
+/// Derives the kind of `cs`, and removes the rows of older versions.
+/// Returns the kind's name and what the run stored and removed. The kinds
+/// a user derives are the ones the server ships, each with its own `pub`
+/// fn below, so the crate-private trait never shows in a signature.
 ///
 /// # Errors
 ///
 /// Errors as for the fill, and of [`Store::flush`](crate::store::Store::flush).
-/// Derives the kind of `cs`, and removes the rows of older versions.
-/// Returns the kind's name, which the `derive` command reports. The kinds
-/// a user derives are the ones the server ships, each with its own `pub`
-/// fn below, so the crate-private trait never shows in a signature.
 pub(crate) fn backfill<K: Kind>(
     store: &Backend,
     repo: &str,
     cs: ChangesetId,
-) -> Result<&'static str> {
+) -> Result<DeriveReport> {
     use crate::meta::Meta as _;
     let repo = store.read(|c| c.repo_id(repo))?;
-    fill::<K>(store, repo, cs)?;
-    // A short step means that no older row is left.
-    while store.commit(|c| remove_old::<K>(c))? == STEP {}
+    let (_value, written) = fill_until::<K>(store, repo, cs, None)?;
+    // Every step removes at most a step's worth, and a short step means
+    // that no older row is left; the sum is what the run removed.
+    let mut removed = 0usize;
+    loop {
+        let removed_now = store.commit(|c| remove_old::<K>(c))?;
+        removed += removed_now;
+        if removed_now != STEP {
+            break;
+        }
+    }
     store.flush()?;
-    Ok(K::NAME)
+    Ok(DeriveReport {
+        name: K::NAME,
+        written,
+        removed,
+    })
 }
 
 /// Derives the value of `K` for `cs` inside the caller's transaction, and
@@ -552,8 +574,8 @@ pub(crate) fn derive<K: Kind>(
         ControlFlow::Continue(walk) => walk,
     };
     walk.step::<K>(c, usize::MAX)?;
-    derive_chain::<K>(c, repo, &walk.into_pending(), lens)?
-        .ok_or_else(|| Error::NotFound(format!("changeset {cs}")))
+    let (value, _written) = derive_chain::<K>(c, repo, &walk.into_pending(), lens)?;
+    value.ok_or_else(|| Error::NotFound(format!("changeset {cs}")))
 }
 
 /// Stores the value of `K` for `cs`. A second write must agree with the
@@ -740,8 +762,9 @@ fn derive_steps<K: Kind>(
     pending: &[ChangesetId],
     deadline: Option<&Deadline>,
     check: impl Fn() -> Result<()>,
-) -> Result<Option<K::Value>> {
+) -> Result<Option<(K::Value, usize)>> {
     let mut value = None;
+    let mut written = 0usize;
     for step in pending.chunks(STEP) {
         check()?;
         // The lengths the step's trees carry come from the blob files'
@@ -768,18 +791,20 @@ fn derive_steps<K: Kind>(
         } else {
             HashMap::new()
         };
-        value = store.commit(|c| {
-            let value = derive_chain::<K>(c, repo, step, &mut tree::lens_from(&lens))?;
+        let (step_value, step_written) = store.commit(|c| {
+            let (value, written) = derive_chain::<K>(c, repo, step, &mut tree::lens_from(&lens))?;
             remove_old::<K>(c)?;
-            Ok(value)
+            Ok((value, written))
         })?;
+        written += step_written;
+        value = step_value;
         // A writer that waited for the connection while this step held it
         // gets in before the next step takes it again: the walk waits
         // while writers wait, so the mutex handoff is deterministic, not
         // a race the walker wins under load ([#142]).
         store.wait_for_writers(deadline)?;
     }
-    Ok(value)
+    Ok(value.map(|v| (v, written)))
 }
 
 /// Derives and stores the value of `K` for each of `ids`, in order, from
@@ -792,8 +817,9 @@ fn derive_chain<K: Kind>(
     repo: RepoId,
     ids: &[ChangesetId],
     lens: crate::tree::BlobLens<'_>,
-) -> Result<Option<K::Value>> {
+) -> Result<(Option<K::Value>, usize)> {
     let mut value = None;
+    let mut written = 0usize;
     for &id in ids {
         if let Some(known) = load::<K>(c, id)? {
             value = Some(known);
@@ -809,9 +835,10 @@ fn derive_chain<K: Kind>(
         })?;
         let next = K::derive(c, id, &changeset, parents, lens)?;
         put::<K>(c, id, &next)?;
+        written += 1;
         value = Some(next);
     }
-    Ok(value)
+    Ok((value, written))
 }
 
 /// The stored values of `K` for the parents of `changeset` that `K` reads,
@@ -1546,7 +1573,7 @@ mod tests {
         assert_eq!(DERIVES.get(), 5);
 
         let late = derive_steps::<ChangedPathsV1>(&store, repo, &pending, None, || Ok(())).unwrap();
-        assert_eq!(late, Some(5));
+        assert_eq!(late.map(|(value, _written)| value), Some(5));
         assert_eq!(DERIVES.get(), 5, "the late steps derive nothing again");
     }
 

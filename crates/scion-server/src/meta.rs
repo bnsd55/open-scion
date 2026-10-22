@@ -176,6 +176,24 @@ pub trait MetaTx {
     /// Reads a changeset of `repo`, and checks it against its ID.
     fn get_changeset(&mut self, repo: RepoId, id: ChangesetId) -> Result<Changeset>;
 
+    /// `start` and up to `limit - 1` of its first-parent ancestors, as
+    /// (id, generation, body), newest first, in walk order: the page one
+    /// statement fetches where the backend can. Every row is an ancestor
+    /// of `start`, so the repo check rides the start row alone, as
+    /// [`MetaTx::get_changeset`] checks it. The page is short at the root
+    /// of the history.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if `repo` does not hold `start`.
+    /// [`Error::Corrupt`] if a row's id is not a changeset id.
+    fn first_parent_page(
+        &mut self,
+        repo: RepoId,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, i64, Vec<u8>)>>;
+
     /// Whether `repo` may see changeset `id`.
     fn has_changeset(&mut self, repo: RepoId, id: ChangesetId) -> Result<bool>;
 
@@ -356,6 +374,11 @@ pub trait MetaTx {
 
     /// Reads a tree, and checks it against its ID.
     fn get_tree(&mut self, id: TreeId) -> Result<Tree>;
+
+    /// The stored bytes of the trees the ids name, in the order asked:
+    /// `None` for an id that is not stored. Unchecked bytes: the caller
+    /// decodes each and checks it against its id, as `get_tree` does.
+    fn get_trees(&mut self, ids: &[TreeId]) -> Result<Vec<Option<Vec<u8>>>>;
 
     /// Reads a tree's stored `TreeV1` bytes, checked against its ID.
     fn get_tree_body(&mut self, id: TreeId) -> Result<Vec<u8>>;
