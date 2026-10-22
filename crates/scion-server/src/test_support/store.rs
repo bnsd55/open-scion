@@ -207,6 +207,14 @@ impl Store {
     pub fn commits(&self) -> u64 {
         self.inner.committed.load(Ordering::Acquire)
     }
+    /// The commit count a completed flush last covered: every commit
+    /// below it is durable.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn flushed_upto(&self) -> u64 {
+        self.inner.flushed.load(Ordering::Acquire)
+    }
     /// Sets how many of the next commits fail as a busy database. Tests of
     /// the import's busy retry use it: the failing transaction ran and
     /// rolled back, so the retry re-runs it whole.

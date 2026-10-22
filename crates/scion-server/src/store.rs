@@ -613,7 +613,9 @@ impl Store {
     /// cache covers every commit before it, and the log recovered after a
     /// crash is a prefix of the commits (the write-ahead log's checksums are
     /// chained). So a land that builds on a head that is not durable yet
-    /// replies only after a flush that covers that head too.
+    /// replies only after a flush that covers that head too, and every land
+    /// reply — an error reply that says the land stays pending included —
+    /// waits for a flush that covers the row it recorded.
     ///
     /// # Errors
     ///

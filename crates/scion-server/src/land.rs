@@ -339,8 +339,9 @@ impl Lands {
         // while, so it happens here, outside every lock.
         let evicted = mem::take(&mut *self.evicted.lock().unwrap_or_else(PoisonError::into_inner));
         drop(evicted);
-        let outcome = outcome?;
-        if let Some(metrics) = &self.metrics {
+        if let Ok(outcome) = &outcome
+            && let Some(metrics) = &self.metrics
+        {
             metrics.land(match outcome.state {
                 LandState::Landed => "landed",
                 LandState::Conflict => "conflict",
@@ -350,9 +351,12 @@ impl Lands {
             });
         }
         // Lands on one ref commit one at a time. Waiting for the flush after
-        // the ref lock is released lets them share it.
+        // the ref lock is released lets them share it. Every reply waits for
+        // the flush, the error replies included: a reply that says the land
+        // stays pending rests on the row the land recorded, and that row
+        // must be durable before the reply goes out.
         store.flush()?;
-        Ok(outcome)
+        outcome
     }
 
     /// [`Lands::land`], up to commits that are not durable yet. Its reads do
@@ -543,10 +547,25 @@ fn check_name(what: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// A verdict the head decided, and the ref version the plan read it
+/// from: `settle` records it only while the ref still answers that
+/// version, and an import that moved it in the window replans.
+struct Verdict {
+    state: LandState,
+    detail: String,
+    paths: Vec<RepoPath>,
+    /// The ref version the plan read; `None` for a ref the plan read
+    /// and did not find.
+    expected: Option<i64>,
+}
+
 /// What step 4 decided.
 enum Plan {
+    /// A verdict that does not depend on the ref: the changeset's own
+    /// shape refused it before any head was read.
     Reject(String),
-    Conflict(String, Vec<RepoPath>),
+    /// A verdict the head decided.
+    Verdict(Verdict),
     Land {
         rebased: Changeset,
         head: RefState,
@@ -637,12 +656,16 @@ fn finish(
             plan(lands, c, repo, req, index).map(Planned::Do)
         })?;
         #[cfg(test)]
-        if let Some(step) = lands
+        let step = lands
             .before_settle
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
+            .take();
+        #[cfg(test)]
+        // The hook runs with the seam's lock released: a hook that arms
+        // the next one (a land that must lose the CAS at every attempt)
+        // takes the same lock to set it.
+        if let Some(step) = step {
             step();
         }
         let plan = match planned {
@@ -678,7 +701,12 @@ fn plan(
         ));
     };
     let Some(head) = c.get_ref(repo, target)? else {
-        return Ok(Plan::Reject(format!("ref {target:?} does not exist")));
+        return Ok(Plan::Verdict(Verdict {
+            state: LandState::Rejected,
+            detail: format!("ref {target:?} does not exist"),
+            paths: vec![],
+            expected: None,
+        }));
     };
     let index = match index {
         Some(index) => index,
@@ -688,9 +716,12 @@ fn plan(
     let conflicts = match index.check(lands, c, repo, base, cs.changes(), &req.deadline)? {
         Checked::Paths(conflicts) => conflicts,
         Checked::NotOnHistory => {
-            return Ok(Plan::Reject(format!(
-                "base {base} is not on the first-parent history of {target:?}"
-            )));
+            return Ok(Plan::Verdict(Verdict {
+                state: LandState::Rejected,
+                detail: format!("base {base} is not on the first-parent history of {target:?}"),
+                paths: vec![],
+                expected: Some(head.version),
+            }));
         }
         Checked::Derive => return Ok(Plan::Derive(head.target)),
     };
@@ -699,7 +730,12 @@ fn plan(
             "{} path(s) changed on {target:?} after the base",
             conflicts.len()
         );
-        return Ok(Plan::Conflict(detail, conflicts));
+        return Ok(Plan::Verdict(Verdict {
+            state: LandState::Conflict,
+            detail,
+            paths: conflicts,
+            expected: Some(head.version),
+        }));
     }
     let rebased = cs
         .with_parents(vec![head.target])
@@ -707,8 +743,14 @@ fn plan(
     Ok(Plan::Land { rebased, head })
 }
 
-/// Step 5: records what the plan decided. If the ref moved since the plan,
-/// writes nothing and returns [`Error::Aborted`].
+/// Step 5: records what the plan decided. If the ref moved since the
+/// plan, writes nothing and returns [`Error::Aborted`]: a verdict the
+/// head decided is final only against the head it was planned on, so it
+/// carries the ref version the plan read, and the recording transaction
+/// re-reads the ref and writes only under that version - the same
+/// guard the land's own move has in its CAS. An import that moved the
+/// ref in the window aborts the verdict, and `finish` replans against
+/// the head the import made.
 fn settle(
     lands: &Lands,
     store: &Backend,
@@ -727,11 +769,9 @@ fn settle(
                 })
                 .map(Finished::Outcome);
         }
-        Plan::Conflict(detail, paths) => {
+        Plan::Verdict(verdict) => {
             return store
-                .commit(|c| {
-                    c.set_land_state(repo, land_id, LandState::Conflict, None, detail, paths)
-                })
+                .commit(|c| record_verdict(c, repo, target, land_id, verdict))
                 .map(Finished::Outcome);
         }
         Plan::Land { rebased, head } => (rebased, head),
@@ -778,16 +818,63 @@ fn settle(
         // The path check passed, but the changes still clash with the head's
         // tree (for example a delete of a file the head never had). The
         // transaction rolled back; record the conflict.
+        // The path check passed, but the changes still clash with the head's
+        // tree (for example a delete of a file the head never had). The
+        // transaction rolled back; record the conflict - against the
+        // head the apply ran on, with the same version guard as any
+        // verdict: the failed transaction and this one are two, and an
+        // import can move the ref between them.
         Err(Error::Apply(e)) => {
             let detail = format!("does not apply to {target:?}: {e}");
             store
                 .commit(|c| {
-                    c.set_land_state(repo, land_id, LandState::Conflict, None, detail, vec![])
+                    record_verdict(
+                        c,
+                        repo,
+                        target,
+                        land_id,
+                        Verdict {
+                            state: LandState::Conflict,
+                            detail,
+                            paths: vec![],
+                            expected: Some(head.version),
+                        },
+                    )
                 })
                 .map(Finished::Outcome)
         }
         Err(e) => Err(e),
     }
+}
+
+/// Records a verdict the head decided, only while the ref still answers
+/// the version the plan read it from. The re-read shares the write
+/// transaction with the verdict: the write orders this transaction
+/// against the import's move on every backend (the one write connection,
+/// or the collector's key), so a ref the plan read is either still
+/// here, or the import committed before this transaction began and the
+/// read below sees it. A ref that moved aborts the verdict, and
+/// `finish` replans against the head the import made.
+fn record_verdict(
+    c: &mut dyn MetaTx,
+    repo: RepoId,
+    target: &str,
+    land_id: i64,
+    verdict: Verdict,
+) -> Result<LandOutcome> {
+    let Verdict {
+        state,
+        detail,
+        paths,
+        expected,
+    } = verdict;
+    let at = c.get_ref(repo, target)?.map(|r| r.version);
+    if at != expected {
+        return Err(Error::Aborted(format!(
+            "ref {target:?} moved during the land; retry with the same request key"
+        )));
+    }
+    c.set_land_state(repo, land_id, state, None, detail, paths)
 }
 
 /// For one ref's first-parent history: the newest generation at which each
@@ -1318,6 +1405,18 @@ mod tests {
     fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        fixture_on(store, dir)
+    }
+
+    /// The same repo, on the test backend the environment names: the
+    /// verdict race runs on SQLite and on the test database alike.
+    fn fixture_shared() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::open_test_shared(dir.path()).unwrap();
+        fixture_on(store, dir)
+    }
+
+    fn fixture_on(store: Backend, dir: tempfile::TempDir) -> Fixture {
         let (repo, root) = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
@@ -1544,6 +1643,69 @@ mod tests {
         );
     }
 
+    /// An error reply says the land stays pending and a retry with the
+    /// same request key resumes it. The row that promise rests on must be
+    /// durable before the reply goes out, so a crash that follows the
+    /// reply cannot lose it. The call's guard drops before the plan
+    /// starts, so the land ends in that error reply right after it records
+    /// its row, before any settle work runs.
+    #[test]
+    fn an_error_reply_waits_for_the_pending_row_to_be_durable() {
+        let f = fixture();
+        // The index starts at B, so the import below moves main past it,
+        // and the plan's next step checks the deadline before it derives
+        // anything.
+        f.move_main(f.commit(f.root, &[put("b/y", "B")]));
+        f.fill("f", 1);
+        f.move_main(f.commit(f.main().target, &[put("c", "import")]));
+        let cs = f.commit(f.main().target, &[put("a/x", "mine")]);
+        // The call went before the plan started: the guard drops, the
+        // deadline itself is far in the future.
+        let deadline = Deadline::new(Instant::now() + std::time::Duration::from_secs(600));
+        let guard = deadline.guard();
+        let gone = LandRequest {
+            deadline,
+            ..req(cs, "k")
+        };
+        drop(guard);
+        let commits_before = f.store.commits();
+        let err = f.lands.land(&f.store, &caller(), &gone).unwrap_err();
+        // The reply says the land stays pending, and a retry with the
+        // same request key resumes it.
+        assert!(
+            matches!(err, Error::Cancelled(ref d)
+                if d.contains("the land stays pending, retry with the same request key")),
+            "{err}"
+        );
+        // The row's commit is durable when the reply is built: a flush
+        // covered every commit made before the reply, the pending row's
+        // included. `flushed_upto` is the store's own durability mark, the
+        // one a flush updates on every platform. The check runs before any
+        // read of this test: a read of an unflushed commit flushes on its
+        // own, which would hide the bug.
+        assert!(
+            f.store.flushed_upto() > commits_before,
+            "the error reply went out before the pending row was durable: \
+             flushed to {}, commits reach {}",
+            f.store.flushed_upto(),
+            commits_before + 1,
+        );
+        let state: String = f
+            .store
+            .read(|c| {
+                c.sqlite()
+                    .unwrap()
+                    .query_row(
+                        "SELECT state FROM lands WHERE request_key = 'k'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(crate::error::from_sqlite)
+            })
+            .unwrap();
+        assert_eq!(state, "pending");
+    }
+
     #[test]
     fn a_head_without_a_root_tree_is_derived_in_steps_before_the_land() {
         let f = fixture();
@@ -1669,6 +1831,57 @@ mod tests {
         assert_eq!(parents, vec![import], "the land rebased onto the import");
         assert_eq!(metrics.land_replans(), 1, "the replan counted once");
         // A retry with the same key returns the same outcome.
+        let again = lands.land(&f.store, &caller(), &req(cs, "hook")).unwrap();
+        assert_eq!(stored(&again), stored(&out));
+    }
+
+    /// The collector of a stale verdict: the plan reads a Conflict off
+    /// the head, an import moves the ref before the settle, and the
+    /// settle must not record the verdict the old head answered for. The
+    /// settle re-reads the ref version inside its own transaction and
+    /// replans, so the reply names every path the head the import made
+    /// changed after the base - and a retry with the same key reads the
+    /// same verdict back.
+    #[test]
+    fn a_conflict_recorded_while_an_import_moved_the_ref_is_not_final() {
+        let f = fixture_shared();
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        let lands = Lands::new(None, Some(Arc::clone(&metrics)));
+        // Main moves past the base and takes `b/y`, so the plan reads a
+        // Conflict on `b/y`.
+        f.move_main(f.commit(f.root, &[put("b/y", "import")]));
+        let cs = f.commit(f.root, &[put("b/y", "mine"), put("c", "mine")]);
+        // The import commits its changeset but holds its ref move for
+        // the moment between the land's plan and its settle.
+        let import = f.commit(f.main().target, &[put("c", "import too")]);
+        let hook_store = f.store.clone();
+        let hook_repo = f.repo;
+        lands.set_before_settle(Box::new(move || {
+            let head = hook_store
+                .read(|c| Ok(c.get_ref(hook_repo, "main")?.unwrap()))
+                .unwrap();
+            let moved = hook_store
+                .write(|c| c.cas_ref(hook_repo, "main", Some(head.version), import))
+                .unwrap();
+            assert!(moved, "the import's move lost a race it cannot lose");
+        }));
+
+        let out = lands.land(&f.store, &caller(), &req(cs, "hook")).unwrap();
+        assert_eq!(out.state, LandState::Conflict, "{}", out.detail);
+        // The verdict is the plan's answer to the head the import made:
+        // it names `c`, which only that head changed. The stale verdict
+        // planned on the earlier head names `b/y` alone.
+        assert!(
+            out.conflict_paths.iter().any(|p| p.as_bytes() == b"c"),
+            "the verdict names the head the import made: {:?}",
+            out.conflict_paths
+        );
+        assert_eq!(
+            metrics.land_replans(),
+            1,
+            "the stale verdict replanned against the head the import made"
+        );
+        // A retry with the same key returns the same verdict.
         let again = lands.land(&f.store, &caller(), &req(cs, "hook")).unwrap();
         assert_eq!(stored(&again), stored(&out));
     }
