@@ -508,10 +508,6 @@ fn fill_until<K: Kind>(
     filled.ok_or_else(|| Error::NotFound(format!("changeset {cs}")))
 }
 
-/// Fills `K` for `cs` and its history, then removes every
-/// row of an older version of `K`, at most [`STEP`] rows per transaction.
-/// Returns once all of it is durable.
-///
 /// What one backfill run did: the kind's name, the rows it derived and
 /// stored, and the rows of older versions it removed. The `derive`
 /// command reports both counts in its admin line.
@@ -529,6 +525,10 @@ pub struct DeriveReport {
 /// Returns the kind's name and what the run stored and removed. The kinds
 /// a user derives are the ones the server ships, each with its own `pub`
 /// fn below, so the crate-private trait never shows in a signature.
+///
+/// # Errors
+///
+/// Errors as for the fill, and of [`Store::flush`](crate::store::Store::flush).
 pub(crate) fn backfill<K: Kind>(
     store: &Backend,
     repo: &str,
