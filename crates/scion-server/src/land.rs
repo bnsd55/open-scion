@@ -501,8 +501,20 @@ fn check_name(what: &str, value: &str) -> Result<()> {
 
 /// What step 4 decided.
 enum Plan {
+    /// A verdict that does not depend on the ref: the changeset's own
+    /// shape refused it before any head was read.
     Reject(String),
-    Conflict(String, Vec<RepoPath>),
+    /// A verdict the head decided, against the ref version the plan
+    /// read it from. `None` is the version of a ref the plan read and
+    /// did not find. `settle` records the verdict only while the ref
+    /// still answers that version; an import that moved it in the
+    /// window replans.
+    Verdict {
+        state: LandState,
+        detail: String,
+        paths: Vec<RepoPath>,
+        expected: Option<i64>,
+    },
     Land {
         rebased: Changeset,
         head: RefState,
@@ -634,7 +646,12 @@ fn plan(
         ));
     };
     let Some(head) = c.get_ref(repo, target)? else {
-        return Ok(Plan::Reject(format!("ref {target:?} does not exist")));
+        return Ok(Plan::Verdict {
+            state: LandState::Rejected,
+            detail: format!("ref {target:?} does not exist"),
+            paths: vec![],
+            expected: None,
+        });
     };
     let index = match index {
         Some(index) => index,
@@ -644,9 +661,12 @@ fn plan(
     let conflicts = match index.check(lands, c, repo, base, cs.changes(), &req.deadline)? {
         Checked::Paths(conflicts) => conflicts,
         Checked::NotOnHistory => {
-            return Ok(Plan::Reject(format!(
-                "base {base} is not on the first-parent history of {target:?}"
-            )));
+            return Ok(Plan::Verdict {
+                state: LandState::Rejected,
+                detail: format!("base {base} is not on the first-parent history of {target:?}"),
+                paths: vec![],
+                expected: Some(head.version),
+            });
         }
         Checked::Derive => return Ok(Plan::Derive(head.target)),
     };
@@ -655,7 +675,12 @@ fn plan(
             "{} path(s) changed on {target:?} after the base",
             conflicts.len()
         );
-        return Ok(Plan::Conflict(detail, conflicts));
+        return Ok(Plan::Verdict {
+            state: LandState::Conflict,
+            detail,
+            paths: conflicts,
+            expected: Some(head.version),
+        });
     }
     let rebased = cs
         .with_parents(vec![head.target])
@@ -689,10 +714,27 @@ fn settle(
                 })
                 .map(Finished::Outcome);
         }
-        Plan::Conflict(detail, paths) => {
+        Plan::Verdict {
+            state,
+            detail,
+            paths,
+            expected,
+        } => {
             return store
                 .commit(|c| {
-                    c.set_land_state(repo, land_id, LandState::Conflict, None, detail, paths)
+                    // The re-read shares the write transaction with the
+                    // verdict: the write orders this transaction against
+                    // the import's move on every backend, so a ref the
+                    // plan read is either still here, or the import
+                    // committed before this transaction began and the
+                    // read below sees it. A ref that moved replans.
+                    let at = c.get_ref(repo, target)?.map(|r| r.version);
+                    if at != expected {
+                        return Err(Error::Aborted(format!(
+                            "ref {target:?} moved during the land; retry with the same request key"
+                        )));
+                    }
+                    c.set_land_state(repo, land_id, state, None, detail, paths)
                 })
                 .map(Finished::Outcome);
         }
