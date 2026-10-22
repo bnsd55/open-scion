@@ -231,6 +231,16 @@ pub mod test_support {
                 self.as_sqlite()
             }
         }
+
+        /// The schema versions this build migrates to, so a test pins
+        /// the migration story without naming a literal that the next
+        /// migration turns stale.
+        pub mod schema_version {
+            /// The SQLite store's schema version ([`crate::store`]).
+            pub const SQLITE: u32 = crate::store::SCHEMA_VERSION;
+            /// The Postgres schema's version ([`crate::pg`]).
+            pub const POSTGRES: u32 = crate::pg::PG_SCHEMA_VERSION;
+        }
     }
     /// The error a changeset apply can end in, and the conversion the
     /// tests share with the crate, for the write tests.

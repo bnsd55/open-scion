@@ -1055,6 +1055,13 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn put_git_imports(&mut self, repo: RepoId, pairs: &[(ObjectId, ChangesetId)]) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.put_git_imports(repo, pairs),
+            Self::Postgres(pg) => pg.put_git_imports(repo, pairs),
+        }
+    }
+
     fn imported_commits(
         &mut self,
         repo: RepoId,

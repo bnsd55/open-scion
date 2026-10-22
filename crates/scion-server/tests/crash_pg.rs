@@ -479,7 +479,15 @@ fn seed_wide_changeset(data: &Path, name: &str) -> ChangesetId {
         puts.into_iter().collect::<BTreeMap<_, _>>(),
     )
     .expect("changeset fits the format");
-    write::create_changeset(&store, REPO, &cs.encode()).unwrap()
+    write::create_changeset(
+        &store,
+        REPO,
+        &cs.encode(),
+        &scion_server::test_support::deadline::Deadline::new(
+            Instant::now() + Duration::from_secs(600),
+        ),
+    )
+    .unwrap()
 }
 
 /// The ref's target as the metadata holds it, through the seam.

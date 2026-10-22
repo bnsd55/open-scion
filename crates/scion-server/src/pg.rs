@@ -3101,6 +3101,35 @@ impl MetaTx for PgTx<'_> {
         Ok(())
     }
 
+    /// Records that the git commits became the changesets. One statement
+    /// per 1,000 pairs: the ids travel as one bytea array each, and the
+    /// conflict rule is the single row's, so a repeated pair is skipped.
+    fn put_git_imports(&mut self, repo: RepoId, pairs: &[(ObjectId, ChangesetId)]) -> Result<()> {
+        for chunk in pairs.chunks(crate::meta::DERIVED_BATCH) {
+            let oids: Vec<Vec<u8>> = chunk
+                .iter()
+                .map(|(oid, _)| oid.as_slice().to_vec())
+                .collect();
+            let css: Vec<Vec<u8>> = chunk
+                .iter()
+                .map(|(_, cs)| id_bytes(cs.as_bytes()))
+                .collect();
+            self.c.execute(
+                "INSERT INTO git_import (repo_id, git_algo, git_oid, cs)
+                 SELECT $1, $2, u.oid, u.cs
+                 FROM unnest($3::bytea[], $4::bytea[]) AS u(oid, cs)
+                 ON CONFLICT (repo_id, git_algo, git_oid) DO NOTHING",
+                &[
+                    P::i64(repo.0),
+                    P::i64(SHA1),
+                    P::bytea_array(oids),
+                    P::bytea_array(css),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Every git commit already imported into `repo`.
     fn imported_commits(
         &mut self,

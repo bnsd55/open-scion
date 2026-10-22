@@ -162,12 +162,14 @@ fn the_ladder_walks_stay_under_the_statement_budget() {
     // 200 covers the single-node loads off the chains. Measured 1,171
     // and 139 here.
     let search_cap = u64::try_from(merges).unwrap() / 8 + 200;
-    // One merge-base walk's budget: the Paint walk still asks for each
-    // merge's parents in its own statement, and each pop that misses
-    // the node cache fetches a chain, which answers about one pop per
-    // statement here: about 2 statements per merge, plus the steps'
-    // overhead. Measured 20,147 to 20,149.
-    let paint_cap = 2 * u64::try_from(merges).unwrap() + 2_000;
+    // One merge-base walk's budget: the Paint pop order is unchanged, and
+    // the lookups ride the chain page's caches: a page brings its nodes'
+    // parents in one `parents_many` statement and those parents' nodes in
+    // one batch statement, so a page costs about 4 statements per 1,000
+    // nodes, plus the steps' overhead. Same formula as the search: about
+    // 1/8th statement per merge with k = 200 for the small histories.
+    // Measured 207 here.
+    let paint_cap = u64::try_from(merges).unwrap() / 8 + 200;
     let not_ancestor = statements(&mut || {
         assert!(!read::is_ancestor(&store, REPO, late, tip, &later()).unwrap());
     });
