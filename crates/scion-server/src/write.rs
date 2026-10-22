@@ -215,9 +215,30 @@ fn bad_blob(blob: BlobId, path: &RepoPath, problem: &str, repo: &str) -> Error {
 /// It gets the answer of a blob that is not stored, and no blob is read, so
 /// neither the answer nor its time shows whether another repo has the blob.
 fn check_members(c: &mut dyn MetaTx, repo: &str, repo_id: RepoId, cs: &Changeset) -> Result<()> {
+    // The distinct blobs, in the changeset's own order, in one batched
+    // read. A changeset may carry 100,000 changes: one query per blob
+    // would cost one round trip each. The refusal must name the first
+    // missing put's path, so the whole list is read and this then picks
+    // the first missing put from it, exactly as the per-blob loop did.
     let mut seen = BTreeSet::new();
+    let mut distinct: Vec<BlobId> = Vec::new();
+    for (_, blob) in db::puts(cs) {
+        if seen.insert(blob) {
+            distinct.push(blob);
+        }
+    }
+    if distinct.is_empty() {
+        return Ok(());
+    }
+    let missing: std::collections::HashSet<BlobId> = c
+        .repo_missing_blobs(repo_id, &distinct)?
+        .into_iter()
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
     for (path, blob) in db::puts(cs) {
-        if seen.insert(blob) && !c.repo_has_blob(repo_id, blob)? {
+        if missing.contains(&blob) {
             return Err(bad_blob(blob, path, "is not stored", repo));
         }
     }
