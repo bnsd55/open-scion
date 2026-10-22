@@ -49,4 +49,12 @@ fi
 cd "$(dirname "$0")/.."
 [ -d .github/workflows ] || die "no .github/workflows to lint"
 note "actionlint $($ACTIONLINT -version | head -1 | cut -d' ' -f2) over .github/workflows/"
-exec "$ACTIONLINT" -color .github/workflows/*.yml
+"$ACTIONLINT" -color .github/workflows/*.yml
+
+# Every workflow carries a top-level permissions: block: a workflow
+# without one runs its token with the default write rights, and
+# Scorecard's Token-Permissions check scores the whole of main 0 for it
+# (#518 shipped pg-disk-full.yml without one).
+for workflow in .github/workflows/*.yml; do
+  grep -q '^permissions:' "$workflow" || die "$workflow has no top-level permissions: block"
+done

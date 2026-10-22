@@ -79,14 +79,16 @@ Prove the one-machine server under real load.
 
 - A 72-hour soak and fault job runs against one server, with resource
   ceilings named in advance, and its raw numbers published in
-  [benchmarks](benchmarks.md): open. What exists is a 120-minute
-  nightly soak ([#320](https://github.com/bnsd55/openscion/issues/320)),
-  whose scheduled runs on `main` failed on the RSS warm-up; the fix
-  landed in [#365](https://github.com/bnsd55/openscion/pull/365), and
-  the next scheduled run confirms it. The fault job
-  does not exist yet. No 72-hour run has happened: it will run on a
-  rented VM as a one-job self-hosted runner (D10). No soak numbers are
-  in [benchmarks](benchmarks.md) yet.
+  [benchmarks](benchmarks.md): open. The 12-hour fault soak (Run B)
+  ran and passed; its numbers are in
+  [benchmarks](benchmarks.md#fault-soak-run-b). The 72-hour soak (Run
+  A) runs on an owner machine since 2026-10-21, and its report comes
+  on [#399](https://github.com/bnsd55/openscion/issues/399). A
+  120-minute
+  nightly soak ([#320](https://github.com/bnsd55/openscion/issues/320))
+  runs scheduled on `main`; its RSS warm-up failure was fixed in
+  [#365](https://github.com/bnsd55/openscion/pull/365), and the
+  scheduled run of 2026-10-21 passed.
 - [The checkout benchmark stands against `git clone`](https://github.com/bnsd55/openscion/issues/6):
   done, the comparison and its numbers are in
   [benchmarks](benchmarks.md).
