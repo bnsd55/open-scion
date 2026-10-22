@@ -86,8 +86,9 @@ pub trait Meta: Send + Sync + 'static {
 
     /// Runs `f` in one write transaction. It commits when `f` returns `Ok`
     /// and rolls back otherwise, and returns before the commit is durable.
-    /// A backend with retryable errors may run `f` again; it must not
-    /// change anything outside the transaction.
+    /// Every backend runs `f` exactly once; a retryable error comes back
+    /// from the call instead of rerunning `f`, and `f` changes nothing
+    /// outside the transaction.
     ///
     /// # Errors
     ///
