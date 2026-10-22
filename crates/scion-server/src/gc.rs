@@ -290,6 +290,11 @@ fn prune_rows(
                 // [`DERIVED_BATCH`]: one statement per 1,000 ids instead
                 // of one per changeset. A missing body is skipped, as the
                 // walk reads it: `fsck` reports it.
+                // SHORTCUT: 1,000 bodies per statement; memory is 1,000 x
+                // the largest body in a chunk (an imported initial commit
+                // can hold MAX_CHANGES changes). Upgrade path if that
+                // matters: chunk by bytes (octet_length(body)) or a
+                // cursor with a fetch size.
                 let mut fresh = BTreeSet::new();
                 for ids in unseen.chunks(crate::meta::DERIVED_BATCH) {
                     for (id, body) in c.stored_changeset_bodies(ids)? {
