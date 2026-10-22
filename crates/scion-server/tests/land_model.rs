@@ -733,13 +733,27 @@ async fn the_model_holds_across_lands_retries_and_restarts() {
         // named a hold that never happened).
         tokio::time::sleep(Duration::from_millis(150)).await;
         if round % 3 != 0 {
-            let conn = rusqlite::Connection::open(data.join("scion.db")).unwrap();
+            // The read of the server's own lands table (SQLite's file, or
+            // the server's schema), so the poll sees the same rows on
+            // both backends. The per-round counts name what the check
+            // sees, so a wrong-database read cannot hide as a flake.
+            // The read of the server's own lands table: the per-round
+            // print names what the check sees, so a wrong-database read
+            // cannot hide as a flake. The reader sits in a RefCell
+            // because the wait's closure runs as `Fn`.
+            let lands = std::cell::RefCell::new(common::LandsReader::open(&data));
+            let (total, pending) = lands.borrow_mut().counts();
+            println!("round {round}: the lands table holds {total} rows, {pending} pending");
             if wait_until_bounded("a land is pending in the database", 5, || {
-                pending_lands(&conn) > 0
+                lands.borrow_mut().counts().1 > 0
             })
             .await
             {
                 pending_kills += 1;
+            }
+            let (_, pending) = lands.borrow_mut().counts();
+            if pending == 0 {
+                println!("round {round}: the poll never saw a pending land");
             }
         }
         tokio::time::sleep(Duration::from_millis(u64::try_from(rng.below(60)).unwrap())).await;
