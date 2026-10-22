@@ -466,6 +466,44 @@ fn shape(line: &serde_json::Value) -> BTreeMap<String, &'static str> {
 
 /// The exercise: one refused call, the start line, a put, a create,
 /// and the failed create. Returns the audit's parsed lines.
+/// Writes the import's and the restore's own admin lines, the events the
+/// import and restore subcommands record: one intent and one result per
+/// run, with the runs' counts.
+async fn write_import_restore_lines(audit: &Audit) {
+    for line in [
+        Event::new(
+            "admin",
+            "intent",
+            serde_json::json!({ "what": "import", "repo": "hist" }),
+        ),
+        Event::new(
+            "admin",
+            "ok",
+            serde_json::json!({
+                "what": "import",
+                "repo": "hist",
+                "commits": 2,
+                "commits_imported": 2,
+                "verified": 2,
+                "refs_moved": 1,
+            }),
+        ),
+        Event::new("admin", "intent", serde_json::json!({ "what": "restore" })),
+        Event::new(
+            "admin",
+            "ok",
+            serde_json::json!({
+                "what": "restore",
+                "repos": 1,
+                "refs": 1,
+                "lands": 0,
+            }),
+        ),
+    ] {
+        audit.record(line).await.unwrap();
+    }
+}
+
 async fn exercise() -> (tempfile::TempDir, std::path::PathBuf) {
     use scion_proto::v1::{PutBlobRequest, ResolveRefRequest};
     use tokio_stream::once;
@@ -572,6 +610,15 @@ async fn exercise() -> (tempfile::TempDir, std::path::PathBuf) {
         String::from_utf8_lossy(&out.stderr)
     );
     wait_for_kind(&audit_path, "admin", "ok").await;
+
+    // The import's and the restore's own admin lines, as the CLI writes
+    // them: this exercise runs in-process, so it writes the same
+    // events the import and restore subcommands record (the binary
+    // tests of admin_audit.rs drive those real runs and pin their
+    // fields against the CLI).
+    let audit = Audit::open(&audit_path).unwrap();
+    write_import_restore_lines(&audit).await;
+    wait_for_lines(&audit_path, 21).await;
     (dir, audit_path)
 }
 
