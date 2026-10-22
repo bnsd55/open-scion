@@ -923,6 +923,31 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn get_derived_batch(
+        &mut self,
+        kind: &str,
+        version: u32,
+        ids: &[ChangesetId],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        match self {
+            Self::Sqlite(tx) => tx.get_derived_batch(kind, version, ids),
+            Self::Postgres(pg) => pg.get_derived_batch(kind, version, ids),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn bulk_seed(
+        &mut self,
+        repo: RepoId,
+        css: &[scion_core::Changeset],
+        derived: &[(&'static str, u32, ChangesetId, Vec<u8>)],
+    ) -> Result<Vec<ChangesetId>> {
+        match self {
+            Self::Sqlite(tx) => tx.bulk_seed(repo, css, derived),
+            Self::Postgres(pg) => pg.bulk_seed(repo, css, derived),
+        }
+    }
+
     fn put_derived(
         &mut self,
         kind: &str,

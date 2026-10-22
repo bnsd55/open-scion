@@ -3,9 +3,6 @@ name: pg disk full
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
   test:
     name: test (postgres disk full)

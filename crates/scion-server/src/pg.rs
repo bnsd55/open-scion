@@ -349,6 +349,12 @@ enum Param {
     OptBytes(Option<Vec<u8>>),
     /// A list of byte strings, for a `= ANY($n)` over `bytea[]`.
     ByteaArray(Vec<Vec<u8>>),
+    /// A list of integers, for the bulk seed's `unnest` over `int8[]`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    I64Array(Vec<i64>),
+    /// A list of strings, for the bulk seed's `unnest` over `text[]`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    TextArray(Vec<&'static str>),
 }
 
 impl Param {
@@ -376,6 +382,18 @@ impl Param {
     fn bytea_array(v: Vec<Vec<u8>>) -> Param {
         Param::ByteaArray(v)
     }
+
+    /// A list of integers, as one `int8[]` parameter.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn i64_array(v: Vec<i64>) -> Param {
+        Param::I64Array(v)
+    }
+
+    /// A list of strings, as one `text[]` parameter.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn text_array(v: Vec<&'static str>) -> Param {
+        Param::TextArray(v)
+    }
 }
 
 impl ToSql for Param {
@@ -391,6 +409,10 @@ impl ToSql for Param {
             Self::Bytes(v) => v.to_sql(t, out),
             Self::OptBytes(v) => v.to_sql(t, out),
             Self::ByteaArray(v) => v.to_sql(t, out),
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::I64Array(v) => v.to_sql(t, out),
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::TextArray(v) => v.to_sql(t, out),
         }
     }
 
@@ -410,6 +432,10 @@ impl ToSql for Param {
             Self::Bytes(v) => v.to_sql(t, out),
             Self::OptBytes(v) => v.to_sql(t, out),
             Self::ByteaArray(v) => v.to_sql(t, out),
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::I64Array(v) => v.to_sql(t, out),
+            #[cfg(any(test, feature = "test-hooks"))]
+            Self::TextArray(v) => v.to_sql(t, out),
         }
     }
 }
@@ -2331,6 +2357,100 @@ impl MetaTx for PgTx<'_> {
             .map(|row| row.get(0)))
     }
 
+    fn get_derived_batch(
+        &mut self,
+        kind: &str,
+        version: u32,
+        ids: &[ChangesetId],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        // One statement for the whole batch: the ids travel as one bytea
+        // array, the reply has at most one row per id. The caller's read
+        // transaction holds for the batch, so a land between two ids of the
+        // batch cannot mix two states.
+        let version = i64::from(version);
+        let cs = ids
+            .iter()
+            .map(|id| id_bytes(id.as_bytes()))
+            .collect::<Vec<_>>();
+        let rows = self.c.query(
+            "SELECT cs, value FROM derived
+             WHERE kind = $1 AND version = $2 AND cs = ANY($3)",
+            &[P::text(kind), P::i64(version), P::bytea_array(cs)],
+        )?;
+        let mut found = rows
+            .into_iter()
+            .map(|row| {
+                let cs: Vec<u8> = row.get(0);
+                Ok((to_id(&cs)?, row.get::<_, Option<Vec<u8>>>(1)))
+            })
+            .collect::<Result<std::collections::HashMap<_, _>>>()?;
+        ids.iter()
+            .map(|id| Ok(found.remove(id).flatten()))
+            .collect()
+    }
+
+    /// The test seed, in batches: the changesets, their parents, the repo
+    /// membership, and the derived rows, 1,000 rows per statement.
+    /// Parents must come before their children in `css`, so the
+    /// generations compute in order; the derived rows must find an empty
+    /// schema, like the trait doc says.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn bulk_seed(
+        &mut self,
+        repo: RepoId,
+        css: &[scion_core::Changeset],
+        derived: &[(&'static str, u32, ChangesetId, Vec<u8>)],
+    ) -> Result<Vec<ChangesetId>> {
+        let mut gens: std::collections::HashMap<Vec<u8>, i64> = std::collections::HashMap::new();
+        let mut ids = Vec::with_capacity(css.len());
+        let mut cs_rows: Vec<(Vec<u8>, i64, Vec<u8>)> = Vec::new();
+        let mut parent_rows: Vec<(Vec<u8>, i64, Vec<u8>)> = Vec::new();
+        let mut member_rows: Vec<(i64, Vec<u8>)> = Vec::new();
+        for cs in css {
+            let (body, id) = cs.encode_with_id();
+            let key = id_bytes(id.as_bytes());
+            let mut parent_gen = 0;
+            for parent in cs.parents() {
+                let parent_gen_i =
+                    gens.get(&id_bytes(parent.as_bytes()))
+                        .copied()
+                        .ok_or_else(|| {
+                            Error::Corrupt(format!("the seed's {parent} comes after its child"))
+                        })?;
+                parent_gen = parent_gen.max(parent_gen_i);
+            }
+            let generation = 1 + parent_gen;
+            gens.insert(key.clone(), generation);
+            for (n, parent) in cs.parents().iter().enumerate() {
+                let n = i64::try_from(n).map_err(|_| {
+                    Error::Corrupt(format!(
+                        "the seed's {id} holds more parents than i64 counts"
+                    ))
+                })?;
+                parent_rows.push((key.clone(), n, id_bytes(parent.as_bytes())));
+            }
+            member_rows.push((repo.0, key.clone()));
+            cs_rows.push((key, generation, body));
+            ids.push(id);
+        }
+        self.insert_seed_changesets(&cs_rows)?;
+        self.insert_seed_parents(&parent_rows)?;
+        self.insert_seed_members(&member_rows)?;
+        let derived_rows: Vec<(&str, i64, Vec<u8>, Vec<u8>)> = derived
+            .iter()
+            .map(|(kind, version, cs, value)| {
+                (
+                    *kind,
+                    i64::from(*version),
+                    id_bytes(cs.as_bytes()),
+                    value.clone(),
+                )
+            })
+            .collect();
+        self.insert_seed_derived(&derived_rows)?;
+        Ok(ids)
+    }
+
     /// Records a derived value. A second write must agree with the first:
     /// derivation is deterministic, so a mismatch means corruption.
     ///
@@ -3124,6 +3244,115 @@ impl MetaTx for PgTx<'_> {
                 ))
             })
             .collect()
+    }
+}
+
+/// The statement helpers of [`PgTx::bulk_seed`], outside the trait impl:
+/// each inserts its rows in batches of 1,000 through one `unnest`.
+#[cfg(any(test, feature = "test-hooks"))]
+impl PgTx<'_> {
+    fn insert_seed_changesets(&mut self, rows: &[(Vec<u8>, i64, Vec<u8>)]) -> Result<()> {
+        const CHUNK: usize = 1_000;
+        for chunk in rows.chunks(CHUNK) {
+            let ids = chunk
+                .iter()
+                .map(|(id, _, _)| id.clone())
+                .collect::<Vec<_>>();
+            let gens = chunk
+                .iter()
+                .map(|(_, generation, _)| *generation)
+                .collect::<Vec<_>>();
+            let bodies = chunk
+                .iter()
+                .map(|(_, _, body)| body.clone())
+                .collect::<Vec<_>>();
+            self.c.execute(
+                "INSERT INTO changesets (id, gen, body)
+                 SELECT * FROM unnest($1::bytea[], $2::int8[], $3::bytea[])
+                 ON CONFLICT (id) DO NOTHING",
+                &[
+                    P::bytea_array(ids),
+                    P::i64_array(gens),
+                    P::bytea_array(bodies),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn insert_seed_parents(&mut self, rows: &[(Vec<u8>, i64, Vec<u8>)]) -> Result<()> {
+        const CHUNK: usize = 1_000;
+        for chunk in rows.chunks(CHUNK) {
+            let css = chunk
+                .iter()
+                .map(|(cs, _, _)| cs.clone())
+                .collect::<Vec<_>>();
+            let ns = chunk.iter().map(|(_, n, _)| *n).collect::<Vec<_>>();
+            let parents = chunk
+                .iter()
+                .map(|(_, _, parent)| parent.clone())
+                .collect::<Vec<_>>();
+            self.c.execute(
+                "INSERT INTO changeset_parents (cs, n, parent)
+                 SELECT * FROM unnest($1::bytea[], $2::int8[], $3::bytea[])
+                 ON CONFLICT (cs, n) DO NOTHING",
+                &[
+                    P::bytea_array(css),
+                    P::i64_array(ns),
+                    P::bytea_array(parents),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn insert_seed_members(&mut self, rows: &[(i64, Vec<u8>)]) -> Result<()> {
+        const CHUNK: usize = 1_000;
+        for chunk in rows.chunks(CHUNK) {
+            let repos = chunk.iter().map(|(repo, _)| *repo).collect::<Vec<_>>();
+            let css = chunk.iter().map(|(_, cs)| cs.clone()).collect::<Vec<_>>();
+            self.c.execute(
+                "INSERT INTO repo_changesets (repo_id, cs)
+                 SELECT * FROM unnest($1::int8[], $2::bytea[])
+                 ON CONFLICT (repo_id, cs) DO NOTHING",
+                &[P::i64_array(repos), P::bytea_array(css)],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn insert_seed_derived(
+        &mut self,
+        rows: &[(&'static str, i64, Vec<u8>, Vec<u8>)],
+    ) -> Result<()> {
+        const CHUNK: usize = 1_000;
+        for chunk in rows.chunks(CHUNK) {
+            let kinds = chunk.iter().map(|(kind, ..)| *kind).collect::<Vec<_>>();
+            let versions = chunk
+                .iter()
+                .map(|(_, version, ..)| *version)
+                .collect::<Vec<_>>();
+            let css = chunk
+                .iter()
+                .map(|(_, _, cs, _)| cs.clone())
+                .collect::<Vec<_>>();
+            let values = chunk
+                .iter()
+                .map(|(_, _, _, value)| value.clone())
+                .collect::<Vec<_>>();
+            self.c.execute(
+                "INSERT INTO derived (kind, version, cs, value)
+                 SELECT * FROM unnest($1::text[], $2::int8[], $3::bytea[], $4::bytea[])
+                 ON CONFLICT (kind, version, cs) DO NOTHING",
+                &[
+                    P::text_array(kinds),
+                    P::i64_array(versions),
+                    P::bytea_array(css),
+                    P::bytea_array(values),
+                ],
+            )?;
+        }
+        Ok(())
     }
 }
 

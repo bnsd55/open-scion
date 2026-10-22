@@ -88,6 +88,8 @@ pub(crate) mod objects;
 mod pg;
 pub(crate) mod quotas;
 pub(crate) mod read;
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) mod seed;
 pub(crate) mod service;
 pub(crate) mod similar;
 pub(crate) mod store;
@@ -275,6 +277,11 @@ pub mod test_support {
     /// The write path: changeset decode and apply, and its limits.
     pub mod write {
         pub use crate::write::*;
+    }
+    /// The bulk seed for deep file-less ladders, for the tests that
+    /// measure the queries instead of the seeding.
+    pub mod seed {
+        pub use crate::seed::*;
     }
 }
 
