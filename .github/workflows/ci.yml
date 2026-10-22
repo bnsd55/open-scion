@@ -72,16 +72,19 @@ jobs:
               *) docs_only=false ;;
             esac
             # Postgres or metadata code, and the tests that opt into
-            # the Postgres backend (SCION_TEST_BACKEND).
+            # the Postgres backend: a test that opts into
+            # SCION_TEST_BACKEND belongs in this list, and the globs
+            # catch the ones named pg or postgres, new ones included.
             case "$file" in
               crates/scion-server/src/pg.rs|\
               crates/scion-server/src/meta.rs|\
               crates/scion-server/src/backend.rs|\
               crates/scion-server/src/db.rs|\
               crates/scion-server/migrations/*|\
+              crates/scion-server/tests/*pg*.rs|\
+              crates/scion-server/tests/*postgres*.rs|\
               crates/scion-server/tests/archive_attacks.rs|\
               crates/scion-server/tests/backend_refusals.rs|\
-              crates/scion-server/tests/crash_pg.rs|\
               crates/scion-server/tests/every_rpc_unauthenticated.rs|\
               crates/scion-server/tests/import.rs|\
               crates/scion-server/tests/migrate_log.rs|\
@@ -89,9 +92,12 @@ jobs:
               crates/scion-server/tests/write.rs) pg=true ;;
             esac
             # macOS or filesystem code: the tier store, the scn vfs
-            # and mount path, the permission checks.
+            # and mount path, the permission checks — the ACL and
+            # group-writable walk in the runtime auth module is
+            # macOS-specific (#507 was a macOS-only bug there).
             case "$file" in
               crates/scion-tier/*|\
+              crates/scion-proto/src/runtime/auth/*|\
               crates/scn/src/vfs.rs|\
               crates/scn/src/cmd/mount.rs|\
               crates/scn/src/cmd/checkout.rs|\
