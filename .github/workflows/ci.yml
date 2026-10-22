@@ -59,37 +59,49 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           # The path rules live here, once; the table is in the pull
-          # request body.
-          files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/${{ github.event.pull_request.number }}/files" --jq '.[].filename')
+          # request body. Each line names the file's change status and
+          # path, so a file the pull request deletes is skipped before
+          # any read of its content.
+          files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/${{ github.event.pull_request.number }}/files" --jq '.[] | "\(.status) \(.filename)"')
           docs_only=true
           pg=false
           macos=false
           workflows=false
-          while IFS= read -r file; do
-            [ -z "$file" ] && continue
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            status=${line%% *}
+            file=${line#* }
             case "$file" in
               docs/*|*.md|changes/*) ;;
               *) docs_only=false ;;
             esac
-            # Postgres or metadata code, and the tests that opt into
-            # the Postgres backend: a test that opts into
-            # SCION_TEST_BACKEND belongs in this list, and the globs
-            # catch the ones named pg or postgres, new ones included.
+            # Server code, and tests that opt into the Postgres
+            # backend: the server's correctness depends on the
+            # Postgres transaction order, so any change under the
+            # server's src runs the Postgres tests; a test opts in
+            # when its text names the shared backend or the env var,
+            # and the globs catch the ones named pg or postgres, new
+            # ones included.
             case "$file" in
-              crates/scion-server/src/pg.rs|\
-              crates/scion-server/src/meta.rs|\
-              crates/scion-server/src/backend.rs|\
-              crates/scion-server/src/db.rs|\
+              crates/scion-server/src/*|\
               crates/scion-server/migrations/*|\
               crates/scion-server/tests/*pg*.rs|\
-              crates/scion-server/tests/*postgres*.rs|\
-              crates/scion-server/tests/archive_attacks.rs|\
-              crates/scion-server/tests/backend_refusals.rs|\
-              crates/scion-server/tests/every_rpc_unauthenticated.rs|\
-              crates/scion-server/tests/import.rs|\
-              crates/scion-server/tests/migrate_log.rs|\
-              crates/scion-server/tests/serve_flags.rs|\
-              crates/scion-server/tests/write.rs) pg=true ;;
+              crates/scion-server/tests/*postgres*.rs) pg=true ;;
+              crates/scion-server/tests/*.rs)
+                # A file the pull request deletes has no content, so
+                # it is skipped before the read; the path rules above
+                # already applied to it. A file that cannot be read
+                # runs Postgres rather than skipping it.
+                if [ "$status" = removed ]; then
+                  :
+                elif ! content=$(gh api "repos/$GITHUB_REPOSITORY/contents/$file?ref=${{ github.event.pull_request.head.sha }}" --jq '.content' 2>/dev/null); then
+                  pg=true
+                  echo "::notice::cannot read $file, running Postgres to be safe"
+                elif printf '%s' "$content" | base64 -d 2>/dev/null \
+                  | grep -q 'open_test_shared\|SCION_TEST_BACKEND'; then
+                  pg=true
+                fi
+                ;;
             esac
             # macOS or filesystem code: the tier store, the scn vfs
             # and mount path, the permission checks — the ACL and
