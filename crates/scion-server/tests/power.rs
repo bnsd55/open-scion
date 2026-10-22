@@ -269,6 +269,111 @@ fn pending(data: &std::path::Path) -> i64 {
     })
 }
 
+/// One cut of the power suite: the round's server, clients, the cut at
+/// one of three kinds of moment, and the two checks. Returns the lands
+/// it ran and the ones a reply never reached.
+async fn cut_round(
+    round: usize,
+    lazyfs: &Path,
+    dir: &Path,
+    log: &Path,
+    rng: &mut Rng,
+    total: &mut usize,
+) -> (usize, usize) {
+    let mut cut_lands = 0;
+    // Every round is its own experiment on a fresh repo, so the ledger
+    // and the checks start over with it.
+    let mut ledger = Ledger::default();
+    let mut checked = Checked::default();
+    let mut lazy = Lazyfs::start(dir, lazyfs, round);
+    let data = lazy.mount.join("data");
+    eprintln!("round {round}: mounted");
+    create_repo(&data);
+    eprintln!("round {round}: repo created");
+    // A reaped child's flock can outlive the waitpid by one tick, and
+    // the restart's open raced it (#260): wait for the lock to be free
+    // before the new server opens.
+    common::spawn_guard::across_release(|| {
+        common::spawn_guard::wait_for_lock_release(&data);
+    });
+    let mut server = Server::start(&data, log);
+    eprintln!("round {round}: server up");
+    check(&server.url, &data, &data, &mut ledger, &mut checked, rng).await;
+    eprintln!("round {round}: check 1 done");
+    let signals = Arc::new(Signals::default());
+    let clients: Vec<_> = (0..CLIENTS)
+        .map(|c| {
+            let name = format!("p{round}c{c}");
+            let rng = Rng::new(rng.next());
+            tokio::spawn(client(server.url.clone(), name, rng, Arc::clone(&signals)))
+        })
+        .collect();
+    match rng.below(3) {
+        0 => {
+            // The `LazyFS` cache is slower than the crash suite's tmpfs,
+            // so the cut waits longer before it takes a quiet moment.
+            let run = 500 + rng.below(2000);
+            tokio::time::sleep(Duration::from_millis(u64::try_from(run).unwrap())).await;
+        }
+        1 => {
+            wait_until("a large upload is in flight", || {
+                signals.large_uploads.load(Ordering::SeqCst) > 0
+            })
+            .await;
+            let delay = u64::try_from(rng.below(30)).unwrap();
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+        _ => {
+            wait_until_bounded("a land is pending in the database", 5, || {
+                pending(&data) > 0
+            })
+            .await;
+        }
+    }
+    let pending_at_kill = pending(&data) > 0;
+    eprintln!("round {round}: clients spawning (pending at kill: {pending_at_kill})");
+    signals.killed.store(true, Ordering::SeqCst);
+    // The freeze: no reply can follow it, so no reply can follow the
+    // cut either ([#185]).
+    server.freeze();
+    eprintln!("round {round}: cutting");
+    lazy.cut();
+    eprintln!("round {round}: cut done");
+    drop(server);
+    for client in clients {
+        let mut got = tokio::time::timeout(Duration::from_secs(60), client)
+            .await
+            .unwrap_or_else(|_| panic!("a client never finished after the kill"))
+            .unwrap();
+        ledger.blobs.append(&mut got.blobs);
+        ledger.oplog.merge(got.oplog);
+        cut_lands += got.lands.iter().filter(|sent| sent.reply.is_none()).count();
+        ledger.lands.append(&mut got.lands);
+    }
+    *total += ledger.lands.len();
+    // The store reopens from the backing directory: what `LazyFS`
+    // persisted, and nothing else. The server serves the schema the
+    // first open named: the metadata lives in the database of the
+    // original path, and the backing path would name a fresh, empty
+    // schema. The schema follows the store, not the path.
+    let data = lazy.backing.join("data");
+    let server = Server::start_reopened(&data, &lazy.mount.join("data"), log);
+    eprintln!("round {round}: restart up");
+    check(
+        &server.url,
+        &data,
+        &lazy.mount.join("data"),
+        &mut ledger,
+        &mut checked,
+        rng,
+    )
+    .await;
+    eprintln!("round {round}: check 2 done");
+    drop(server);
+    drop(lazy);
+    (cut_lands, usize::from(pending_at_kill))
+}
+
 /// The real server, several clients, and a cut at three kinds of moment, as
 /// in the crash suite: at a random moment, in the middle of a large upload,
 /// and while a land is pending. Every reply the clients got must survive:
@@ -293,88 +398,10 @@ async fn every_reply_survives_a_power_cut() {
     let mut cut_lands = 0;
     let mut total = 0;
     for round in 0..rounds {
-        // Every round is its own experiment on a fresh repo, so the ledger
-        // and the checks start over with it.
-        let mut ledger = Ledger::default();
-        let mut checked = Checked::default();
-        let mut lazy = Lazyfs::start(dir.path(), &lazyfs, round);
-        let data = lazy.mount.join("data");
-        eprintln!("round {round}: mounted");
-        create_repo(&data);
-        eprintln!("round {round}: repo created");
-        // A reaped child's flock can outlive the waitpid by one tick, and
-        // the restart's open raced it (#260): wait for the lock to be free
-        // before the new server opens.
-        common::spawn_guard::across_release(|| {
-            common::spawn_guard::wait_for_lock_release(&data);
-        });
-        let mut server = Server::start(&data, &log);
-        eprintln!("round {round}: server up");
-        check(&server.url, &data, &mut ledger, &mut checked, &mut rng).await;
-        eprintln!("round {round}: check 1 done");
-        let signals = Arc::new(Signals::default());
-        let clients: Vec<_> = (0..CLIENTS)
-            .map(|c| {
-                let name = format!("p{round}c{c}");
-                let rng = Rng::new(rng.next());
-                tokio::spawn(client(server.url.clone(), name, rng, Arc::clone(&signals)))
-            })
-            .collect();
-        match rng.below(3) {
-            0 => {
-                // The `LazyFS` cache is slower than the crash suite's tmpfs,
-                // so the cut waits longer before it takes a quiet moment.
-                let run = 500 + rng.below(2000);
-                tokio::time::sleep(Duration::from_millis(u64::try_from(run).unwrap())).await;
-            }
-            1 => {
-                wait_until("a large upload is in flight", || {
-                    signals.large_uploads.load(Ordering::SeqCst) > 0
-                })
-                .await;
-                let delay = u64::try_from(rng.below(30)).unwrap();
-                tokio::time::sleep(Duration::from_millis(delay)).await;
-            }
-            _ => {
-                wait_until_bounded("a land is pending in the database", 5, || {
-                    pending(&data) > 0
-                })
-                .await;
-            }
-        }
-        let pending_at_kill = pending(&data) > 0;
-        if pending_at_kill {
-            pending_kills += 1;
-        }
-        eprintln!("round {round}: clients spawning (pending at kill: {pending_at_kill})");
-        signals.killed.store(true, Ordering::SeqCst);
-        // The freeze: no reply can follow it, so no reply can follow the
-        // cut either ([#185]).
-        server.freeze();
-        eprintln!("round {round}: cutting");
-        lazy.cut();
-        eprintln!("round {round}: cut done");
-        drop(server);
-        for client in clients {
-            let mut got = tokio::time::timeout(Duration::from_secs(60), client)
-                .await
-                .unwrap_or_else(|_| panic!("a client never finished after the kill"))
-                .unwrap();
-            ledger.blobs.append(&mut got.blobs);
-            ledger.oplog.merge(got.oplog);
-            cut_lands += got.lands.iter().filter(|sent| sent.reply.is_none()).count();
-            ledger.lands.append(&mut got.lands);
-        }
-        total += ledger.lands.len();
-        // The store reopens from the backing directory: what `LazyFS`
-        // persisted, and nothing else.
-        let data = lazy.backing.join("data");
-        let server = Server::start(&data, &log);
-        eprintln!("round {round}: restart up");
-        check(&server.url, &data, &mut ledger, &mut checked, &mut rng).await;
-        eprintln!("round {round}: check 2 done");
-        drop(server);
-        drop(lazy);
+        let (cut, met_pending) =
+            cut_round(round, &lazyfs, dir.path(), &log, &mut rng, &mut total).await;
+        cut_lands += cut;
+        pending_kills += met_pending;
     }
     println!("{rounds} cuts; {total} lands, {cut_lands} of them cut mid-call");
     assert!(total > 0, "the clients did little work");
@@ -834,9 +861,11 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
         ));
         acked.extend(ids);
         // The store reopens from the backing directory: what `LazyFS`
-        // persisted, and nothing else.
+        // persisted, and nothing else. The schema follows the store, not
+        // the path: the metadata lives in the database the original
+        // path's schema names.
         let data = lazy.backing.join("data");
-        let store = open_store_shared(&data);
+        let store = open_store_shared_reopened(&data, &lazy.mount.join("data"));
         verify_whole(&store, &acked[..], &events, round, &data);
         drop(store);
         drop(lazy);
@@ -925,7 +954,10 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
         // after the close: from there on, only the daemon's exit can change
         // a byte.
         let backing = lazy.backing.join("data");
-        let store = open_store_shared(&backing);
+        // The schema follows the store, not the path: the metadata lives
+        // in the database the original path's schema names, and the
+        // backing path would name a fresh, empty schema.
+        let store = open_store_shared_reopened(&backing, &data);
         for (id, _) in &acked {
             let status = store.blobs().verify(*id).unwrap();
             assert_eq!(status, BlobStatus::Valid, "acknowledged blob {id}");
@@ -955,7 +987,7 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
             panic!("the backing changed while the mount went away: {changed:?}");
         }
         // What the checker verified still verifies.
-        let store = open_store_shared(&backing);
+        let store = open_store_shared_reopened(&backing, &data);
         for (id, _) in &acked {
             let status = store.blobs().verify(*id).unwrap();
             assert_eq!(status, BlobStatus::Valid, "blob {id} after the exit");
@@ -1072,7 +1104,9 @@ async fn import_process_races_the_server_on_the_same_blob() {
     // the backing, where only synced writes live.
     let backing = lazy.backing.join("data");
     drop(lazy);
-    let store = open_store_shared(&backing);
+    // The schema follows the store, not the path (inert on SQLite, whose
+    // metadata is the directory).
+    let store = open_store_shared_reopened(&backing, &data);
     let status = store.blobs().verify(id).unwrap();
     assert_eq!(status, BlobStatus::Valid, "raced blob {id}");
     drop(store);
