@@ -45,6 +45,7 @@ use crate::error::{Error, Result};
 use crate::graph::{self, CommitGraph};
 use crate::history::{self, PathHistory};
 use crate::meta::Meta as _;
+use crate::meta::StaleLand;
 use crate::meta::{MetaTx, RefState, RepoId};
 use crate::tree;
 
@@ -254,10 +255,27 @@ impl Lands {
     /// pending under it. A row rejected here has no live call: the 600 s
     /// call limit ended long before, and a retry that had the lock would
     /// have finished the land.
-    pub fn sweep_stale(&self, store: &Backend, stale_secs: i64) -> Result<u64> {
+    ///
+    /// The sweep writes the land's result line itself: the job that would
+    /// have written it is long gone, and every intent line gets one result
+    /// line, so the audit never holds an intent that nothing answers.
+    pub fn sweep_stale(
+        &self,
+        store: &Backend,
+        stale_secs: i64,
+        audit: &crate::audit::Audit,
+    ) -> Result<u64> {
         let stale = store.read(|c| c.stale_lands(stale_secs))?;
         let mut rejected = 0;
-        for (repo, land_id, target_ref) in stale {
+        for StaleLand {
+            repo,
+            land_id,
+            target_ref,
+            caller,
+            request_key,
+            repo_name,
+        } in stale
+        {
             // The same per-ref lock that the land path holds, so a retry
             // that is finishing this land wins the race: the sweep then
             // finds the row no longer pending, and leaves it alone.
@@ -273,6 +291,32 @@ impl Lands {
             rejected += changed;
             if changed == 1 {
                 tracing::info!(land_id, "rejected a stale pending land");
+                // The intent's request id is the call's and is not
+                // stored, so this line carries a fresh id of its own:
+                // the auditor joins it to the intent on the request key
+                // and the land id (both in the line), not on request_id.
+                if let Err(why) = audit.record_blocking(&crate::audit::Event::new(
+                    "land",
+                    "failed",
+                    crate::service::json_fields(
+                        &scion_proto::runtime::request_id::generate(),
+                        &caller,
+                        &serde_json::json!({
+                            "rpc": "Land",
+                            "repo": repo_name,
+                            "ref": target_ref,
+                            "land_id": land_id,
+                            "request_key": request_key,
+                            "why": "stale",
+                        }),
+                    ),
+                )) {
+                    tracing::error!(
+                        reason = %why,
+                        land_id,
+                        "the sweep's audit line was not made durable"
+                    );
+                }
             }
         }
         Ok(rejected)
@@ -3058,6 +3102,11 @@ mod tests {
     #[test]
     fn the_sweep_rejects_only_pending_lands_past_the_cutoff() {
         let f = fixture();
+        // The audit file lives in its own temp dir, so two test runs
+        // never share it.
+        let audit_dir = tempfile::tempdir().unwrap();
+        let audit_path = audit_dir.path().join("audit.log");
+        let audit = crate::audit::Audit::open(&audit_path).unwrap();
         let cs = f.commit(f.root, &[put("a/x", "new")]);
         let lands = Lands::new(Some(8), None);
         let recorded = f
@@ -3067,7 +3116,7 @@ mod tests {
         assert_eq!(recorded.1.state, LandState::Pending);
 
         // A fresh pending land stays, even at a cutoff of now.
-        let rejected = lands.sweep_stale(&f.store, 60).unwrap();
+        let rejected = lands.sweep_stale(&f.store, 60, &audit).unwrap();
         assert_eq!(rejected, 0);
 
         // The row is old now: the sweep rejects it, and the detail says
@@ -3085,7 +3134,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let rejected = lands.sweep_stale(&f.store, 60).unwrap();
+        let rejected = lands.sweep_stale(&f.store, 60, &audit).unwrap();
         assert_eq!(rejected, 1);
         let (state, detail): (String, String) = f
             .store
@@ -3111,6 +3160,27 @@ mod tests {
             .write(|c| c.record_land(&caller(), &req(cs, "old"), None))
             .unwrap();
         assert_eq!(resumed.1.state, LandState::Rejected);
+
+        // The sweep answered the land's intent: one result line, why
+        // stale, joined to the intent by the request key and the land id.
+        let lines: Vec<serde_json::Value> = String::from_utf8(std::fs::read(&audit_path).unwrap())
+            .unwrap()
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let results: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|line| line["event"] == "land" && line["outcome"] == "failed")
+            .collect();
+        assert_eq!(results.len(), 1, "one result line for one intent");
+        assert_eq!(results[0]["why"], "stale");
+        // The request id is the sweep's own fresh id: the intent's
+        // request id is not stored, so the line joins the intent on the
+        // request key, not on request_id.
+        assert_eq!(results[0]["request_key"], "old");
+        assert_ne!(results[0]["request_id"], "old");
+        assert_eq!(results[0]["land_id"], recorded.1.land_id);
     }
 
     /// Pass 5, W1: a request key is scoped to one caller in one repo. B
