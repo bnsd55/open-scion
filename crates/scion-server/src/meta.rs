@@ -155,6 +155,24 @@ pub trait MetaTx {
     /// Stores a changeset and adds it to `repo`. Safe to repeat.
     fn insert_changeset(&mut self, repo: RepoId, cs: &Changeset) -> Result<ChangesetId>;
 
+    /// Turns the importer's changeset batching on or off. While it is on,
+    /// `insert_changeset` writes the changesets row only: the parents and
+    /// the repo membership of the transaction's changesets wait for
+    /// [`MetaTx::flush_changeset_rows`], which writes them in batches at
+    /// the transaction's end. A transaction that turns this on must flush
+    /// before it ends, and its changesets must come parents first, so the
+    /// batch's generations chain in memory.
+    fn set_changeset_batching(&mut self, on: bool);
+
+    /// Writes the parents and the repo membership that
+    /// [`MetaTx::set_changeset_batching`] held back, one statement per
+    /// 1,000 rows per table where the backend can.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn flush_changeset_rows(&mut self, repo: RepoId) -> Result<()>;
+
     /// Reads a changeset of `repo`, and checks it against its ID.
     fn get_changeset(&mut self, repo: RepoId, id: ChangesetId) -> Result<Changeset>;
 

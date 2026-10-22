@@ -534,6 +534,20 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn set_changeset_batching(&mut self, on: bool) {
+        match self {
+            Self::Sqlite(tx) => tx.set_changeset_batching(on),
+            Self::Postgres(pg) => pg.set_changeset_batching(on),
+        }
+    }
+
+    fn flush_changeset_rows(&mut self, repo: RepoId) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.flush_changeset_rows(repo),
+            Self::Postgres(pg) => pg.flush_changeset_rows(repo),
+        }
+    }
+
     fn insert_changeset(&mut self, repo: RepoId, cs: &Changeset) -> Result<ChangesetId> {
         match self {
             Self::Sqlite(tx) => tx.insert_changeset(repo, cs),

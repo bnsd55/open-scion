@@ -359,6 +359,21 @@ fn store_batch(
                 // commits, never a changeset without its provenance row,
                 // and the busy retry reruns the closure whole, as today.
                 let mut provenance = Vec::new();
+                // The changesets row lands per commit, because the
+                // derived rows of the same commit name it by an immediate
+                // foreign key; the parents and the repo membership of the
+                // transaction's changesets wait for the flush below, one
+                // statement per 1,000 rows. The commits come parents
+                // first, so their generations chain through the
+                // generation cache, and the database reads only the
+                // parents this transaction did not insert, usually the
+                // first commit's. When the last per-commit writer of a
+                // commit moves into the batch, the changesets row moves
+                // with it, and every table writes at the transaction's
+                // end in the order the foreign keys read: changesets,
+                // changeset_parents, repo_changesets, derived, history,
+                // git_import.
+                c.set_changeset_batching(true);
                 for (commit, cs, git_tree) in rest {
                     #[cfg(test)]
                     if !slow_record.is_zero() {
@@ -374,8 +389,14 @@ fn store_batch(
                     if shared && started_tx.elapsed() >= TX_BUDGET {
                         break;
                     }
+                    #[cfg(any(test, feature = "test-hooks"))]
+                    if PER_COMMIT_TXS.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
                 }
+                c.flush_changeset_rows(repo_id)?;
                 c.put_git_imports(repo_id, &provenance)?;
+                c.set_changeset_batching(false);
                 Ok(taken)
             });
             match result {
@@ -407,6 +428,17 @@ fn store_batch(
         }
     }
     Ok(())
+}
+
+/// Whether the import takes one commit per write transaction, for the
+/// tests that compare the batch against the per-commit rows.
+#[cfg(any(test, feature = "test-hooks"))]
+static PER_COMMIT_TXS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Sets whether the import takes one commit per write transaction.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn set_import_per_commit_txs(per_commit: bool) {
+    PER_COMMIT_TXS.store(per_commit, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// What to import, in order.

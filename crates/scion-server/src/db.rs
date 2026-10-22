@@ -190,6 +190,20 @@ impl MetaTx for SqliteTx<'_> {
     /// # Errors
     ///
     /// [`Error::NotFound`] if a parent is not in `repo`.
+    /// Turns the importer's changeset batching on or off. SQLite writes
+    /// every row as its statement anyway (one write connection, so a
+    /// batch buys no round trips), so this holds nothing.
+    fn set_changeset_batching(&mut self, _on: bool) {}
+
+    /// Writes what the batching held back: nothing, on SQLite.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    fn flush_changeset_rows(&mut self, _repo: RepoId) -> Result<()> {
+        Ok(())
+    }
+
     fn insert_changeset(&mut self, repo: RepoId, cs: &Changeset) -> Result<ChangesetId> {
         let (body, id) = cs.encode_with_id();
         let mut parent_gen = 0;

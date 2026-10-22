@@ -295,6 +295,8 @@ pub use error::{Error, Git, Result, Storage, StorageClass};
 pub use gc::DEFAULT_GRACE_SECS;
 pub use graph::{CommitGraph, backfill_commit_graph};
 pub use history::{PathHistory, backfill_path_history};
+#[cfg(any(test, feature = "test-hooks"))]
+pub use import::set_import_per_commit_txs;
 pub use import::{ImportOptions, ImportReport, import_git};
 pub use quotas::Quotas;
 pub use scion_proto::runtime::metrics::Metrics;

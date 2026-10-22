@@ -350,8 +350,8 @@ enum Param {
     OptBytes(Option<Vec<u8>>),
     /// A list of byte strings, for a `= ANY($n)` over `bytea[]`.
     ByteaArray(Vec<Vec<u8>>),
-    /// A list of integers, for the bulk seed's `unnest` over `int8[]`.
-    #[cfg(any(test, feature = "test-hooks"))]
+    /// A list of integers, for the bulk seed's and the batch flush's
+    /// `unnest` over `int8[]`.
     I64Array(Vec<i64>),
     /// A list of strings, for the bulk seed's `unnest` over `text[]`.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -385,7 +385,6 @@ impl Param {
     }
 
     /// A list of integers, as one `int8[]` parameter.
-    #[cfg(any(test, feature = "test-hooks"))]
     fn i64_array(v: Vec<i64>) -> Param {
         Param::I64Array(v)
     }
@@ -410,7 +409,6 @@ impl ToSql for Param {
             Self::Bytes(v) => v.to_sql(t, out),
             Self::OptBytes(v) => v.to_sql(t, out),
             Self::ByteaArray(v) => v.to_sql(t, out),
-            #[cfg(any(test, feature = "test-hooks"))]
             Self::I64Array(v) => v.to_sql(t, out),
             #[cfg(any(test, feature = "test-hooks"))]
             Self::TextArray(v) => v.to_sql(t, out),
@@ -433,7 +431,6 @@ impl ToSql for Param {
             Self::Bytes(v) => v.to_sql(t, out),
             Self::OptBytes(v) => v.to_sql(t, out),
             Self::ByteaArray(v) => v.to_sql(t, out),
-            #[cfg(any(test, feature = "test-hooks"))]
             Self::I64Array(v) => v.to_sql(t, out),
             #[cfg(any(test, feature = "test-hooks"))]
             Self::TextArray(v) => v.to_sql(t, out),
@@ -931,6 +928,9 @@ impl Pg {
         let mut pg = PgTx {
             c: &mut writer,
             gen_cache: std::collections::HashMap::new(),
+            inserted_gens: std::collections::HashMap::new(),
+            cs_batching: false,
+            cs_pending: Vec::new(),
             ended: true,
         };
         f(&mut pg)
@@ -1162,6 +1162,22 @@ pub struct PgTx<'a> {
     /// same changeset - the derived walks and the land ask for the same
     /// few ids again and again.
     gen_cache: std::collections::HashMap<(i64, Vec<u8>), i64>,
+    /// The generations this transaction has inserted, by id: the reads of
+    /// the same transaction (the derived writes of the commit it just
+    /// stored) must see them before anything else does. The generations
+    /// are fixed at insert and never updated.
+    inserted_gens: std::collections::HashMap<Vec<u8>, i64>,
+    /// Whether the importer's batching is on: `insert_changeset` then
+    /// writes the changesets row only, and the parents and the repo
+    /// membership wait in `cs_pending` for the flush at the transaction's
+    /// end, which writes them one statement per 1,000 rows. The
+    /// changesets row cannot wait: the derived rows of the same commit
+    /// name it by a foreign key that checks at the statement.
+    cs_batching: bool,
+    /// The changesets the transaction inserted while batching, in insert
+    /// order: (changeset, parents). The flush writes their parents at
+    /// their places and their repo membership.
+    cs_pending: Vec<(ChangesetId, Vec<ChangesetId>)>,
     /// The transaction was ended by `commit` or `rollback`; a drop then
     /// leaves the client alone.
     ended: bool,
@@ -1174,6 +1190,9 @@ impl<'a> PgTx<'a> {
         Ok(Self {
             c,
             gen_cache: std::collections::HashMap::new(),
+            inserted_gens: std::collections::HashMap::new(),
+            cs_batching: false,
+            cs_pending: Vec::new(),
             ended: false,
         })
     }
@@ -1206,6 +1225,9 @@ impl<'a> PgTx<'a> {
         let tx = Self {
             c,
             gen_cache: std::collections::HashMap::new(),
+            inserted_gens: std::collections::HashMap::new(),
+            cs_batching: false,
+            cs_pending: Vec::new(),
             ended: false,
         };
         tx.c.execute(
@@ -1228,6 +1250,9 @@ impl<'a> PgTx<'a> {
         PgTx {
             c: self.c,
             gen_cache: std::collections::HashMap::new(),
+            inserted_gens: std::collections::HashMap::new(),
+            cs_batching: false,
+            cs_pending: Vec::new(),
             ended: true,
         }
     }
@@ -2042,13 +2067,32 @@ impl MetaTx for PgTx<'_> {
             .iter()
             .map(|parent| id_bytes(parent.as_bytes()))
             .collect();
-        if !parents.is_empty() {
-            // One round trip for every parent's generation, however many
-            // parents a merge has.
+        // The generations this transaction already holds answer the
+        // parents it inserted itself, so a batch's chain reads the
+        // database only for the parents it did not insert, usually the
+        // first commit's. The read carries only those misses: a parent
+        // this transaction inserted has no membership row yet (the flush
+        // holds it back), and the read's join with repo_changesets would
+        // drop it.
+        let mut misses: Vec<Vec<u8>> = Vec::new();
+        for parent in cs.parents() {
+            let key = id_bytes(parent.as_bytes());
+            match self.gen_cache.get(&(repo.0, key.clone())) {
+                Some(cached) => parent_gen = parent_gen.max(*cached),
+                None => {
+                    if !misses.contains(&key) {
+                        misses.push(key);
+                    }
+                }
+            }
+        }
+        if !misses.is_empty() {
+            // One round trip for every parent this transaction did not
+            // insert, however many a merge has.
             let rows = self.c.query(
                 "SELECT id, gen FROM changesets JOIN repo_changesets ON cs = id
                  WHERE repo_id = $1 AND id = ANY($2)",
-                &[P::i64(repo.0), P::bytea_array(parents.clone())],
+                &[P::i64(repo.0), P::bytea_array(misses.clone())],
             )?;
             let gens: std::collections::HashMap<Vec<u8>, i64> = rows
                 .into_iter()
@@ -2058,9 +2102,12 @@ impl MetaTx for PgTx<'_> {
                 // A repeated parent reads the same row twice; `get`, not
                 // `remove`, so parents [X, X] store like they did when
                 // each parent was its own statement.
-                let parent_gen_i = *gens
-                    .get(key)
-                    .ok_or_else(|| Error::NotFound(format!("changeset {parent}")))?;
+                let parent_gen_i = match self.gen_cache.get(&(repo.0, key.clone())) {
+                    Some(cached) => *cached,
+                    None => *gens
+                        .get(key)
+                        .ok_or_else(|| Error::NotFound(format!("changeset {parent}")))?,
+                };
                 parent_gen = parent_gen.max(parent_gen_i);
                 self.gen_cache.insert((repo.0, key.clone()), parent_gen_i);
             }
@@ -2074,6 +2121,24 @@ impl MetaTx for PgTx<'_> {
                 P::bytes(&body),
             ],
         )?;
+        let generation = parent_gen + 1;
+        self.inserted_gens
+            .insert(id_bytes(id.as_bytes()), generation);
+        self.gen_cache
+            .insert((repo.0, id_bytes(id.as_bytes())), generation);
+        // While the import's batching is on, the parents and the repo
+        // membership of this transaction's changesets wait for the
+        // flush, which writes them one statement per 1,000 rows. The
+        // changesets row itself lands per commit: the derived rows of
+        // the same commit name it by an immediate foreign key. When the
+        // last per-commit writer of a commit moves into the batch, this
+        // row moves with it, and every table writes at the end in the
+        // order the foreign keys read: changesets, changeset_parents,
+        // repo_changesets, derived, history, git_import.
+        if self.cs_batching {
+            self.cs_pending.push((id, cs.parents().to_vec()));
+            return Ok(id);
+        }
         // Every parent as one statement, however many a merge has: the
         // row number is the parent's place in the array.
         if !parents.is_empty() {
@@ -2094,6 +2159,74 @@ impl MetaTx for PgTx<'_> {
             &[P::i64(repo.0), P::bytes(&id_bytes(id.as_bytes()))],
         )?;
         Ok(id)
+    }
+
+    /// Turns the import's changeset batching on or off. While it is on,
+    /// `insert_changeset` writes the changesets row only, and the parents
+    /// and the repo membership of this transaction's changesets wait for
+    /// `flush_changeset_rows`.
+    fn set_changeset_batching(&mut self, on: bool) {
+        self.cs_batching = on;
+        if !on {
+            self.cs_pending.clear();
+        }
+    }
+
+    /// Writes the parents and the repo membership of the changesets the
+    /// transaction inserted while batching, one statement per 1,000 rows
+    /// per table, and returns how many statements it wrote. The parents'
+    /// row numbers follow the per-commit insert's contract (the parent's
+    /// place, counting from one, as `WITH ORDINALITY` numbers it).
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn flush_changeset_rows(&mut self, repo: RepoId) -> Result<()> {
+        const CHUNK: usize = 1_000;
+        if self.cs_pending.is_empty() {
+            return Ok(());
+        }
+        let mut parent_rows: Vec<(Vec<u8>, i64, Vec<u8>)> = Vec::new();
+        let mut member_rows: Vec<(i64, Vec<u8>)> = Vec::new();
+        for (id, parents) in self.cs_pending.drain(..) {
+            let key = id_bytes(id.as_bytes());
+            for (n, parent) in (1_i64..).zip(&parents) {
+                parent_rows.push((key.clone(), n, id_bytes(parent.as_bytes())));
+            }
+            member_rows.push((repo.0, key));
+        }
+        for chunk in parent_rows.chunks(CHUNK) {
+            let css = chunk
+                .iter()
+                .map(|(cs, _, _)| cs.clone())
+                .collect::<Vec<_>>();
+            let ns = chunk.iter().map(|(_, n, _)| *n).collect::<Vec<_>>();
+            let parents = chunk
+                .iter()
+                .map(|(_, _, parent)| parent.clone())
+                .collect::<Vec<_>>();
+            self.c.execute(
+                "INSERT INTO changeset_parents (cs, n, parent)
+                 SELECT * FROM unnest($1::bytea[], $2::int8[], $3::bytea[])
+                 ON CONFLICT (cs, n) DO NOTHING",
+                &[
+                    P::bytea_array(css),
+                    P::i64_array(ns),
+                    P::bytea_array(parents),
+                ],
+            )?;
+        }
+        for chunk in member_rows.chunks(CHUNK) {
+            let repos = chunk.iter().map(|(repo, _)| *repo).collect::<Vec<_>>();
+            let css = chunk.iter().map(|(_, cs)| cs.clone()).collect::<Vec<_>>();
+            self.c.execute(
+                "INSERT INTO repo_changesets (repo_id, cs)
+                 SELECT * FROM unnest($1::int8[], $2::bytea[])
+                 ON CONFLICT (repo_id, cs) DO NOTHING",
+                &[P::i64_array(repos), P::bytea_array(css)],
+            )?;
+        }
+        Ok(())
     }
 
     /// Adds `blob` to the blobs that `repo` may name. Returns whether it is
@@ -2230,6 +2363,9 @@ impl MetaTx for PgTx<'_> {
     ///
     /// [`Error::NotFound`] if no changeset has this ID.
     fn generation_of(&mut self, id: ChangesetId) -> Result<i64> {
+        if let Some(cached) = self.inserted_gens.get(&id_bytes(id.as_bytes())) {
+            return Ok(*cached);
+        }
         self.c
             .query_opt(
                 "SELECT gen FROM changesets WHERE id = $1",
