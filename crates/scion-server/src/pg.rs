@@ -498,7 +498,7 @@ impl PgClient {
                 // reconnect. A lock the database does not give back fails
                 // every statement that follows: another server process may
                 // hold it, and this one must not land beside it.
-                let mut setup = Setup::new(conn.schema.as_deref(), conn.lock_key, &mut client);
+                let mut setup = Setup::new(conn.schema.as_deref(), conn.exclusive, &mut client);
                 // BEGIN opens one; COMMIT and ROLLBACK end it. A
                 // transaction a reconnect lost fails every statement until
                 // its rollback: on the new connection, autocommit would
@@ -571,7 +571,7 @@ impl PgClient {
                     // some while after the connection did. One retry a
                     // job, so the recovery needs no process restart.
                     if !setup.ok() {
-                        setup = Setup::new(conn.schema.as_deref(), conn.lock_key, &mut client);
+                        setup = Setup::new(conn.schema.as_deref(), conn.exclusive, &mut client);
                     }
                     if !setup.ok() {
                         if ever_held && matches!(setup.outcome, SetupOutcome::LockRefused) {
@@ -731,6 +731,10 @@ impl Pg {
         data: &Path,
         marker: Marker,
     ) -> Result<Self> {
+        // The schema the URL rides is the connection's own business: the
+        // setup asks the database `current_schema()` and locks that, so
+        // parallel servers of distinct schemas do not fence each other,
+        // and a plain URL fences the whole default schema.
         Self::open_in(url, ca, readers, data, None, true, marker)
     }
 
@@ -747,22 +751,12 @@ impl Pg {
     ) -> Result<Self> {
         let options = base_options();
         let fence = Arc::new(Fence::new());
-        // The one-server lock of the database, or of one test schema: a
-        // key per schema, so parallel tests do not block each other.
-        let lock_key = if exclusive {
-            Some(schema.map_or(SERVER_LOCK, schema_lock_key))
-        } else {
-            None
-        };
+        // The one-server lock of the schema the connection lands in: the
+        // setup asks the database `current_schema()` and locks that, so a
+        // plain URL and one that rides `--search_path=public` take the
+        // same lock, and schemas ride separately. A reader takes none.
         let mut writer = if exclusive {
-            connect_exclusive(
-                url,
-                ca,
-                &options,
-                schema,
-                lock_key.expect("an exclusive open names a lock"),
-                Arc::clone(&fence),
-            )?
+            connect_exclusive(url, ca, &options, schema, Arc::clone(&fence))?
         } else {
             connect_with(url, ca, &options, schema)?
         };
@@ -1315,6 +1309,10 @@ enum SetupOutcome {
     /// The database answered and refused the one-server lock: another
     /// session holds it.
     LockRefused,
+    /// The URL's `search_path` names no existing schema: the database
+    /// answered, only the schema is missing. A refusal, not an
+    /// unreachable: no retry can fix the URL.
+    NoSchema,
     /// The database could not be reached, or refused the schema
     /// statements: nothing is known about the lock.
     Unreachable,
@@ -1322,20 +1320,20 @@ enum SetupOutcome {
 
 struct Setup {
     schema: Option<String>,
-    /// The advisory lock this session takes, if any: the one-server lock
-    /// of a database, or of one test schema. None for a client that
-    /// takes no lock (a reader, an import).
-    lock_key: Option<i64>,
+    /// Whether this session takes the one-server lock of the schema it
+    /// lands in (an exclusive writer; None-equivalent for a reader, an
+    /// import).
+    exclusive: bool,
     outcome: SetupOutcome,
 }
 
 impl Setup {
     /// Applies the setup to a fresh client. A failed setup leaves the
     /// statements failed until a reconnect applies it again.
-    fn new(schema: Option<&str>, lock_key: Option<i64>, client: &mut Client) -> Self {
+    fn new(schema: Option<&str>, exclusive: bool, client: &mut Client) -> Self {
         let mut setup = Self {
             schema: schema.map(str::to_owned),
-            lock_key,
+            exclusive,
             outcome: SetupOutcome::Unreachable,
         };
         setup.outcome = setup.apply(client);
@@ -1364,11 +1362,25 @@ impl Setup {
                 return SetupOutcome::Unreachable;
             }
         }
-        if let Some(key) = self.lock_key
-            && !server_lock_raw(client, key)
-        {
-            // The database answered: another session holds the lock.
-            return SetupOutcome::LockRefused;
+        if self.exclusive {
+            // What the connection actually writes into, whatever the URL
+            // spelled: a plain URL and one that rides
+            // `--search_path=public` land in the same schema and must
+            // fence each other, and schemas ride separately.
+            let Ok(row) = client.query_one("SELECT current_schema()::text", &[]) else {
+                return SetupOutcome::Unreachable;
+            };
+            // A search_path whose members all miss answers NULL: the
+            // connection would create nothing, and no lock names it.
+            // The database answered, so this is a URL mistake, not an
+            // unreachable database: refuse with the fix.
+            let Some(current) = row.get::<_, Option<String>>(0) else {
+                return SetupOutcome::NoSchema;
+            };
+            if !server_lock_raw(client, schema_lock_key(&current)) {
+                // The database answered: another session holds the lock.
+                return SetupOutcome::LockRefused;
+            }
         }
         SetupOutcome::Applied
     }
@@ -1505,6 +1517,11 @@ fn run_statement(client: &mut Client, job: &Job) -> Result<Reply> {
 /// The reply of a failed setup: a takeover names the loss; an
 /// unreachable database answers what a client retries against.
 fn setup_error(setup: &Setup, ever_held: bool) -> Error {
+    if matches!(setup.outcome, SetupOutcome::NoSchema) {
+        return Error::FailedPrecondition(
+            "the URL's search_path names no existing schema; create it first".into(),
+        );
+    }
     if matches!(setup.outcome, SetupOutcome::Unreachable) {
         return Error::Storage(Storage::busy(std::io::Error::other(
             "the database was unreachable at setup",
@@ -1525,7 +1542,7 @@ fn lost_message(setup_held: bool) -> &'static str {
         "this server process lost the database to another \
          server process; it serves nothing from here on"
     } else {
-        "another server holds this database"
+        "another server holds this store"
     }
 }
 
@@ -1535,7 +1552,7 @@ fn lost_message(setup_held: bool) -> &'static str {
 fn reconnect(client: &mut Client, conn: &Conn) -> Result<Setup> {
     let fresh = connect_on(&conn.url, conn.ca.as_deref(), &conn.options)?;
     *client = fresh;
-    Ok(Setup::new(conn.schema.as_deref(), conn.lock_key, client))
+    Ok(Setup::new(conn.schema.as_deref(), conn.exclusive, client))
 }
 
 /// Whether the worker's client is inside the transaction a `BEGIN`
@@ -1586,9 +1603,9 @@ struct Conn {
     options: String,
     /// The schema a reconnect narrows itself to again.
     schema: Option<String>,
-    /// The advisory lock this session re-takes after every reconnect,
-    /// if any.
-    lock_key: Option<i64>,
+    /// Whether this session re-takes the one-server lock after every
+    /// reconnect (an exclusive writer; a reader takes none).
+    exclusive: bool,
 }
 
 /// What a worker needs to run, and to connect again when its client dies.
@@ -1638,7 +1655,7 @@ fn connect_with(
     options: &str,
     schema: Option<&str>,
 ) -> Result<PgClient> {
-    spawn_client(url, ca, options, schema, None, None)
+    spawn_client(url, ca, options, schema, false, None)
 }
 
 /// Undoes the identity a failed restore's open minted in the database:
@@ -1658,26 +1675,26 @@ fn connect_exclusive(
     ca: Option<&Path>,
     options: &str,
     schema: Option<&str>,
-    lock_key: i64,
     fence: Arc<Fence>,
 ) -> Result<PgClient> {
     // Whether the lock was given is decided at the spawn: one probe job
     // brings a refusal here, to the open, so an operator whose second
     // server starts against a taken database sees it now, and not in the
     // errors of the first call a client makes.
-    let client = spawn_client(url, ca, options, schema, Some(lock_key), Some(fence))?;
+    let client = spawn_client(url, ca, options, schema, true, Some(fence))?;
     client.query_opt("SELECT 1", &[])?;
     Ok(client)
 }
 
-/// Puts one client on its worker thread. A `lock_key` is re-taken after
-/// every reconnect, and its loss trips the fence.
+/// Puts one client on its worker thread. An exclusive client re-takes
+/// the one-server lock after every reconnect, and its loss trips the
+/// fence.
 fn spawn_client(
     url: &str,
     ca: Option<&Path>,
     options: &str,
     schema: Option<&str>,
-    lock_key: Option<i64>,
+    exclusive: bool,
     fence: Option<Arc<Fence>>,
 ) -> Result<PgClient> {
     let client =
@@ -1691,7 +1708,7 @@ fn spawn_client(
             ca: ca.map(Path::to_path_buf),
             options: options.to_owned(),
             schema: schema.map(str::to_owned),
-            lock_key,
+            exclusive,
         },
         fence,
     }))
@@ -3517,6 +3534,54 @@ mod tests {
         assert_eq!(
             merged_options(Some("--search_path=scion_test_1"), OWN),
             format!("--search_path=scion_test_1 {OWN}")
+        );
+    }
+
+    /// A URL whose `search_path` names no existing schema refuses with
+    /// the fix named, not 'unreachable': the database answered, and
+    /// only the schema is missing.
+    #[test]
+    fn a_search_path_that_names_no_schema_refuses_with_the_fix() {
+        if !crate::Backend::test_is_postgres() {
+            return;
+        }
+        let url = crate::backend::test_hooks::test_url().unwrap();
+        let mut client = Client::connect(&url, NoTls).unwrap();
+        let setup = super::Setup::new(Some("scion_test_missing"), true, &mut client);
+        assert!(!setup.ok(), "a missing schema cannot hold the setup");
+        let error = super::setup_error(&setup, false);
+        assert!(
+            error
+                .to_string()
+                .contains("the URL's search_path names no existing schema; create it first"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_53100_database_error_is_disk_full_with_the_fixed_reply() {
+        use super::pg_error_of;
+        use crate::{Error, StorageClass};
+        // A source of the right type with no SQLSTATE of its own: a
+        // connect to port 1, which every kernel refuses. The mapping
+        // runs on the SQLSTATE the test hands it, not on this source.
+        let Err(refused) = Client::connect("postgres://127.0.0.1:1/x", NoTls) else {
+            panic!("a connect to port 1 is refused");
+        };
+        assert!(!refused.is_closed());
+        assert!(refused.code().is_none());
+        let error = pg_error_of(Some("53100"), refused);
+        assert!(
+            matches!(&error, Error::Storage(s) if s.class() == StorageClass::DiskFull),
+            "{error:?}"
+        );
+        // The reply the client sees is the fixed one: it names the
+        // shortage and the retry, not the server path.
+        let status = tonic::Status::from(error);
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            status.message(),
+            "the server is out of disk space; retry later"
         );
     }
 
