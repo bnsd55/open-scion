@@ -67,10 +67,7 @@ fn the_prune_of_a_thousand_rows_costs_twenty_statements() {
                 .write(|c| c.insert_changeset(repo, &cs_put(put)))
                 .unwrap();
             // The prunable row: names a blob no changeset puts.
-            let dead = store
-                .blobs()
-                .put(format!("dead {i}\n").as_bytes())
-                .unwrap();
+            let dead = store.blobs().put(format!("dead {i}\n").as_bytes()).unwrap();
             store.write(|c| c.add_repo_blob(repo, dead)).unwrap();
             age_file(&store, dead, old);
         }
