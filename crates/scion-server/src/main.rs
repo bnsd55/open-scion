@@ -405,9 +405,7 @@ async fn write_deferred_intent(audit: &scion_server::Audit, dry_run: bool, run_o
         .record(scion_server::Event::new("admin", "intent", what))
         .await
     {
-        eprintln!(
-            "scion-server gc: the run's intent line is still not recorded: {why}"
-        );
+        eprintln!("scion-server gc: the run's intent line is still not recorded: {why}");
         std::process::exit(i32::from(!run_ok));
     }
 }
@@ -813,7 +811,9 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
         }
-        Command::HashToken { .. } | Command::TicketKey { .. } | Command::Verify { .. }
+        Command::HashToken { .. }
+        | Command::TicketKey { .. }
+        | Command::Verify { .. }
         | Command::Restore { .. } => {
             unreachable!("handled before the store opens")
         }

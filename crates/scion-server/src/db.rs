@@ -390,6 +390,17 @@ impl MetaTx for SqliteTx<'_> {
         .collect()
     }
 
+    fn parents_many(
+        &mut self,
+        merges: &[(ChangesetId, i64)],
+    ) -> Result<Vec<Vec<(ChangesetId, i64)>>> {
+        // Local, no round trip: one prepared statement over the batch.
+        merges
+            .iter()
+            .map(|&(id, id_gen)| self.parents(id, id_gen))
+            .collect()
+    }
+
     /// Whether `ancestor` is `descendant` or reachable from it through parents.
     ///
     /// Walks every parent, not only first parents. A parent's generation is
@@ -1168,16 +1179,25 @@ impl MetaTx for SqliteTx<'_> {
             .map_err(crate::error::from_sqlite)
     }
 
-    /// The body of changeset `cs`, or `None` when it is not stored.
-    fn stored_changeset_body(&mut self, cs: &[u8]) -> Result<Option<Vec<u8>>> {
-        let body: Option<Vec<u8>> = self
+    /// The bodies of the changesets the ids name, as `(id, body)` for
+    /// every id that has a stored body. SQLite has one write connection:
+    /// the existing per-id statement, in a loop, is the batch.
+    fn stored_changeset_bodies(&mut self, ids: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut rows = Vec::new();
+        let mut stmt = self
             .0
             .prepare_cached("SELECT body FROM changesets WHERE id = ?1")
-            .map_err(crate::error::from_sqlite)?
-            .query_row(params![cs], |row| row.get(0))
-            .optional()
             .map_err(crate::error::from_sqlite)?;
-        Ok(body)
+        for id in ids {
+            if let Some(body) = stmt
+                .query_row(params![id], |row| row.get(0))
+                .optional()
+                .map_err(crate::error::from_sqlite)?
+            {
+                rows.push((id.clone(), body));
+            }
+        }
+        Ok(rows)
     }
 
     /// The blobs that `repo` may name, all of them.
@@ -1200,6 +1220,15 @@ impl MetaTx for SqliteTx<'_> {
             .map_err(crate::error::from_sqlite)?
             .execute(params![repo.0, blob])
             .map_err(crate::error::from_sqlite)?;
+        Ok(())
+    }
+
+    /// Removes the rows that name any of `blobs` for `repo`. SQLite has
+    /// one write connection: the existing per-row statement, in a loop.
+    fn delete_repo_blobs(&mut self, repo: RepoId, blobs: &[Vec<u8>]) -> Result<()> {
+        for blob in blobs {
+            self.delete_repo_blob(repo, blob)?;
+        }
         Ok(())
     }
 

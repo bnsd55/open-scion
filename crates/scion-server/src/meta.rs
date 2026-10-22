@@ -170,6 +170,18 @@ pub trait MetaTx {
     /// Every parent of `id`, in order, with its generation.
     fn parents(&mut self, id: ChangesetId, id_gen: i64) -> Result<Vec<(ChangesetId, i64)>>;
 
+    /// The parents of up to [`DERIVED_BATCH`] merges, in the order asked:
+    /// for each merge, its parents in order with their generations. One
+    /// statement where the backend can. A merge asked twice in the batch
+    /// gets its parents once per ask. A merge with no parent rows gives an
+    /// empty list, as [`MetaTx::parents`] would.
+    ///
+    /// [`DERIVED_BATCH`]: crate::meta::DERIVED_BATCH
+    fn parents_many(
+        &mut self,
+        merges: &[(ChangesetId, i64)],
+    ) -> Result<Vec<Vec<(ChangesetId, i64)>>>;
+
     /// Whether `ancestor` is `descendant` or reachable from it, within a
     /// bounded walk.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -418,9 +430,12 @@ pub trait MetaTx {
     /// The changeset IDs that `repo` holds, all of them.
     fn repo_changeset_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>>;
 
-    /// The body of changeset `cs`, or `None` when it is not stored.
-    /// Unchecked: `fsck` reads damaged bodies.
-    fn stored_changeset_body(&mut self, cs: &[u8]) -> Result<Option<Vec<u8>>>;
+    /// The bodies of the changesets the ids name, as `(id, body)` for
+    /// every id that has a stored body. Unchecked: `fsck` reads damaged
+    /// bodies. The ids travel as one statement on Postgres: a batch is
+    /// the size the caller chooses, and a caller that reads per id pays
+    /// per statement.
+    fn stored_changeset_bodies(&mut self, ids: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
 
     /// The blobs that `repo` may name, all of them.
     fn repo_blob_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>>;
@@ -451,6 +466,10 @@ pub trait MetaTx {
 
     /// Removes the row that names `blob` for `repo`.
     fn delete_repo_blob(&mut self, repo: RepoId, blob: &[u8]) -> Result<()>;
+
+    /// Removes the rows that name any of `blobs` for `repo`, all of
+    /// them, in one statement where the backend can.
+    fn delete_repo_blobs(&mut self, repo: RepoId, blobs: &[Vec<u8>]) -> Result<()>;
 
     /// Whether any repo names `blob`.
     fn any_repo_names(&mut self, blob: &[u8]) -> Result<bool>;

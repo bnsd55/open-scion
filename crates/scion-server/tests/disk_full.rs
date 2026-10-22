@@ -407,7 +407,7 @@ fn a_disk_full_runbook_gcs_then_writes_resume() {
     // failed to go in on the full disk, and the real run's line went in
     // after the run freed the space, marked with why it was late. The
     // dry run removed nothing, so its deferred line had nowhere to go.
-    let audit = fs::read_to_string(data.join("audit.log")).unwrap();
+    let audit = std::fs::read_to_string(data.join("audit.log")).unwrap();
     let lines: Vec<serde_json::Value> = audit
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())

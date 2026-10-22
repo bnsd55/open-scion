@@ -21,6 +21,7 @@
 //! - Land IDs come from an identity sequence, so no ID is handed out
 //!   twice, and the newest land holds the largest one.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicU64;
@@ -2260,6 +2261,53 @@ impl MetaTx for PgTx<'_> {
             .collect()
     }
 
+    /// The parents of up to `DERIVED_BATCH` merges, in the order asked,
+    /// in one statement: the ids travel as one `bytea[]`, and the reply
+    /// has at most one row per parent. A merge asked twice gets its
+    /// parents twice, once per ask. The generation check is the one
+    /// [`MetaTx::parents`] makes, with the asked merge's generation.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] if a parent's generation is not below its
+    /// merge's.
+    fn parents_many(
+        &mut self,
+        merges: &[(ChangesetId, i64)],
+    ) -> Result<Vec<Vec<(ChangesetId, i64)>>> {
+        let ids = merges
+            .iter()
+            .map(|(id, _)| id_bytes(id.as_bytes()))
+            .collect::<Vec<_>>();
+        let rows = self.c.query(
+            "SELECT cs, parent, gen FROM changeset_parents JOIN changesets ON id = parent
+             WHERE cs = ANY($1) ORDER BY cs, n",
+            &[P::bytea_array(ids)],
+        )?;
+        let mut out: Vec<Vec<(ChangesetId, i64)>> = vec![Vec::new(); merges.len()];
+        // One id can be asked twice: two histories reach the same merge.
+        let mut asked: HashMap<&[u8], Vec<usize>> = HashMap::new();
+        for (i, (id, _)) in merges.iter().enumerate() {
+            asked.entry(id.as_bytes()).or_default().push(i);
+        }
+        for row in &rows {
+            let cs: Vec<u8> = row.get(0);
+            let parent: Vec<u8> = row.get(1);
+            let parent_gen: i64 = row.get(2);
+            let parent = to_id(&parent)?;
+            for &i in &asked[cs.as_slice()] {
+                let (id, id_gen) = merges[i];
+                if parent_gen >= id_gen {
+                    return Err(Error::Corrupt(format!(
+                        "changeset {id} has generation {id_gen}, its parent {parent} {parent_gen}"
+                    )));
+                }
+                out[i].push((parent, parent_gen));
+            }
+        }
+        Ok(out)
+    }
+
     /// Whether `ancestor` is `descendant` or reachable from it through
     /// parents, within a bounded walk.
     ///
@@ -3095,12 +3143,18 @@ impl MetaTx for PgTx<'_> {
             .collect())
     }
 
-    /// The body of changeset `cs`, or `None` when it is not stored.
-    fn stored_changeset_body(&mut self, cs: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .c
-            .query_opt("SELECT body FROM changesets WHERE id = $1", &[P::bytes(cs)])?
-            .map(|row| row.get(0)))
+    /// The bodies of the changesets the ids name, as `(id, body)` for
+    /// every id that has a stored body. One statement: the ids travel as
+    /// one bytea array, and the reply has at most one row per id.
+    fn stored_changeset_bodies(&mut self, ids: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let rows = self.c.query(
+            "SELECT id, body FROM changesets WHERE id = ANY($1)",
+            &[P::bytea_array(ids.to_vec())],
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
     }
 
     /// The blobs that `repo` may name, all of them.
@@ -3117,6 +3171,16 @@ impl MetaTx for PgTx<'_> {
         self.c.execute(
             "DELETE FROM repo_blobs WHERE repo_id = $1 AND blob = $2",
             &[P::i64(repo.0), P::bytes(blob)],
+        )?;
+        Ok(())
+    }
+
+    /// Removes the rows that name any of `blobs` for `repo`. One
+    /// statement: the blobs travel as one bytea array.
+    fn delete_repo_blobs(&mut self, repo: RepoId, blobs: &[Vec<u8>]) -> Result<()> {
+        self.c.execute(
+            "DELETE FROM repo_blobs WHERE repo_id = $1 AND blob = ANY($2)",
+            &[P::i64(repo.0), P::bytea_array(blobs.to_vec())],
         )?;
         Ok(())
     }
