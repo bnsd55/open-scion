@@ -1204,10 +1204,6 @@ impl Drop for PgWriteWaiter<'_> {
 /// of the client, so a `PgTx` is a plain client handle: it stays covariant
 /// in its lifetime, which the backend enum's transaction needs.
 ///
-/// `pub` with the unreachable-pub allow, like [`SqliteTx`](crate::db::SqliteTx):
-/// [`Meta::Tx`] names it, and the trait re-exports through
-/// `test_support::meta`.
-#[allow(unreachable_pub)]
 /// The derived rows a batching transaction holds for the flush.
 type DerivedPending = Vec<(String, i64, ChangesetId, Vec<u8>)>;
 
@@ -1215,6 +1211,10 @@ type DerivedPending = Vec<(String, i64, ChangesetId, Vec<u8>)>;
 /// (kind, version, id).
 type DerivedPreload = std::collections::HashMap<(String, i64, Vec<u8>), Vec<u8>>;
 
+/// `pub` with the unreachable-pub allow, like [`SqliteTx`](crate::db::SqliteTx):
+/// [`Meta::Tx`] names it, and the trait re-exports through
+/// `test_support::meta`.
+#[allow(unreachable_pub)]
 pub struct PgTx<'a> {
     c: &'a mut PgClient,
     /// The generations this transaction has already read. A changeset's
