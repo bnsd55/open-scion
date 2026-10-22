@@ -369,6 +369,9 @@ The server records an audit log: an append-only JSON-lines file of
 refused authentication (counted per peer), writes, ref changes, lands
 and administrative changes, with no tokens and no contents. It lives at
 `audit.log` in the data directory; `--audit-file` puts it elsewhere.
+The CLI's state-changing subcommands record their own admin lines in
+the same file -- one intent before a change and one result after it --
+`gc` first, and the list grows with each slice.
 There is no way to turn it off: a server that cannot record refuses the
 changes it cannot account for, and flips readiness until a restart. The
 file is mode 0600, never a symlink, in a directory only the server's
