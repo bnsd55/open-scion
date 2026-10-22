@@ -71,7 +71,7 @@ sudo modprobe nfs
 command -v mount.nfs > /dev/null || sudo apt-get install -y -qq nfs-common
 
 note "starting the server"
-"$BIN/scion-server" ticket-key --out "$WORK/ticket.key" > "$WORK/ticket.pub"
+"$BIN/scion-server" --data "$WORK/server" ticket-key --out "$WORK/ticket.key" > "$WORK/ticket.pub"
 # In Postgres mode (SCION_TEST_BACKEND=postgres) the server serves its
 # metadata from the test database; the data directory keeps the marker and
 # the blob files, and the checks below prove which backend served.

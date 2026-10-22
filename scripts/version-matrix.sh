@@ -484,7 +484,7 @@ pair_5() {
   # A key that is not the server's, made by the OTHER build's tool: if
   # the two versions disagreed on the key format, the refusal below
   # would catch it.
-  "$cache/scion-server" ticket-key --out "$dir/wrong.key" \
+  "$cache/scion-server" --data "$dir/server" ticket-key --out "$dir/wrong.key" \
     >"$dir/wrong.pub" || die "pair '$PAIR' ($SIDE): the second ticket-key failed"
   sport=$(start server "$dir" "$srv/scion-server" port --data "$dir/server" serve \
     --listen 127.0.0.1:0 --ticket-key "$dir/ticket.key")

@@ -78,13 +78,16 @@ pub struct CommitGraph;
 /// Bytes of a stored [`Link`]: ID, generation, depth.
 const LINK_BYTES: usize = 32 + 8 + 8;
 
+use crate::derived::DeriveReport;
+
 /// Derives the commit graph of `cs`, and removes the rows of older
-/// versions. Returns the kind's name for the `derive` command's report.
+/// versions. Returns the kind's name and the counts the `derive`
+/// command's report carries.
 ///
 /// # Errors
 ///
-/// Errors of the `derived` fill, and of `Store::flush`.
-pub fn backfill_commit_graph(store: &Backend, repo: &str, cs: ChangesetId) -> Result<&'static str> {
+/// Errors of the derived fill, and of the store's flush.
+pub fn backfill_commit_graph(store: &Backend, repo: &str, cs: ChangesetId) -> Result<DeriveReport> {
     crate::derived::backfill::<CommitGraph>(store, repo, cs)
 }
 
