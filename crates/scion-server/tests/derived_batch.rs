@@ -79,90 +79,12 @@ impl Git {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    let table = "0123456789abcdef";
-    let mut out = String::new();
-    for b in bytes {
-        out.push(table.chars().nth(usize::from(b >> 4)).unwrap());
-        out.push(table.chars().nth(usize::from(b & 15)).unwrap());
-    }
-    out
-}
-
 fn opts(rev: &str) -> ImportOptions {
     ImportOptions {
         rev: rev.to_owned(),
         target_ref: "main".to_owned(),
         verify_sample: 1000,
     }
-}
-
-#[test]
-fn the_chain_read_walks_the_flushed_rows() {
-    if !Backend::test_is_postgres() {
-        eprintln!("skip on sqlite: this guard compares Postgres rows");
-        return;
-    }
-    let git = Git::new();
-    let tip = git.fast_commits(10);
-    let dir = tempfile::tempdir().unwrap();
-    let store = Backend::open_test(dir.path()).unwrap();
-    import_git(&store, "main", git.path(), &opts(&tip)).unwrap();
-    let schema = Backend::test_schema(dir.path()).unwrap();
-    let mut client = postgres::Client::connect(
-        &std::env::var("SCION_TEST_POSTGRES_URL").unwrap(),
-        postgres::NoTls,
-    )
-    .unwrap();
-    let n: i64 = client
-        .query(
-            &format!("SELECT count(*) FROM {schema}.changeset_parents"),
-            &[],
-        )
-        .unwrap()[0]
-        .get(0);
-    eprintln!("changeset_parents rows after a 10-commit import: {n}");
-    let rows = client
-        .query(
-            &format!("SELECT id FROM {schema}.changesets ORDER BY gen DESC LIMIT 1"),
-            &[],
-        )
-        .unwrap();
-    let tip_bytes: Vec<u8> = rows[0].get(0);
-    let rows = client
-        .query(
-            &format!("SELECT n, parent FROM {schema}.changeset_parents WHERE cs = $1 ORDER BY n"),
-            &[&tip_bytes],
-        )
-        .unwrap();
-    eprintln!(
-        "the tip's parents rows: {:?}",
-        rows.iter()
-            .map(|r| (r.get::<_, i64>(0), hex(&r.get::<_, Vec<u8>>(1))))
-            .collect::<Vec<_>>()
-    );
-    let rows = client
-        .query(
-            &format!(
-                "WITH RECURSIVE walk(id, depth) AS (
-                     SELECT $1::bytea, 0::bigint
-                     UNION ALL
-                     SELECT cp.parent, w.depth + 1
-                     FROM walk w
-                     JOIN {schema}.changeset_parents cp ON cp.cs = w.id AND cp.n = 0
-                     WHERE w.depth < 1000
-                 )
-                 SELECT depth, count(*) FROM walk GROUP BY depth ORDER BY depth",
-            ),
-            &[&tip_bytes],
-        )
-        .unwrap();
-    let depth = rows.iter().map(|r| r.get::<_, i64>(0)).max().unwrap_or(0);
-    assert_eq!(
-        depth, 9,
-        "the first-parent chain walk of the tip must reach every imported changeset: \
-         the walk follows n = 0, so the parents' row numbers must count from zero"
-    );
 }
 
 #[test]

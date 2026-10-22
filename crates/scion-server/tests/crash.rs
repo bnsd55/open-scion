@@ -79,7 +79,15 @@ async fn every_reply_survives_a_kill_of_the_server() {
     let mut pending_kills = 0usize;
     for round in 0..kills {
         let server = Server::start_on("One server", &data, &log);
-        check(&server.url, &data, &mut ledger, &mut checked, &mut rng).await;
+        check(
+            &server.url,
+            &data,
+            &data,
+            &mut ledger,
+            &mut checked,
+            &mut rng,
+        )
+        .await;
         let signals = Arc::new(Signals::default());
         let clients: Vec<_> = (0..CLIENTS)
             .map(|c| {
@@ -134,7 +142,15 @@ async fn every_reply_survives_a_kill_of_the_server() {
         left += fs::read_dir(data.join("tmp")).unwrap().count();
     }
     let server = Server::start_on("One server", &data, &log);
-    check(&server.url, &data, &mut ledger, &mut checked, &mut rng).await;
+    check(
+        &server.url,
+        &data,
+        &data,
+        &mut ledger,
+        &mut checked,
+        &mut rng,
+    )
+    .await;
 
     println!(
         "{} lands, {cut} of them cut by a kill; {} blob files; {left} temp files left by the kills",

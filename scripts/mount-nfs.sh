@@ -71,7 +71,7 @@ sudo modprobe nfs
 command -v mount.nfs > /dev/null || sudo apt-get install -y -qq nfs-common
 
 note "starting the server"
-"$BIN/scion-server" ticket-key --out "$WORK/ticket.key" > "$WORK/ticket.pub"
+"$BIN/scion-server" --data "$WORK/server" ticket-key --out "$WORK/ticket.key" > "$WORK/ticket.pub"
 # In Postgres mode (SCION_TEST_BACKEND=postgres) the server serves its
 # metadata from the test database; the data directory keeps the marker and
 # the blob files, and the checks below prove which backend served.
@@ -81,10 +81,9 @@ if [ "${SCION_TEST_BACKEND:-}" = postgres ]; then
   PG_ARG="--postgres-url $SCION_TEST_POSTGRES_URL"
 fi
 # shellcheck disable=SC2086 # the URL holds no spaces
-"$BIN/scion-server" --data "$WORK/server" serve \
+"$BIN/scion-server" --data "$WORK/server" $PG_ARG serve \
   --listen "127.0.0.1:$SERVER_PORT" \
   --ticket-key "$WORK/ticket.key" \
-  $PG_ARG \
   > "$WORK/server.log" 2>&1 &
 echo $! > "$WORK/server.pid"
 "$TIMEOUT" 30 bash -c 'until grep -q serving '"$WORK"'/server.log 2> /dev/null; do sleep 0.2; done' \
@@ -110,10 +109,11 @@ git -C "$WORK/src" add README.md
 git -C "$WORK/src" -c user.name=mount-nfs -c user.email=mount-nfs@localhost \
   commit -qm "seed the repo"
 # The import opens the same backend beside the serving one, so it takes
-# the same `--postgres-url` in Postgres mode.
-"$TIMEOUT" 120 "$BIN/scion-server" --data "$WORK/server" import \
+# the same `--postgres-url` in Postgres mode, before the subcommand: the
+# flag belongs to the root command.
+# shellcheck disable=SC2086 # the URL holds no spaces
+"$TIMEOUT" 120 "$BIN/scion-server" --data "$WORK/server" $PG_ARG import \
   --repo main --rev main "$WORK/src" \
-  $PG_ARG \
   > "$WORK/import.out" 2> "$WORK/import.log" || {
   tail -n 20 "$WORK/import.log" >&2
   die "the import failed"
