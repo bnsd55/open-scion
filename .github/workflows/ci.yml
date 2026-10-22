@@ -98,7 +98,7 @@ jobs:
                   pg=true
                   echo "::notice::cannot read $file, running Postgres to be safe"
                 elif printf '%s' "$content" | base64 -d 2>/dev/null \
-                  | grep -q 'open_test_shared\|SCION_TEST_BACKEND'; then
+                  | grep -q 'open_test\|SCION_TEST_BACKEND\|SCION_TEST_POSTGRES_URL'; then
                   pg=true
                 fi
                 ;;
@@ -309,6 +309,13 @@ jobs:
           PROPTEST_CASES: "64"
           SCION_TEST_BACKEND: postgres
           SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+          SCION_TEST_BACKEND: postgres
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+          # The backup test dumps the live metadata with the job's own
+          # Postgres, so its tools match the server: the container name
+          # points at the service container above, and the test never
+          # stops it (the takeover step below does, after the tests).
+          SCION_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
       # The fault rows whose metadata half is Postgres itself: on this
       # backend the blob files live in the data directory of each step
       # below, and the metadata lives in the database, so a cut of the
@@ -342,6 +349,7 @@ jobs:
             echo "::error::the test suite left the work tree dirty: $dirty"
             exit 1
           fi
+
       # The takeover test stops the database and restarts it. The service
       # container of this job is the only postgres:17.11 on the runner, and
       # it belongs to this job alone, so it may go down and come back.
