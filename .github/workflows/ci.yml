@@ -35,8 +35,44 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The tier gate. It reads the pull request's own file list from the
+  # API: no checkout, no fetch, no third-party action. A PR that touches
+  # only docs/**, *.md or changes/** cannot change behavior, so
+  # docs_only=true and only the docs tests run for it. A draft PR skips
+  # every job, this one included. The slow tier below (every job but
+  # lint, test and docs) never runs on a pull request: main, the
+  # nightly schedule and a dispatch run it as before.
+  tier:
+    name: what a pull request touches
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request' && !github.event.pull_request.draft
+    outputs:
+      docs_only: ${{ steps.files.outputs.docs_only }}
+    steps:
+      - id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/${{ github.event.pull_request.number }}/files" --jq '.[].filename')
+          docs_only=true
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            case "$file" in
+              docs/*|*.md|changes/*) ;;
+              *) docs_only=false; break ;;
+            esac
+          done <<< "$files"
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+
   lint:
     name: fmt + clippy
+    needs: tier
+    # Fast tier: every event, but on a pull request only a ready,
+    # non-docs-only one. The tier job is skipped on main, the nightly
+    # and a dispatch; the fast jobs then run as they always did.
+    if: >-
+      ${{ !cancelled() && (needs.tier.result == 'success' || needs.tier.result == 'skipped') && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -86,6 +122,11 @@ jobs:
 
   docs:
     name: rustdoc
+    needs: tier
+    # The docs tests run on every event and for every ready pull
+    # request; for a docs-only PR they are the only tier that runs.
+    if: >-
+      ${{ !cancelled() && (needs.tier.result == 'success' || needs.tier.result == 'skipped') && !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -101,6 +142,8 @@ jobs:
 
   supply-chain:
     name: cargo-deny
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -112,6 +155,11 @@ jobs:
 
   test:
     name: test
+    needs: tier
+    # Fast tier: every event, but on a pull request only a ready,
+    # non-docs-only one.
+    if: >-
+      ${{ !cancelled() && (needs.tier.result == 'success' || needs.tier.result == 'skipped') && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -126,7 +174,9 @@ jobs:
           cache-workspace-crates: true
       - run: cargo test --workspace
         env:
-          PROPTEST_CASES: "2000"
+          # The fast tier: a pull request runs 500 cases, main, the
+          # nightly and a dispatch the full 2000.
+          PROPTEST_CASES: ${{ github.event_name == 'pull_request' && '500' || '2000' }}
       - name: the work tree is still clean after the tests
         run: |
           # A test that writes outside its sandbox (the #332 class) shows up
@@ -157,6 +207,8 @@ jobs:
 
   test-postgres:
     name: test (postgres)
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
@@ -215,6 +267,8 @@ jobs:
 
   test-macos:
     name: test (macOS)
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: macos-15
     timeout-minutes: 40
     steps:
@@ -228,10 +282,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-workspace-crates: true
       # The Linux lint job never compiles macOS-only code (the ACL FFI
-      # module among it), so clippy runs here too, before the tests:
-      # same warm cache, a couple of minutes on a job that already
-      # builds everything, and no second macOS runner to book.
-      - run: cargo clippy --workspace --lib --bins -- -D warnings
+      # module among it), so clippy runs here, before the tests: same
+      # warm cache, a couple of minutes on a job that already builds
+      # everything, and no second macOS runner to book. --all-targets
+      # covers the lib, the bins and the test code in one pass.
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
         env:
@@ -249,6 +303,8 @@ jobs:
 
   promtool:
     name: promtool
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -269,6 +325,8 @@ jobs:
 
   power-loss:
     name: power-loss
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -332,6 +390,8 @@ jobs:
 
   nfs-mount:
     name: mount (NFS)
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -355,6 +415,8 @@ jobs:
 
   publish-check:
     name: publish check
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -372,6 +434,8 @@ jobs:
 
   msrv:
     name: check (MSRV)
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -387,6 +451,8 @@ jobs:
 
   grpc-conformance:
     name: conformance (grpcurl)
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -407,6 +473,8 @@ jobs:
 
   docker:
     name: docker demo
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -429,6 +497,8 @@ jobs:
 
   fuzz:
     name: fuzz smoke (60 s)
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -475,6 +545,8 @@ jobs:
 
   release-smoke:
     name: release smoke (${{ matrix.os }})
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     strategy:
       fail-fast: false
       matrix:
@@ -497,6 +569,8 @@ jobs:
 
   nightly-streak:
     name: nightly streak
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     # A report, not a gate: the v0.8.0 line "the scheduled full suite
