@@ -828,7 +828,24 @@ impl Pg {
         } else {
             // A marker that names a store is the identity to adopt: a
             // dump taken before the UUID existed restores next to its
-            // own directory, and they agree. A fresh database mints.
+            // own directory, and they agree. But only a schema that
+            // holds the store it names: a store that ever served wrote
+            // its repo rows, so a schema with no repos row was never
+            // served by the directory's store, and adopting would give
+            // the marker's identity to an empty schema - a wrong
+            // --postgres-url, a typo in its search_path, or one never
+            // served - and every caller would read "repo not found"
+            // with no error at the start. An empty schema refuses while
+            // the marker names a store, and mints when it names none.
+            let served = writer.query("SELECT 1 FROM repos LIMIT 1", &[])?;
+            if let (Some(held), []) = (marker.uuid, served.as_slice()) {
+                return Err(Error::FailedPrecondition(format!(
+                    "this data directory belongs to the store whose UUID \
+                     is {}, but this database holds no store: check \
+                     --postgres-url and its search_path",
+                    hex16(&held)
+                )));
+            }
             let fresh = marker.uuid.unwrap_or_else(uuid_new);
             writer.query(
                 "INSERT INTO store_uuid (one, uuid) VALUES (1, $1) \

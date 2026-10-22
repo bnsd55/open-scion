@@ -565,8 +565,8 @@ fn two_urls_that_ride_different_schemas_open_side_by_side() {
     }
 }
 
-/// 16 bytes as the 32 lowercase hex digits a marker spells.
-fn hex_of(bytes: &[u8; 16]) -> String {
+/// 16 bytes as 32 lowercase hex digits, as the marker spells them.
+fn hex16_of(bytes: &[u8; 16]) -> String {
     let mut hex = String::with_capacity(32);
     for byte in bytes {
         use std::fmt::Write as _;
@@ -575,6 +575,91 @@ fn hex_of(bytes: &[u8; 16]) -> String {
     hex
 }
 
+/// A data directory that names a store refuses a database schema that
+/// holds no store: the open would adopt the marker's UUID into an empty
+/// schema and serve nothing, and every caller would read "repo not
+/// found" with no error at the start. A `--postgres-url` that names the
+/// wrong schema (a `search_path` typo, or a schema never served) must
+/// refuse at the open.
+#[test]
+fn a_directory_that_names_a_store_refuses_an_empty_schema() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let db = Throwaway::new("empty_schema");
+    let mut admin = postgres::Client::connect(&db.url, postgres::NoTls).unwrap();
+    admin
+        .batch_execute("CREATE SCHEMA a; CREATE SCHEMA b;")
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // Schema `a` serves once: it mints the store, the directory's marker
+    // takes its UUID, and the schema holds the store's data.
+    let served = Backend::open(dir.path(), Some(&db.url_riding(Some("a"))), None)
+        .expect("the first schema opens");
+    served.write(|c| c.create_repo("r").map(|_| ())).unwrap();
+    drop(served);
+    let marker = std::fs::read_to_string(dir.path().join("backend")).unwrap();
+    let uuid = marker.lines().nth(1).unwrap().trim().to_owned();
+    assert_eq!(uuid.len(), 32, "{marker}");
+    // The same directory against schema `b`, which no store ever served:
+    // refuse, and name the store the directory belongs to.
+    let Err(error) = Backend::open(dir.path(), Some(&db.url_riding(Some("b"))), None) else {
+        panic!("the empty schema adopts the marker's store");
+    };
+    assert!(
+        matches!(error, scion_server::Error::FailedPrecondition(_)),
+        "{error:?}"
+    );
+    let text = error.to_string();
+    assert!(text.contains("holds no store"), "{error}");
+    assert!(
+        text.contains(&uuid),
+        "the refusal names the marker's store: {text}"
+    );
+    assert!(
+        text.contains("search_path"),
+        "the refusal says what to check: {text}"
+    );
+}
+
+/// The adopt keeps its legit case: a schema that holds a store's rows
+/// but no `store_uuid` row - a dump taken before the UUID existed - is
+/// adopted by the marker's directory, and the reopened store serves its
+/// rows and writes the UUID back.
+#[test]
+fn a_schema_that_holds_a_store_but_no_uuid_row_still_adopts() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let db = Throwaway::new("adopt");
+    let mut admin = postgres::Client::connect(&db.url, postgres::NoTls).unwrap();
+    admin.batch_execute("CREATE SCHEMA a;").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let served = Backend::open(dir.path(), Some(&db.url_riding(Some("a"))), None)
+        .expect("the first open mints");
+    served.write(|c| c.create_repo("r").map(|_| ())).unwrap();
+    drop(served);
+    let marker = std::fs::read_to_string(dir.path().join("backend")).unwrap();
+    let uuid = marker.lines().nth(1).unwrap().trim().to_owned();
+    // The dump's shape: the rows stay, the `store_uuid` row goes.
+    admin.batch_execute("DELETE FROM a.store_uuid;").unwrap();
+    let reopened = Backend::open(dir.path(), Some(&db.url_riding(Some("a"))), None)
+        .expect("the dump's schema is adopted");
+    assert!(reopened.read(|c| c.repo_id("r")).is_ok(), "the rows serve");
+    drop(reopened);
+    let row: Vec<u8> = postgres::Client::connect(&db.url_riding(Some("a")), postgres::NoTls)
+        .unwrap()
+        .query("SELECT uuid FROM store_uuid WHERE one = 1", &[])
+        .unwrap()[0]
+        .get(0);
+    let mut back = [0u8; 16];
+    back.copy_from_slice(&row);
+    assert_eq!(
+        hex16_of(&back),
+        uuid,
+        "the adopted identity is the marker's"
+    );
+}
 /// A first open cut between its store's UUID row and its marker opens
 /// again: the row commits early in the open, the marker is written at
 /// its end, and a kill in between left a store that could never open
@@ -616,7 +701,7 @@ fn a_first_open_cut_before_its_marker_opens_again() {
     let written = marker.lines().nth(1).unwrap().trim();
     assert_eq!(
         written,
-        hex_of(&minted),
+        hex16_of(&minted),
         "the marker names the store the row minted"
     );
 }
