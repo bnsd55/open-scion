@@ -663,8 +663,14 @@ fn plan(
     Ok(Plan::Land { rebased, head })
 }
 
-/// Step 5: records what the plan decided. If the ref moved since the plan,
-/// writes nothing and returns [`Error::Aborted`].
+/// Step 5: records what the plan decided. If the ref moved since the
+/// plan, writes nothing and returns [`Error::Aborted`]: a verdict the
+/// head decided is final only against the head it was planned on, so it
+/// carries the ref version the plan read, and the recording transaction
+/// re-reads the ref and writes only under that version - the same
+/// guard the land's own move has in its CAS. An import that moved the
+/// ref in the window aborts the verdict, and `finish` replans against
+/// the head the import made.
 fn settle(
     lands: &Lands,
     store: &Backend,
@@ -1274,6 +1280,18 @@ mod tests {
     fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        fixture_on(store, dir)
+    }
+
+    /// The same repo, on the test backend the environment names: the
+    /// verdict race runs on SQLite and on the test database alike.
+    fn fixture_shared() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::open_test_shared(dir.path()).unwrap();
+        fixture_on(store, dir)
+    }
+
+    fn fixture_on(store: Backend, dir: tempfile::TempDir) -> Fixture {
         let (repo, root) = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
@@ -1625,6 +1643,57 @@ mod tests {
         assert_eq!(parents, vec![import], "the land rebased onto the import");
         assert_eq!(metrics.land_replans(), 1, "the replan counted once");
         // A retry with the same key returns the same outcome.
+        let again = lands.land(&f.store, &caller(), &req(cs, "hook")).unwrap();
+        assert_eq!(stored(&again), stored(&out));
+    }
+
+    /// The collector of a stale verdict: the plan reads a Conflict off
+    /// the head, an import moves the ref before the settle, and the
+    /// settle must not record the verdict the old head answered for. The
+    /// settle re-reads the ref version inside its own transaction and
+    /// replans, so the reply names every path the head the import made
+    /// changed after the base - and a retry with the same key reads the
+    /// same verdict back.
+    #[test]
+    fn a_conflict_recorded_while_an_import_moved_the_ref_is_not_final() {
+        let f = fixture_shared();
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        let lands = Lands::new(None, Some(Arc::clone(&metrics)));
+        // Main moves past the base and takes `b/y`, so the plan reads a
+        // Conflict on `b/y`.
+        f.move_main(f.commit(f.root, &[put("b/y", "import")]));
+        let cs = f.commit(f.root, &[put("b/y", "mine"), put("c", "mine")]);
+        // The import commits its changeset but holds its ref move for
+        // the moment between the land's plan and its settle.
+        let import = f.commit(f.main().target, &[put("c", "import too")]);
+        let hook_store = f.store.clone();
+        let hook_repo = f.repo;
+        lands.set_before_settle(Box::new(move || {
+            let head = hook_store
+                .read(|c| Ok(c.get_ref(hook_repo, "main")?.unwrap()))
+                .unwrap();
+            let moved = hook_store
+                .write(|c| c.cas_ref(hook_repo, "main", Some(head.version), import))
+                .unwrap();
+            assert!(moved, "the import's move lost a race it cannot lose");
+        }));
+
+        let out = lands.land(&f.store, &caller(), &req(cs, "hook")).unwrap();
+        assert_eq!(out.state, LandState::Conflict, "{}", out.detail);
+        // The verdict is the plan's answer to the head the import made:
+        // it names `c`, which only that head changed. The stale verdict
+        // planned on the earlier head names `b/y` alone.
+        assert!(
+            out.conflict_paths.iter().any(|p| p.as_bytes() == b"c"),
+            "the verdict names the head the import made: {:?}",
+            out.conflict_paths
+        );
+        assert_eq!(
+            metrics.land_replans(),
+            1,
+            "the stale verdict replanned against the head the import made"
+        );
+        // A retry with the same key returns the same verdict.
         let again = lands.land(&f.store, &caller(), &req(cs, "hook")).unwrap();
         assert_eq!(stored(&again), stored(&out));
     }
