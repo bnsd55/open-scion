@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use prost::Message as _;
@@ -32,7 +33,8 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::interceptor::InterceptedService;
 
-use crate::metrics::{Metrics, MetricsLayer, land_error_label};
+use crate::metrics::{Metrics, MetricsLayer, code_label};
+use serde_json::Value;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::Instrument as _;
@@ -144,14 +146,34 @@ fn spawn_free_space_poll(
     });
 }
 
+/// Set when the server's first stale-land sweep has finished. A test
+/// hook: the land round-trip guard waits for it before it resets the
+/// statement counter, so the sweep's own statements cannot fall inside
+/// the counted window - the only database-speaking background task the
+/// server runs is this sweep, and after its first pass the next one is
+/// [`SWEEP_PERIOD`] away.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) static TEST_FIRST_SWEEP_DONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Runs the stale-land sweep at once, then once per [`SWEEP_PERIOD`], until
 /// `stop` resolves. The first sweep settles what a restart left pending
 /// before the first client asks.
-async fn sweeps(worker: Worker, lands: Arc<Lands>, stale_secs: i64, mut stop: watch::Receiver<()>) {
+async fn sweeps(
+    worker: Worker,
+    lands: Arc<Lands>,
+    stale_secs: i64,
+    audit: crate::audit::Audit,
+    mut stop: watch::Receiver<()>,
+) {
     loop {
         let (lands, store) = (Arc::clone(&lands), worker.store());
+        let audit = audit.clone();
         let rejected =
-            tokio::task::spawn_blocking(move || lands.sweep_stale(&store, stale_secs)).await;
+            tokio::task::spawn_blocking(move || lands.sweep_stale(&store, stale_secs, &audit))
+                .await;
+        #[cfg(any(test, feature = "test-hooks"))]
+        TEST_FIRST_SWEEP_DONE.store(true, std::sync::atomic::Ordering::Release);
         match rejected {
             Ok(Ok(0)) => {}
             Ok(Ok(n)) => tracing::info!(rejected = n, "rejected stale pending lands"),
@@ -295,6 +317,7 @@ pub async fn serve(
         worker.clone(),
         Arc::clone(&lands),
         land_stale_secs,
+        audit.clone(),
         stop_rx,
     ));
     // Outside the access rules, so a refused call counts too. The layer
@@ -306,6 +329,7 @@ pub async fn serve(
             lands,
             quotas.clone(),
             Arc::clone(&metrics),
+            audit.clone(),
         )
         .into_server(),
         crate::audit::AuditedAuth::new(auth.clone(), Arc::clone(&meter)),
@@ -371,6 +395,69 @@ pub struct ScionService {
     /// `READ_BUDGET_BYTES` permits, one per byte, shared by all `ReadFile`
     /// replies.
     reads: Arc<Semaphore>,
+    /// The audit log: state changes record an intent line before they
+    /// run and a result line after.
+    audit: crate::audit::Audit,
+}
+
+/// One state per land call's answer: the intent is recorded, and
+/// exactly one of the handler's drop and the store job owns the result
+/// line. The job moves it to [`LAND_STARTED`] as its first statement;
+/// the handler's drop moves it to [`LAND_ABANDONED`] and answers only
+/// if its swap won. [`LAND_VOID`] retires the debt when the intent
+/// itself was never made durable: no intent, no answer owed.
+const LAND_INTENT: u8 = 0;
+const LAND_STARTED: u8 = 1;
+const LAND_ABANDONED: u8 = 2;
+const LAND_VOID: u8 = 3;
+
+/// The result line a land call owes its intent. Held by the handler
+/// from before the intent is recorded to the call's end, returned or
+/// dropped: its drop answers with `cancelled` only when the job never
+/// claimed the call, and it hands the line to the audit's writer off
+/// this thread, because a `Drop` must not fsync.
+struct LandAnswer {
+    state: Arc<AtomicU8>,
+    audit: crate::audit::Audit,
+    request_id: String,
+    principal: String,
+    repo: String,
+    target_ref: String,
+}
+
+impl Drop for LandAnswer {
+    fn drop(&mut self) {
+        if self.state.swap(LAND_ABANDONED, Ordering::AcqRel) != LAND_INTENT {
+            // The job claimed the call: its own lines answer the intent.
+            return;
+        }
+        let line = ScionService::land_failed_line(
+            &self.request_id,
+            &self.principal,
+            &self.repo,
+            &self.target_ref,
+            "cancelled",
+        );
+        let audit = self.audit.clone();
+        let write = move || {
+            if let Err(why) = audit.record_blocking(&line) {
+                tracing::error!(
+                    reason = %why,
+                    "a cancelled land's audit line was not made durable"
+                );
+            }
+        };
+        // Off this thread: a Drop runs on a runtime worker, and a
+        // blocking append there would stall it.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(write);
+            }
+            Err(_) => {
+                std::thread::spawn(write);
+            }
+        }
+    }
 }
 
 impl ScionService {
@@ -411,6 +498,7 @@ impl ScionService {
         lands: Arc<Lands>,
         quotas: Quotas,
         metrics: Arc<Metrics>,
+        audit: crate::audit::Audit,
     ) -> Self {
         Self {
             worker,
@@ -418,6 +506,7 @@ impl ScionService {
             lands,
             quotas,
             metrics,
+            audit,
             uploads: Arc::new(Semaphore::new(MAX_UPLOADS)),
             blames: Arc::new(Semaphore::new(MAX_BLAMES)),
             blame_memory: crate::memory::Bytes::new(BLAME_MEMORY_BUDGET),
@@ -429,6 +518,155 @@ impl ScionService {
 
     fn into_server(self) -> ScionServer<Self> {
         into_server(self)
+    }
+
+    /// Records the audit's intent line for a state change, and waits
+    /// until it is durable: evidence first, so a change whose evidence
+    /// was not made durable does not happen.
+    async fn audit_intent(
+        &self,
+        request_id: &str,
+        principal: &str,
+        event: &'static str,
+        fields: serde_json::Value,
+    ) -> Result<(), Status> {
+        let line =
+            crate::audit::Event::new(event, "intent", json_fields(request_id, principal, &fields));
+        self.audit.record(line).await.map_err(|why| {
+            tracing::error!(reason = %why, "an audit intent was not made durable");
+            Status::unavailable("the audit line was not made durable")
+        })
+    }
+
+    /// The audit's answer the land job owes its intent: the outcome's
+    /// own lines when the land ran, else the one failed line. The why
+    /// is the code label of the one Status the job built, the one the
+    /// reply carries too, so one error logs once. The checks before
+    /// the land refuse a call after the guard already said STARTED, so
+    /// the job owes the intent its answer there too.
+    fn audit_land_outcome(
+        audit: &crate::audit::Audit,
+        request_id: &str,
+        principal: &str,
+        repo: &str,
+        target_ref: &str,
+        outcome: &Result<land::LandOutcome, Status>,
+    ) {
+        match outcome {
+            Ok(outcome) => {
+                for line in
+                    Self::land_result_lines(request_id, principal, repo, target_ref, outcome)
+                {
+                    Self::audit_result_blocking(audit, &line);
+                }
+            }
+            Err(status) => {
+                Self::audit_result_blocking(
+                    audit,
+                    &Self::land_failed_line(
+                        request_id,
+                        principal,
+                        repo,
+                        target_ref,
+                        code_label(status.code()),
+                    ),
+                );
+            }
+        }
+    }
+
+    /// The failed line a land owes its intent when the call ends in an
+    /// error: the why is the code label the caller read.
+    fn land_failed_line(
+        request_id: &str,
+        principal: &str,
+        repo: &str,
+        target_ref: &str,
+        why: &str,
+    ) -> crate::audit::Event {
+        crate::audit::Event::new(
+            "land",
+            "failed",
+            json_fields(
+                request_id,
+                principal,
+                &serde_json::json!({
+                    "rpc": "Land",
+                    "repo": repo,
+                    "ref": target_ref,
+                    "why": why,
+                }),
+            ),
+        )
+    }
+
+    /// The audit's result lines a state change leaves, written by the
+    /// store job that made the change, after it and outside any write
+    /// transaction: a call cut between the intent and the result (a
+    /// client that left, a deadline, a shutdown) still leaves the
+    /// audit's answer to its intent. A free function on the audit
+    /// handle, because the job that calls it is not a method on the
+    /// service.
+    fn audit_result_blocking(audit: &crate::audit::Audit, line: &crate::audit::Event) {
+        if let Err(why) = audit.record_blocking(line) {
+            tracing::error!(reason = %why, "an audit result was not made durable");
+        }
+    }
+
+    /// The audit's result lines a land that ran leaves: the land's
+    /// result line, and — when this call moved the ref — the move's
+    /// own line. A replay of a landed request reports the first move's
+    /// outcome and moved nothing itself: the move's line exists from
+    /// the call that made it.
+    fn land_result_lines(
+        request_id: &str,
+        principal: &str,
+        repo: &str,
+        target_ref: &str,
+        outcome: &land::LandOutcome,
+    ) -> Vec<crate::audit::Event> {
+        let mut fields = serde_json::json!({
+            "rpc": "Land",
+            "repo": repo,
+            "ref": target_ref,
+            "state": outcome.state.as_str(),
+            "land_id": outcome.land_id,
+        });
+        if let Some(landed) = outcome.result {
+            fields["new"] = serde_json::json!(hex_id(landed.as_bytes()));
+            if let Some(from) = outcome.previous.as_ref() {
+                fields["old"] = serde_json::json!(hex_id(from.as_bytes()));
+            }
+        }
+        if !outcome.detail.is_empty() {
+            fields["detail"] = serde_json::json!(outcome.detail);
+        }
+        let mut lines = vec![crate::audit::Event::new(
+            "land",
+            "ok",
+            json_fields(request_id, principal, &fields),
+        )];
+        // The move's own line: which principal moved which ref from
+        // what to what. The land's intent line made the evidence
+        // first; this line is the move's record.
+        if let (true, Some(landed)) = (outcome.moved, outcome.result) {
+            lines.push(crate::audit::Event::new(
+                "ref",
+                "ok",
+                json_fields(
+                    request_id,
+                    principal,
+                    &serde_json::json!({
+                        "rpc": "Land",
+                        "repo": repo,
+                        "ref": target_ref,
+                        "old": outcome.previous.as_ref().map(|id| hex_id(id.as_bytes())),
+                        "new": hex_id(landed.as_bytes()),
+                    }),
+                ),
+            ));
+        }
+        lines
     }
 
     /// Runs a `MergeBase`, `IsAncestor` or `Log` with a path: at most
@@ -544,6 +782,24 @@ pub(crate) fn check_whole_reader(
     Ok(())
 }
 
+/// The shared fields of an audit line: who, which call, on which RPC.
+pub(crate) fn json_fields(
+    request_id: &str,
+    principal: &str,
+    fields: &serde_json::Value,
+) -> serde_json::Value {
+    let mut all = serde_json::json!({
+        "request_id": request_id,
+        "principal": principal,
+    });
+    if let (Value::Object(all), Value::Object(extra)) = (&mut all, fields) {
+        for (key, value) in extra {
+            all.insert(key.clone(), value.clone());
+        }
+    }
+    all
+}
+
 /// `ResolveRef`, served by both services.
 pub(crate) async fn resolve_ref(
     worker: &Worker,
@@ -575,6 +831,30 @@ fn parse_optional_path(bytes: Vec<u8>) -> Result<Option<RepoPath>, Status> {
     } else {
         parse_path(bytes).map(Some)
     }
+}
+
+/// The caller's request ID, if it sent one that fits: the audit's
+/// intent and result lines join by it. A call that sent no usable ID
+/// gets one the server made, so every line it leaves still carries a
+/// `request_id` its pair can be found by.
+fn request_id_of<T>(request: &Request<T>) -> String {
+    scion_proto::runtime::request_id::sanitize(
+        request
+            .metadata()
+            .get(scion_proto::runtime::request_id::REQUEST_ID)
+            .map(tonic::metadata::MetadataValue::as_bytes),
+    )
+    .unwrap_or_else(scion_proto::runtime::request_id::generate)
+}
+
+/// The hex of a content ID, as the audit's old and new ref values.
+fn hex_id(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 pub(crate) fn caller<T>(request: &Request<T>) -> Result<Caller, Status> {
@@ -1112,6 +1392,7 @@ impl Scion for ScionService {
             .await
             .map_err(|_| Status::unavailable("server is shutting down"))?;
         let caller = caller(&request)?;
+        let request_id = request_id_of(&request);
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let mut stream = request.into_inner();
         let first = stream
@@ -1128,6 +1409,10 @@ impl Scion for ScionService {
             ));
         }
         self.access.check_writer(&caller, &first.repo)?;
+        let repo_name = first.repo.clone();
+        let principal = caller.0.clone();
+        let audit = self.audit.clone();
+        let mut bytes_total = first.data.len();
         // The first message's bytes, and the budget that the later messages
         // of this upload take from. Held until the reply, on every path.
         let mut quota = self
@@ -1152,13 +1437,53 @@ impl Scion for ScionService {
                     "only the first PutBlob message names the repo",
                 ));
             }
+            bytes_total += chunk.data.len();
             quota.add(chunk.data.len()).map_err(Status::from)?;
             upload = self.worker.run(move |_| upload.append(&chunk.data)).await?;
         }
-        let id = self
+        let bytes = bytes_total;
+        self.audit_intent(
+            &request_id,
+            caller.0.as_str(),
+            "write",
+            serde_json::json!({ "rpc": "PutBlob", "repo": repo_name, "bytes": bytes }),
+        )
+        .await?;
+        let written = self
             .worker
-            .run(move |store| write::put_blob(&store, repo, upload))
-            .await?;
+            .run(move |store| {
+                let written = write::put_blob(&store, repo, upload).map_err(Status::from);
+                // The job that changed the state writes the state
+                // change's own line, after the commit and outside the
+                // write transaction: the evidence does not depend on the
+                // call that asked for the write living on.
+                let mut fields =
+                    serde_json::json!({ "rpc": "PutBlob", "repo": repo_name, "bytes": bytes });
+                match &written {
+                    Ok(_) => Self::audit_result_blocking(
+                        &audit,
+                        &crate::audit::Event::new(
+                            "write",
+                            "ok",
+                            json_fields(&request_id, &principal, &fields),
+                        ),
+                    ),
+                    Err(status) => {
+                        fields["why"] = serde_json::json!(code_label(status.code()));
+                        Self::audit_result_blocking(
+                            &audit,
+                            &crate::audit::Event::new(
+                                "write",
+                                "failed",
+                                json_fields(&request_id, &principal, &fields),
+                            ),
+                        );
+                    }
+                }
+                Ok(written)
+            })
+            .await;
+        let id = written??;
         Ok(Response::new(PutBlobResponse {
             blob_id: id.as_bytes().to_vec(),
         }))
@@ -1169,21 +1494,84 @@ impl Scion for ScionService {
         request: Request<CreateChangesetRequest>,
     ) -> Result<Response<CreateChangesetResponse>, Status> {
         let caller = caller(&request)?;
+        let request_id = request_id_of(&request);
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let CreateChangesetRequest { repo, changeset } = request.into_inner();
         check_whole_reader(&self.access, &caller, &repo)?;
+        let principal = caller.0.clone();
+        self.audit_intent(
+            &request_id,
+            principal.as_str(),
+            "write",
+            serde_json::json!({ "rpc": "CreateChangeset", "repo": repo }),
+        )
+        .await?;
         let access = Arc::clone(&self.access);
-        let id = self
+        let repo_for_write = repo.clone();
+        let job_repo = repo.clone();
+        let audit = self.audit.clone();
+        let outcome = self
             .worker
             .run(move |store| {
-                // The rules first, so a change that the caller may not make
-                // reads no blob. Decoding twice costs little next to reading
-                // every blob back.
-                let (cs, _) = write::decode(&changeset)?;
-                access.check_write(&caller, &repo, cs.changes().keys())?;
-                write::create_changeset(&store, &repo, &changeset)
+                let outcome = (|| {
+                    // The rules first, so a change that the caller may not make
+                    // reads no blob. Decoding twice costs little next to reading
+                    // every blob back.
+                    let (cs, _) = write::decode(&changeset)?;
+                    access.check_write(&caller, &repo_for_write, cs.changes().keys())?;
+                    Ok(write::create_changeset(&store, &repo_for_write, &changeset)
+                        .map_err(Status::from))
+                })();
+                // The job that changed the state writes the state change's
+                // own line, after the commit and outside the write
+                // transaction: the evidence does not depend on the call
+                // that asked for the write living on.
+                match &outcome {
+                    Ok(Ok(id)) => {
+                        Self::audit_result_blocking(
+                            &audit,
+                            &crate::audit::Event::new(
+                                "write",
+                                "ok",
+                                json_fields(
+                                    &request_id,
+                                    &principal,
+                                    // A changeset ID names content the caller
+                                    // already had; the audit never names a blob
+                                    // or a tree.
+                                    &serde_json::json!({
+                                        "rpc": "CreateChangeset",
+                                        "repo": job_repo,
+                                        "changeset": hex_id(id.as_bytes()),
+                                    }),
+                                ),
+                            ),
+                        );
+                    }
+                    Ok(Err(status)) => {
+                        Self::audit_result_blocking(
+                            &audit,
+                            &crate::audit::Event::new(
+                                "write",
+                                "failed",
+                                json_fields(
+                                    &request_id,
+                                    &principal,
+                                    &serde_json::json!({
+                                        "rpc": "CreateChangeset",
+                                        "repo": job_repo,
+                                        "why": code_label(status.code()),
+                                    }),
+                                ),
+                            ),
+                        );
+                    }
+                    Err(_) => {}
+                }
+                outcome
             })
-            .await?;
+            .await;
+        let id = outcome??;
         Ok(Response::new(CreateChangesetResponse {
             changeset_id: id.as_bytes().to_vec(),
         }))
@@ -1199,39 +1587,115 @@ impl Scion for ScionService {
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let _call = deadline.guard();
         let caller = caller(&request)?;
+        let request_id = request_id_of(&request);
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let req = request.into_inner();
         check_whole_reader(&self.access, &caller, &req.repo)?;
         check_name("target_ref", &req.target_ref)?;
         check_name("request_key", &req.request_key)?;
+        // The changeset is parsed before anything is recorded: a bad ID
+        // is refused with `invalid_argument`, and the audit owes no
+        // intent for a call that named nothing to land.
+        let changeset = parse_id(&req.changeset_id, "changeset_id")?;
+        let principal = caller.0.clone();
+        // The answer the intent will owe: armed before the intent is
+        // recorded, so a call cut while the intent's append is in
+        // flight is still answered by the drop - a gap here would leave
+        // an intent that nothing ever answers. The guard is voided when
+        // the intent itself fails: no intent, no answer owed. The job
+        // claims the answer as its first statement; if this call dies
+        // first, the guard's drop answers `cancelled`. One of the two
+        // answers, never both, never neither.
+        let answer = Arc::new(AtomicU8::new(LAND_INTENT));
+        let _answering = LandAnswer {
+            state: Arc::clone(&answer),
+            audit: self.audit.clone(),
+            request_id: request_id.clone(),
+            principal: principal.clone(),
+            repo: req.repo.clone(),
+            target_ref: req.target_ref.clone(),
+        };
+        self.audit_intent(
+            &request_id,
+            principal.as_str(),
+            "land",
+            serde_json::json!({
+                "rpc": "Land",
+                "repo": req.repo,
+                "ref": req.target_ref,
+                "request_key": req.request_key,
+            }),
+        )
+        .await
+        // The intent was not made durable, so no result line is owed:
+        // the drop must answer nothing.
+        .inspect_err(|_| answer.store(LAND_VOID, Ordering::Release))?;
         let req = land::LandRequest {
-            changeset: parse_id(&req.changeset_id, "changeset_id")?,
+            changeset,
             repo: req.repo,
             target_ref: req.target_ref,
             request_key: req.request_key,
             deadline,
         };
         let (lands, access) = (Arc::clone(&self.lands), Arc::clone(&self.access));
+        let (repo, target_ref) = (req.repo.clone(), req.target_ref.clone());
+        // The job writes the land's own result lines, so the evidence
+        // does not depend on this handler living: the job needs its own
+        // copies of what the lines name.
+        let (job_request_id, job_principal) = (request_id.clone(), principal.clone());
+        let (job_repo, job_ref) = (repo.clone(), target_ref.clone());
+        let audit = self.audit.clone();
         // The land's own result comes back inside an Ok, so this handler,
         // not the worker, builds the reply's Status: a land that ends in
         // an error moves the land counter, by the code of the reply the
         // caller saw.
-        let outcome = self
+        let ran = self
             .worker
             .run(move |store| {
+                // The job's first statement claims the call's answer. If
+                // the handler's drop won the race, the call is gone and
+                // its drop has answered `cancelled`: run nothing, answer
+                // nothing more.
+                if answer.swap(LAND_STARTED, Ordering::AcqRel) == LAND_ABANDONED {
+                    return Err(crate::error::Error::Cancelled(
+                        "the call went before the land started".to_owned(),
+                    ));
+                }
                 // A rebase keeps the changes, so these are the paths that the
                 // land changes, on any ref of the repo. Checked on every call,
-                // before the land records anything, also on a retry.
-                let cs = read::get_changeset(&store, &req.repo, req.changeset)?;
-                access.check_write(&caller, &req.repo, cs.changes().keys())?;
-                Ok(lands.land(&store, &caller, &req))
+                // before the land records anything, also on a retry. Every
+                // refusal becomes its one Status here: the audit's label
+                // and the reply read the same value, so one error logs
+                // once.
+                let outcome: Result<land::LandOutcome, Status> = (|| {
+                    let cs = read::get_changeset(&store, &req.repo, req.changeset)
+                        .map_err(Status::from)?;
+                    access
+                        .check_write(&caller, &req.repo, cs.changes().keys())
+                        .map_err(Status::from)?;
+                    lands.land(&store, &caller, &req).map_err(Status::from)
+                })();
+                // The job that changed the state writes the state change's
+                // own lines, after the commit and outside the write
+                // transaction: the evidence does not depend on the call
+                // that asked for the land living on. The worker's own
+                // failures (a panic, a shutdown) built no land outcome,
+                // and the worker logged them.
+                Self::audit_land_outcome(
+                    &audit,
+                    &job_request_id,
+                    &job_principal,
+                    &job_repo,
+                    &job_ref,
+                    &outcome,
+                );
+                Ok(outcome)
             })
             .await;
-        match outcome {
+        match ran {
             Ok(Ok(outcome)) => Ok(Response::new(land_response(outcome))),
-            Ok(Err(e)) => {
-                let status = Status::from(e);
-                self.metrics.land(land_error_label(status.code()));
+            Ok(Err(status)) => {
+                self.metrics.land(code_label(status.code()));
                 Err(status)
             }
             // The worker's own failures (a panic, a shutdown) built no
@@ -1735,6 +2199,7 @@ mod tests {
             Arc::default(),
             Quotas::off(),
             Arc::default(),
+            crate::audit::Audit::off(),
         )
     }
 
@@ -1949,6 +2414,7 @@ mod tests {
             Arc::default(),
             Quotas::off(),
             Arc::default(),
+            crate::audit::Audit::off(),
         );
         // A valid changeset, which puts `f`: decode succeeds, the rules
         // deny the write. The check runs in the job, so this also shows
@@ -2252,6 +2718,7 @@ mod tests {
             Arc::new(Lands::new(None, Some(Arc::clone(metrics)))),
             Quotas::off(),
             Arc::clone(metrics),
+            crate::audit::Audit::off(),
         )
     }
 

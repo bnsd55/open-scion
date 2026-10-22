@@ -399,8 +399,10 @@ fn a_pg_replay_that_dies_halfway_leaves_the_database_empty() {
         return;
     };
     // The restore's database names one store, so the attack gets its
-    // own: created and dropped here, never the tests' shared one.
-    let name = format!("scion_restore_attack_{}", std::process::id());
+    // own: created and dropped here, never the tests' shared one. The
+    // name is this test's own, not only this process's: the tests run
+    // in parallel, and a shared name would drop a sibling's database.
+    let name = format!("scion_restore_attack_replay_{}", std::process::id());
     let mut maker = postgres::Client::connect(&base, postgres::NoTls).unwrap();
     maker
         .batch_execute(&format!("DROP DATABASE IF EXISTS {name}"))
@@ -424,6 +426,9 @@ fn a_pg_replay_that_dies_halfway_leaves_the_database_empty() {
         // its tables, and holds past the writer's 5 s clock: the
         // replay's one write dies as busy. The channel says the lock
         // is down, and the replay waits for that word before it runs.
+        // Bounded: a table that never appears hangs this thread forever
+        // and CI dies of a timeout with no name — so 30 s, then panic.
+        let started = std::time::Instant::now();
         loop {
             let there: Option<String> = db
                 .query_one("SELECT to_regclass('public.changesets')::text", &[])
@@ -437,6 +442,10 @@ fn a_pg_replay_that_dies_halfway_leaves_the_database_empty() {
                 let _ = db.batch_execute("COMMIT");
                 return;
             }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "the test database never gained its changesets table within 30 s"
+            );
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
     });
@@ -461,15 +470,85 @@ fn a_pg_replay_that_dies_halfway_leaves_the_database_empty() {
     );
     // The database came out as it went in: no row the replay wrote,
     // and no identity — the next open mints again, so the retry is
-    // refused by nothing.
+    // refused by nothing. The replay may die before its schema
+    // migration lands, so a table that does not exist counts as
+    // empty; a table that exists must hold no rows, so a partial
+    // schema with rows still fails.
     let mut check = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    assert_pg_database_empty(&mut check);
+    drop(check);
+    maker
+        .batch_execute(&format!("DROP DATABASE {name}"))
+        .unwrap();
+}
+
+/// The four tables a Scion Postgres store holds, checked against the
+/// failed restore's database: a table that does not exist counts as
+/// empty, and a table that exists must hold no rows.
+fn assert_pg_database_empty(check: &mut postgres::Client) {
     for table in ["repos", "changesets", "refs", "store_uuid"] {
-        let rows: i64 = check
-            .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+        let there: Option<String> = check
+            .query_one(&format!("SELECT to_regclass('public.{table}')::text"), &[])
             .unwrap()
             .get(0);
+        let rows: i64 = match there {
+            None => 0,
+            Some(_) => check
+                .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+                .unwrap()
+                .get(0),
+        };
         assert_eq!(rows, 0, "{table} must be empty after a failed restore");
     }
+}
+
+/// The earlier half of the promise, made deterministic: the restore
+/// dies at its open — the opener fails before any table exists — so
+/// the database comes out exactly as it went in, without a single
+/// Scion table. The old check (count(*) alone) panicked here with
+/// `relation "store_uuid" does not exist` whenever the death came
+/// before the schema; this case pins that the new check holds.
+#[test]
+fn a_pg_restore_that_dies_at_the_open_leaves_the_database_empty() {
+    let Ok(base) = std::env::var("SCION_TEST_POSTGRES_URL") else {
+        return;
+    };
+    // The restore's database names one store, so the attack gets its
+    // own: created and dropped here, never the tests' shared one. The
+    // name is this test's own, not only this process's: the tests run
+    // in parallel, and a shared name would drop a sibling's database.
+    let name = format!("scion_restore_attack_open_{}", std::process::id());
+    let mut maker = postgres::Client::connect(&base, postgres::NoTls).unwrap();
+    maker
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {name}"))
+        .unwrap();
+    maker
+        .batch_execute(&format!("CREATE DATABASE {name}"))
+        .unwrap();
+    let url = format!(
+        "{}/{}",
+        base.rsplit_once('/')
+            .map_or(base.as_str(), |(rest, _)| rest),
+        name
+    );
+    let (_keep, out, _main, _second) = sound_archive();
+    let empty = tempfile::tempdir().unwrap();
+    let restored = archive::restore_with(&out, empty.path(), Some(&url), None, |_, _, _| {
+        Err(scion_server::Error::FailedPrecondition(
+            "the open itself dies before any table exists".into(),
+        ))
+    });
+    assert!(
+        restored.is_err(),
+        "a restore whose open dies must not report success"
+    );
+    let written = std::fs::read_dir(empty.path()).unwrap().count();
+    assert_eq!(
+        written, 0,
+        "the target must stay empty when the restore dies at the open"
+    );
+    let mut check = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    assert_pg_database_empty(&mut check);
     drop(check);
     maker
         .batch_execute(&format!("DROP DATABASE {name}"))

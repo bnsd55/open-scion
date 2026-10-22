@@ -5,13 +5,24 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # The nightly: the same suite, on main, once a night. The v0.8.0 line
+  # "the scheduled full suite passes 30 consecutive runs" counts these
+  # runs (scripts/nightly-streak.sh reads them with --event schedule).
+  schedule:
+    - cron: "0 3 * * *"
 
 permissions:
   contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A pull_request run may cancel the run before it (same branch,
+  # superseded); a push to main may not: a run in progress finishes
+  # and verifies the head it ran on, and while it runs only the
+  # newest push waits — an older pending run is replaced, not run.
+  # A 03:00 schedule and a push to main share one group, and neither
+  # cancels: the nightly waits its turn.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Every third-party action is pinned to the commit SHA its version tag
 # named when this file last moved, with the version in a comment; Dependabot
@@ -24,8 +35,96 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The tier gate. It reads the pull request's own file list from the
+  # API: no checkout, no fetch, no third-party action. A PR that touches
+  # only docs/**, *.md or changes/** cannot change behavior, so
+  # docs_only=true and only the docs tests run for it. The risk flags
+  # add jobs: pg adds test (postgres), macos adds test (macOS),
+  # workflows adds the release smoke. A draft PR skips every job, this
+  # one included. Main, the nightly schedule and a dispatch run every
+  # job as before.
+  tier:
+    name: what a pull request touches
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request' && !github.event.pull_request.draft
+    outputs:
+      docs_only: ${{ steps.files.outputs.docs_only }}
+      pg: ${{ steps.files.outputs.pg }}
+      macos: ${{ steps.files.outputs.macos }}
+      workflows: ${{ steps.files.outputs.workflows }}
+    steps:
+      - id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The path rules live here, once; the table is in the pull
+          # request body.
+          files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/${{ github.event.pull_request.number }}/files" --jq '.[].filename')
+          docs_only=true
+          pg=false
+          macos=false
+          workflows=false
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            case "$file" in
+              docs/*|*.md|changes/*) ;;
+              *) docs_only=false ;;
+            esac
+            # Postgres or metadata code, and the tests that opt into
+            # the Postgres backend: a test that opts into
+            # SCION_TEST_BACKEND belongs in this list, and the globs
+            # catch the ones named pg or postgres, new ones included.
+            case "$file" in
+              crates/scion-server/src/pg.rs|\
+              crates/scion-server/src/meta.rs|\
+              crates/scion-server/src/backend.rs|\
+              crates/scion-server/src/db.rs|\
+              crates/scion-server/migrations/*|\
+              crates/scion-server/tests/*pg*.rs|\
+              crates/scion-server/tests/*postgres*.rs|\
+              crates/scion-server/tests/archive_attacks.rs|\
+              crates/scion-server/tests/backend_refusals.rs|\
+              crates/scion-server/tests/every_rpc_unauthenticated.rs|\
+              crates/scion-server/tests/import.rs|\
+              crates/scion-server/tests/migrate_log.rs|\
+              crates/scion-server/tests/serve_flags.rs|\
+              crates/scion-server/tests/write.rs) pg=true ;;
+            esac
+            # macOS or filesystem code: the tier store, the scn vfs
+            # and mount path, the permission checks — the ACL and
+            # group-writable walk in the runtime auth module is
+            # macOS-specific (#507 was a macOS-only bug there).
+            case "$file" in
+              crates/scion-tier/*|\
+              crates/scion-proto/src/runtime/auth/*|\
+              crates/scn/src/vfs.rs|\
+              crates/scn/src/cmd/mount.rs|\
+              crates/scn/src/cmd/checkout.rs|\
+              crates/scn/src/materialize.rs) macos=true ;;
+            esac
+            # Workflow or release files. The lint job's actionlint
+            # step already runs for every pull request; the release
+            # smoke is the addition.
+            case "$file" in
+              .github/workflows/*|scripts/release*) workflows=true ;;
+            esac
+          done <<< "$files"
+          {
+            echo "docs_only=$docs_only"
+            echo "pg=$pg"
+            echo "macos=$macos"
+            echo "workflows=$workflows"
+          } >> "$GITHUB_OUTPUT"
+
   lint:
     name: fmt + clippy
+    needs: tier
+    # Fast tier: every event, but on a pull request only a ready,
+    # non-docs-only one. The tier job is skipped on main, the nightly
+    # and a dispatch; the fast jobs then run as they always did.
+    if: >-
+      ${{ !cancelled() && (needs.tier.result == 'success' || needs.tier.result == 'skipped') && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -43,6 +142,16 @@ jobs:
         run: scripts/check-changelog.sh
       - name: the changelog merge script does what it says
         run: scripts/test-merge-changelog.sh
+      # The release pipeline's tag verdicts, fed canned tag objects: no
+      # CI run holds a signed release tag, so the decision is tested
+      # here instead of being trusted.
+      - name: the release tag verdicts hold (release-verify-tag)
+        run: scripts/test-release-verify-tag.sh
+      # A workflow that cannot parse fails here, on the PR that carries
+      # it, not main's next push-triggered run (#416, #419). The
+      # actionlint release is pinned by version and sha256.
+      - name: the workflows parse (actionlint)
+        run: scripts/lint-workflows.sh
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
@@ -65,6 +174,11 @@ jobs:
 
   docs:
     name: rustdoc
+    needs: tier
+    # The docs tests run on every event and for every ready pull
+    # request; for a docs-only PR they are the only tier that runs.
+    if: >-
+      ${{ !cancelled() && (needs.tier.result == 'success' || needs.tier.result == 'skipped') && !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -80,6 +194,8 @@ jobs:
 
   supply-chain:
     name: cargo-deny
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -91,6 +207,11 @@ jobs:
 
   test:
     name: test
+    needs: tier
+    # Fast tier: every event, but on a pull request only a ready,
+    # non-docs-only one.
+    if: >-
+      ${{ !cancelled() && (needs.tier.result == 'success' || needs.tier.result == 'skipped') && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -105,7 +226,9 @@ jobs:
           cache-workspace-crates: true
       - run: cargo test --workspace
         env:
-          PROPTEST_CASES: "2000"
+          # The fast tier: a pull request runs 500 cases, main, the
+          # nightly and a dispatch the full 2000.
+          PROPTEST_CASES: ${{ github.event_name == 'pull_request' && '500' || '2000' }}
       - name: the work tree is still clean after the tests
         run: |
           # A test that writes outside its sandbox (the #332 class) shows up
@@ -136,6 +259,12 @@ jobs:
 
   test-postgres:
     name: test (postgres)
+    needs: tier
+    # Risk tier: a pull request that touches Postgres or metadata code
+    # also runs this job, on one Postgres version as today. Main, the
+    # nightly and a dispatch always run it.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' && needs.tier.outputs.pg == 'true')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
@@ -200,6 +329,12 @@ jobs:
 
   test-macos:
     name: test (macOS)
+    needs: tier
+    # Risk tier: a pull request that touches the tier store, the scn
+    # vfs or mount path, or the permission checks also runs this job.
+    # Main, the nightly and a dispatch always run it.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' && needs.tier.outputs.macos == 'true')) }}
     runs-on: macos-15
     timeout-minutes: 40
     steps:
@@ -213,14 +348,15 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-workspace-crates: true
       # The Linux lint job never compiles macOS-only code (the ACL FFI
-      # module among it), so clippy runs here too, before the tests:
-      # same warm cache, a couple of minutes on a job that already
-      # builds everything, and no second macOS runner to book.
-      - run: cargo clippy --workspace --lib --bins -- -D warnings
+      # module among it), so clippy runs here, before the tests: same
+      # warm cache, a couple of minutes on a job that already builds
+      # everything, and no second macOS runner to book. --all-targets
+      # covers the lib, the bins and the test code in one pass.
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
         env:
-          PROPTEST_CASES: "2000"
+          # A pull request runs 500 cases, main and the nightly 2000.
+          PROPTEST_CASES: ${{ github.event_name == 'pull_request' && '500' || '2000' }}
       - name: the work tree is still clean after the tests
         run: |
           # New untracked files count too (a stray bench-output.txt);
@@ -234,6 +370,8 @@ jobs:
 
   promtool:
     name: promtool
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -254,6 +392,8 @@ jobs:
 
   power-loss:
     name: power-loss
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -317,6 +457,8 @@ jobs:
 
   nfs-mount:
     name: mount (NFS)
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -340,6 +482,8 @@ jobs:
 
   publish-check:
     name: publish check
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -357,6 +501,8 @@ jobs:
 
   msrv:
     name: check (MSRV)
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -372,6 +518,8 @@ jobs:
 
   grpc-conformance:
     name: conformance (grpcurl)
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -392,6 +540,8 @@ jobs:
 
   docker:
     name: docker demo
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -414,6 +564,8 @@ jobs:
 
   fuzz:
     name: fuzz smoke (60 s)
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -460,6 +612,12 @@ jobs:
 
   release-smoke:
     name: release smoke (${{ matrix.os }})
+    needs: tier
+    # Risk tier: a pull request that touches a workflow or a release
+    # script also runs this job. Main, the nightly and a dispatch
+    # always run it.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' && needs.tier.outputs.workflows == 'true')) }}
     strategy:
       fail-fast: false
       matrix:
@@ -479,3 +637,21 @@ jobs:
       # and 002): import, ticket-key, serve, scn reads and writes, fsck,
       # and a one-signal shutdown that must exit 0, on Linux and macOS.
       - run: scripts/release-smoke.sh
+
+  nightly-streak:
+    name: nightly streak
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # A report, not a gate: the v0.8.0 line "the scheduled full suite
+    # passes 30 consecutive runs" is a fact this job prints, and the run
+    # history is where anyone re-checks it. Read-only over the runs.
+    permissions:
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: the current streak of the nightly
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/nightly-streak.sh

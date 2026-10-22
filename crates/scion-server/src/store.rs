@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 use std::time::{Duration, SystemTime};
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
@@ -472,6 +473,35 @@ impl Store {
         (result, self.inner.committing.load(Ordering::Acquire))
     }
 
+    /// Runs `f` on one reader connection inside one explicit read
+    /// transaction, so every statement of `f` sees one snapshot. Plain
+    /// [`Store::read`] runs each statement autocommit, and a commit
+    /// between them changes what the later ones see. The cost is the
+    /// snapshot: the log cannot restart while `f` runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns what `f` returns, or an error from the transaction's
+    /// begin.
+    pub(crate) fn read_snapshot<T>(
+        &self,
+        f: impl for<'x> FnOnce(&'x mut SqliteTx<'x>) -> Result<T>,
+    ) -> Result<T> {
+        let reader = self.inner.readers.take();
+        let result = reader
+            .unchecked_transaction()
+            .map_err(from_sqlite)
+            .and_then(|tx| {
+                // A read transaction: nothing to keep, and the drop rolls
+                // it back. The drop must not hide what `f` returned.
+                let out = f(&mut SqliteTx(&reader));
+                drop(tx);
+                out
+            });
+        self.wait_durable(self.inner.committing.load(Ordering::Acquire))?;
+        result
+    }
+
     /// Returns once every commit that a read with count `seen` could see is
     /// durable ([`Store::read_counted`]). Call it after that read.
     ///
@@ -583,7 +613,9 @@ impl Store {
     /// cache covers every commit before it, and the log recovered after a
     /// crash is a prefix of the commits (the write-ahead log's checksums are
     /// chained). So a land that builds on a head that is not durable yet
-    /// replies only after a flush that covers that head too.
+    /// replies only after a flush that covers that head too, and every land
+    /// reply — an error reply that says the land stays pending included —
+    /// waits for a flush that covers the row it recorded.
     ///
     /// # Errors
     ///
@@ -779,9 +811,18 @@ pub(crate) fn migrate(db: &Connection, target: u32) -> Result<()> {
             "database schema version {version} is newer than this build ({SCHEMA_VERSION})"
         )));
     }
+    if version == target {
+        return Ok(());
+    }
+    tracing::info!(
+        from_version = version,
+        to_version = target,
+        "migrating the metadata schema"
+    );
     // Each migration runs in its own transaction, with the version it sets.
     // A crash rolls it back, and the next open runs it again from its start.
     for (to, sql) in (1..=target).zip(MIGRATIONS).skip(version as usize) {
+        let step = Instant::now();
         let tx = db.unchecked_transaction().map_err(from_sqlite)?;
         tx.execute_batch(sql).map_err(from_sqlite)?;
         if to == 4 {
@@ -791,7 +832,18 @@ pub(crate) fn migrate(db: &Connection, target: u32) -> Result<()> {
         tx.pragma_update(None, "user_version", to)
             .map_err(from_sqlite)?;
         tx.commit().map_err(from_sqlite)?;
+        tracing::info!(
+            from_version = to - 1,
+            to_version = to,
+            elapsed_ms = u64::try_from(step.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "the metadata schema migrated one step"
+        );
     }
+    tracing::info!(
+        from_version = version,
+        to_version = target,
+        "the metadata migration is done"
+    );
     Ok(())
 }
 

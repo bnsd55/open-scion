@@ -10,21 +10,37 @@ use std::process::{Command, Output};
 
 /// Runs `scion-server gc` on a fresh store in `dir`, with `--metrics-file`
 /// set to `metrics`, and gives its output.
+use scion_server::test_support::docs::runbook_block_with;
+
 fn run_gc(dir: &std::path::Path, metrics: &std::path::Path, dry: bool) -> Output {
     let data = dir.join("data");
     fs::create_dir_all(&data).unwrap();
-    let mut args = vec![
-        "--data".to_owned(),
-        data.display().to_string(),
-        "gc".to_owned(),
-        "--metrics-file".to_owned(),
-        metrics.display().to_string(),
-    ];
+    // The collector's command is the routine's own line, with the
+    // test's data directory and metrics file in place of the
+    // documented ones. A dry run is the documented `--dry-run` flag.
+    let line = runbook_block_with(
+        "5. Routines",
+        "metrics-file",
+        &[
+            ("/tmp/scion", data.to_str().unwrap()),
+            (
+                "/var/lib/node_exporter/textfile/scion_gc.prom",
+                metrics.to_str().unwrap(),
+            ),
+        ],
+    );
+    let mut argv: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
+    assert_eq!(
+        argv.first().map(String::as_str),
+        Some("scion-server"),
+        "the routine's collector line is a scion-server command: {line}"
+    );
+    let mut collector_args = argv.split_off(1);
     if dry {
-        args.push("--dry-run".to_owned());
+        collector_args.push("--dry-run".to_owned());
     }
     Command::new(env!("CARGO_BIN_EXE_scion-server"))
-        .args(&args)
+        .args(&collector_args)
         .env("NO_COLOR", "1")
         .output()
         .unwrap()

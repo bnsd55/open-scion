@@ -17,6 +17,7 @@ use scion_core::{BlobId, Changeset, ChangesetId, FileState, RepoPath};
 use scion_proto::v1::{CreateChangesetRequest, LandRequest, LandState};
 use scion_server::Backend;
 use scion_server::test_support::backend::from_store;
+use scion_server::test_support::docs::run_guide_block_with;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::store::Store;
 
@@ -88,29 +89,50 @@ async fn a_backup_taken_while_serving_restores_whole() {
     // The writer's first raced acknowledgment: the snapshot starts
     // only once the writer has landed a whole round, so the
     // pre-snapshot window holds raced writes, not just the chain's.
-    common::wait_until(|| acked.load(Ordering::SeqCst) > 0).await;
+    common::wait_until("the writer's first raced round", || {
+        acked.load(Ordering::SeqCst) > 0
+    })
+    .await;
 
-    // The metadata snapshot: the runbook's `VACUUM INTO`, on its own
-    // connection to the live database, while the store keeps serving.
-    // The snapshot is a consistent committed state, whatever a write
-    // that runs beside it does. Everything acknowledged before this
-    // call started must read back after the restore; what the writer
+    // The metadata snapshot: the runbook's own `VACUUM INTO` line, run
+    // through `sh` with the test's paths in place of the documented
+    // ones, on the live database, while the store keeps serving. The
+    // snapshot is a consistent committed state, whatever a write that
+    // runs beside it does. Everything acknowledged before this call
+    // started must read back after the restore; what the writer
     // acknowledges from here on may be in or out. The counter is
     // stored only after a whole round, so the pre-snapshot window
     // never splits a round's records.
     let pre_snapshot = acked.load(Ordering::SeqCst);
     let backup_db = tempfile::tempdir().unwrap();
     let snapshot = backup_db.path().join("scion.db");
-    let live = rusqlite::Connection::open(data.join("scion.db")).unwrap();
-    live.execute(&format!("VACUUM INTO '{}'", snapshot.display()), [])
-        .expect("the metadata snapshot is taken");
+    let _stdout = run_guide_block_with(
+        "The durability point",
+        "VACUUM INTO",
+        &[
+            ("/srv/scion", data.to_str().unwrap()),
+            ("/backups/scion.db", snapshot.to_str().unwrap()),
+        ],
+    );
 
     // The copy of the blob files runs while the writer keeps landing: a
     // blob the snapshot names stays reachable, and the copy may or may
     // not hold the newer ones. `gc` must not run during a backup (the
     // runbook's warning); no test runs one here.
     let backup = tempfile::tempdir().unwrap();
-    copy_tree(&data.join("objects"), &backup.path().join("objects"));
+    // The blob copy is the runbook's own `cp -R` line, with the test's
+    // data directory and backup folder in place of the documented ones.
+    let _stdout = run_guide_block_with(
+        "The durability point",
+        "objects",
+        &[
+            ("/srv/scion", data.to_str().unwrap()),
+            (
+                "/backups/scion-$(date +%F)",
+                backup.path().to_str().unwrap(),
+            ),
+        ],
+    );
     stop.store(true, Ordering::SeqCst);
     let raced = writer.await.unwrap();
     let raced_entries = raced.entries().len();
