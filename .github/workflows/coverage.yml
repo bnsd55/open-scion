@@ -302,11 +302,12 @@ jobs:
           if [ "${{ matrix.value }}" = postgres ]; then
             nextest_args+=(-p open-scion-server)
             # SHORTCUT: one graph walk runs longer than eight minutes
-            # under postgres plus instrumentation (it passes in seconds
-            # on the default backend, whose slices give its lines
-            # coverage); exclude it from the postgres slices until the
-            # walk is bounded. The upgrade path is a bounded-depth walk
-            # in the test itself.
+            # under postgres plus instrumentation, because the ancestry
+            # walk issues one query per node link (a product bug; the
+            # batched walk on perf/pg-ancestry-batch takes it from 311 s
+            # to 65 s). Remove this exclusion when the batched ancestry
+            # walk lands. Until then the default-backend slices give
+            # the test's lines coverage.
             nextest_args+=(-E 'not test(graph_queries_across_many_merges_answer)')
           else
             nextest_args+=(--workspace)
