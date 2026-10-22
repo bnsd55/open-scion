@@ -1113,3 +1113,144 @@ async fn a_land_dropped_around_its_jobs_start_gets_one_answer() {
     }
     stop.send(()).unwrap();
 }
+
+/// A caller who may read but not write gets its intent answered by
+/// exactly one failed line, whose why is the code the reply carried:
+/// the store job claimed the call (STARTED), so the job, not the dead
+/// handler, owes the line when the checks before the land refuse it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_land_without_write_access_gets_one_failed_line() {
+    use scion_proto::v1::LandRequest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let audit_path = dir.path().join("audit.log");
+    let audit = Audit::open(&audit_path).unwrap();
+    let start = store.resolve_ref(REPO, "main").unwrap();
+    // `access()` grants read only: the write check inside the job fails.
+    let (stop, url) = serve_with_audit(&store, dir.path(), access(), audit).await;
+    let mut ci = writer(&url, "t-deny").await;
+
+    let status = ci
+        .land(LandRequest {
+            repo: REPO.into(),
+            changeset_id: start.as_bytes().to_vec(),
+            target_ref: "main".into(),
+            request_key: "k-deny".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+
+    stop.send(()).unwrap();
+    wait_for_lines(&audit_path, 2).await;
+
+    let lines = read_lines(&audit_path);
+    let intents = land_lines(&lines, "t-deny")
+        .into_iter()
+        .filter(|line| line["outcome"] == "intent")
+        .count();
+    assert_eq!(intents, 1, "one intent for a refused land: {lines:?}");
+    let answers: Vec<_> = land_lines(&lines, "t-deny")
+        .into_iter()
+        .filter(|line| line["outcome"] != "intent")
+        .collect();
+    assert_eq!(answers.len(), 1, "exactly one answer, never two");
+    assert_eq!(
+        answers[0]["outcome"], "failed",
+        "the refused land's answer is the failure"
+    );
+    assert_eq!(
+        answers[0]["why"], "permission_denied",
+        "the why is the code the reply carried"
+    );
+}
+
+/// A land that names a changeset ID the server cannot parse is refused
+/// before anything is recorded: no intent line, no answer, and the
+/// reply is `invalid_argument`. An intent that a refusal never answers
+/// would read as a lost line.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_land_with_a_bad_changeset_id_records_nothing() {
+    use scion_proto::v1::LandRequest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let audit_path = dir.path().join("audit.log");
+    let audit = Audit::open(&audit_path).unwrap();
+    let (stop, url) = serve_with_audit(&store, dir.path(), write_access(), audit).await;
+    let mut ci = writer(&url, "t-bad").await;
+
+    let status = ci
+        .land(LandRequest {
+            repo: REPO.into(),
+            changeset_id: b"not-a-changeset-id".to_vec(),
+            target_ref: "main".into(),
+            request_key: "k-bad".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+
+    // The refusal and its (absent) lines are both before the reply, but
+    // the drop's cancelled line - if the code still wrote one - hands
+    // off to a blocking task. Give it a moment, then hold the file to
+    // its promise: nothing about this call is in it.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let lines = read_lines(&audit_path);
+    assert!(
+        land_lines(&lines, "t-bad").is_empty(),
+        "a refused land records nothing: {:?}",
+        land_lines(&lines, "t-bad")
+    );
+    stop.send(()).unwrap();
+}
+
+/// An intent that was not made durable is answered by nothing: the
+/// guard that writes `cancelled` is armed only after the intent exists,
+/// so the file never holds a result whose intent is missing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_land_whose_intent_fails_leaves_no_answer_line() {
+    use scion_proto::v1::LandRequest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let audit_path = dir.path().join("audit.log");
+    let audit = Audit::open(&audit_path).unwrap();
+    audit.fail_next_appends(1).unwrap();
+    let (stop, url) = serve_with_audit(&store, dir.path(), write_access(), audit).await;
+    let mut ci = writer(&url, "t-intent").await;
+
+    let status = ci
+        .land(LandRequest {
+            repo: REPO.into(),
+            changeset_id: land_changeset(&store, 0, store.resolve_ref(REPO, "main").unwrap())
+                .as_bytes()
+                .to_vec(),
+            target_ref: "main".into(),
+            request_key: "k-intent".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+
+    // The readiness loss latches and the server drains; the call rode
+    // the connection, so poll with a deadline. Whatever the timing, the
+    // file holds no land line: no intent was recorded, so no result is
+    // owed - not even `cancelled`. The drop's line, if the code still
+    // wrote one, hands off to a blocking task, so the wait is real.
+    for _ in 0..100 {
+        let lines = read_lines(&audit_path);
+        if let Some(line) = lines.iter().find(|line| line["event"] == "land") {
+            panic!("a land line exists for an intent that never landed: {line}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let lines = read_lines(&audit_path);
+    assert!(
+        !lines.iter().any(|line| line["event"] == "land"),
+        "no intent, no answer: {lines:?}"
+    );
+
+    let _ = stop.send(());
+}
