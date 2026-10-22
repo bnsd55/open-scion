@@ -21,6 +21,7 @@
 //! - Land IDs come from an identity sequence, so no ID is handed out
 //!   twice, and the newest land holds the largest one.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::atomic::AtomicU64;
@@ -2230,6 +2231,51 @@ impl MetaTx for PgTx<'_> {
                 Ok((parent, parent_gen))
             })
             .collect()
+    }
+
+    /// The parents of up to `DERIVED_BATCH` merges, in the order asked,
+    /// in one statement: the ids travel as one `bytea[]`, and the reply
+    /// has at most one row per parent. The generation check is the one
+    /// [`MetaTx::parents`] makes, with the asked merge's generation.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] if a parent's generation is not below its
+    /// merge's.
+    fn parents_many(
+        &mut self,
+        merges: &[(ChangesetId, i64)],
+    ) -> Result<Vec<Vec<(ChangesetId, i64)>>> {
+        let ids = merges
+            .iter()
+            .map(|(id, _)| id_bytes(id.as_bytes()))
+            .collect::<Vec<_>>();
+        let rows = self.c.query(
+            "SELECT cs, parent, gen FROM changeset_parents JOIN changesets ON id = parent
+             WHERE cs = ANY($1) ORDER BY cs, n",
+            &[P::bytea_array(ids)],
+        )?;
+        let mut out: Vec<Vec<(ChangesetId, i64)>> = vec![Vec::new(); merges.len()];
+        let asked: HashMap<Vec<u8>, usize> = merges
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| (id.as_bytes().to_vec(), i))
+            .collect();
+        for row in &rows {
+            let cs: Vec<u8> = row.get(0);
+            let parent: Vec<u8> = row.get(1);
+            let parent_gen: i64 = row.get(2);
+            let i = asked[&cs];
+            let (id, id_gen) = merges[i];
+            let parent = to_id(&parent)?;
+            if parent_gen >= id_gen {
+                return Err(Error::Corrupt(format!(
+                    "changeset {id} has generation {id_gen}, its parent {parent} {parent_gen}"
+                )));
+            }
+            out[i].push((parent, parent_gen));
+        }
+        Ok(out)
     }
 
     /// Whether `ancestor` is `descendant` or reachable from it through

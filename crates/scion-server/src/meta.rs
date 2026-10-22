@@ -150,6 +150,23 @@ pub trait MetaTx {
     /// Every parent of `id`, in order, with its generation.
     fn parents(&mut self, id: ChangesetId, id_gen: i64) -> Result<Vec<(ChangesetId, i64)>>;
 
+    /// The parents of up to [`DERIVED_BATCH`] merges, in the order asked:
+    /// for each merge, its parents in order with their generations. One
+    /// statement where the backend can; the default asks one by one
+    /// through [`MetaTx::parents`]. A merge with no parent rows gives an
+    /// empty list, as [`MetaTx::parents`] would.
+    ///
+    /// [`DERIVED_BATCH`]: crate::meta::DERIVED_BATCH
+    fn parents_many(
+        &mut self,
+        merges: &[(ChangesetId, i64)],
+    ) -> Result<Vec<Vec<(ChangesetId, i64)>>> {
+        merges
+            .iter()
+            .map(|&(id, id_gen)| self.parents(id, id_gen))
+            .collect()
+    }
+
     /// Whether `ancestor` is `descendant` or reachable from it, within a
     /// bounded walk.
     #[cfg(any(test, feature = "test-hooks"))]
