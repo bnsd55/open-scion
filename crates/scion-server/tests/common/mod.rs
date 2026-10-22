@@ -866,6 +866,76 @@ pub(crate) fn pending_lands(c: &rusqlite::Connection) -> i64 {
     c.query_row(pending, [], |row| row.get(0)).unwrap()
 }
 
+/// A read of the lands table of a data directory whose server runs in
+/// another process: SQLite's file beside the server, or the server's own
+/// Postgres schema. The table is the server's backend's, so a test that
+/// waits for a pending land sees the same rows on both backends.
+pub(crate) enum LandsReader {
+    Sqlite(rusqlite::Connection),
+    Postgres(Option<postgres::Client>),
+}
+
+impl LandsReader {
+    /// Opens the read. It must not run on a Postgres data directory's
+    /// SQLite path: opening `scion.db` beside a Postgres server would
+    /// create a file the restart refuses, so Postgres reads the schema.
+    pub(crate) fn open(data: &Path) -> Self {
+        if Backend::test_is_postgres() {
+            let url = postgres_url(data);
+            let client = std::thread::spawn(move || {
+                postgres::Client::connect(&url, postgres::NoTls)
+                    .expect("the server's schema connects")
+            })
+            .join()
+            .unwrap();
+            Self::Postgres(Some(client))
+        } else {
+            Self::Sqlite(rusqlite::Connection::open(data.join("scion.db")).unwrap())
+        }
+    }
+
+    /// The total land rows the server's backend holds, and the pending
+    /// ones among them.
+    pub(crate) fn counts(&mut self) -> (i64, i64) {
+        let total = "SELECT count(*) FROM lands";
+        let pending = "SELECT count(*) FROM lands WHERE state = 'pending'";
+        match self {
+            Self::Sqlite(c) => {
+                let rows = c.query_row(total, [], |row| row.get(0)).unwrap();
+                (rows, pending_lands(c))
+            }
+            Self::Postgres(client) => {
+                let c = client.as_mut().expect("the reader's client is open");
+                // The sync client's queries block on the connection's own
+                // runtime, so they cannot run on a tokio worker: they run
+                // on a thread of their own, against the held client.
+                std::thread::scope(|s| {
+                    s.spawn(|| {
+                        let rows: i64 = c.query_one(total, &[]).unwrap().get(0);
+                        let pending: i64 = c.query_one(pending, &[]).unwrap().get(0);
+                        (rows, pending)
+                    })
+                    .join()
+                    .unwrap()
+                })
+            }
+        }
+    }
+}
+
+impl Drop for LandsReader {
+    fn drop(&mut self) {
+        // The sync client's close blocks on the connection's own runtime,
+        // so it cannot drop on a tokio worker: it drops on a thread of
+        // its own.
+        if let Self::Postgres(client) = self
+            && let Some(client) = client.take()
+        {
+            std::thread::spawn(move || drop(client)).join().unwrap();
+        }
+    }
+}
+
 /// The blobs that the changeset and tree rows of the database name, and the
 /// number of pending lands. Rows in `seen` are skipped, and new rows added:
 /// a row never changes.
