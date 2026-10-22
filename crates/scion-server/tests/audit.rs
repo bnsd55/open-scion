@@ -113,11 +113,7 @@ async fn serve_with_audit(
 }
 
 async fn client(url: &str, token: &str) -> Scion {
-    let channel = Channel::from_shared(url.to_owned())
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(url).await.unwrap();
     let value = format!("Bearer {token}")
         .parse()
         .expect("a bearer header parses");
@@ -1254,3 +1250,6 @@ async fn a_land_whose_intent_fails_leaves_no_answer_line() {
 
     let _ = stop.send(());
 }
+
+#[path = "common/mod.rs"]
+mod common;

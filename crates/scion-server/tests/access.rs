@@ -205,11 +205,7 @@ async fn serve(store: &Backend, dir: &std::path::Path, access: Access) -> (Stop,
 
 /// A client of `url` as `token`; `None` sends no token at all.
 async fn scion(url: &str, token: Option<&str>) -> Scion {
-    let channel = Channel::from_shared(url.to_owned())
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(url).await.unwrap();
     match token {
         None => ScionClient::with_interceptor(channel, Bearer(None)),
         Some(token) => {
@@ -221,11 +217,7 @@ async fn scion(url: &str, token: Option<&str>) -> Scion {
 
 /// An `Objects` client of `url` as `token`; `None` sends no token.
 async fn objects(url: &str, token: Option<&str>) -> Objects {
-    let channel = Channel::from_shared(url.to_owned())
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(url).await.unwrap();
     match token {
         None => ObjectsClient::with_interceptor(channel, Bearer(None)),
         Some(token) => {
@@ -2041,3 +2033,6 @@ async fn a_principal_name_that_differs_by_case_is_another_principal() {
     }
     let _ = tip;
 }
+
+#[path = "common/mod.rs"]
+mod common;

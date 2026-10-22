@@ -129,6 +129,12 @@ pub trait Meta: Send + Sync + 'static {
     fn flush(&self) -> Result<()>;
 }
 
+/// Most ids one `get_derived_batch` call fetches. The statement stays
+/// small (1,000 x 32-byte ids as one array parameter, the reply at most
+/// 1,000 rows), and a walk reads at most 1,000 nodes per step, so one
+/// batch covers one step.
+pub(crate) const DERIVED_BATCH: usize = 1_000;
+
 /// The queries on the metadata tables. Every query fails with a database
 /// error, or with the `NotFound` or `Corrupt` error that its doc says; the
 /// docs do not repeat that per method. A query may be called in a read or
@@ -190,6 +196,44 @@ pub trait MetaTx {
     fn get_derived(&mut self, kind: &str, version: u32, cs: ChangesetId)
     -> Result<Option<Vec<u8>>>;
 
+    /// The stored bytes of up to [`DERIVED_BATCH`] derived values, in the
+    /// order asked. One read transaction, one statement: a land between two
+    /// ids of the batch cannot mix two states.
+    ///
+    /// [`DERIVED_BATCH`]: crate::meta::DERIVED_BATCH
+    fn get_derived_batch(
+        &mut self,
+        kind: &str,
+        version: u32,
+        ids: &[ChangesetId],
+    ) -> Result<Vec<Option<Vec<u8>>>>;
+
+    /// Writes a test seed: `css` oldest first, every parent before its
+    /// children, file-less (no tree entries, no blobs), and the derived
+    /// values to store beside them. One statement per batch, not per
+    /// changeset, where the backend can. The default writes them one by
+    /// one through the ordinary path; backends where a round trip costs
+    /// real time override it. The rows must find an empty schema: the
+    /// bulk write does not replay the ordinary write's conflict checks.
+    ///
+    /// Returns the ids, in `css` order.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn bulk_seed(
+        &mut self,
+        repo: RepoId,
+        css: &[scion_core::Changeset],
+        derived: &[(&'static str, u32, ChangesetId, Vec<u8>)],
+    ) -> Result<Vec<ChangesetId>> {
+        let mut ids = Vec::with_capacity(css.len());
+        for cs in css {
+            ids.push(self.insert_changeset(repo, cs)?);
+        }
+        for (kind, version, cs, value) in derived {
+            self.put_derived(kind, *version, *cs, value)?;
+        }
+        Ok(ids)
+    }
+
     /// Records a derived value. A second write must agree with the first.
     fn put_derived(
         &mut self,
@@ -241,6 +285,25 @@ pub trait MetaTx {
     /// Stores a tree. Safe to repeat.
     fn put_tree(&mut self, tree: &Tree) -> Result<TreeId>;
 
+    /// Stores pre-encoded trees, whose ids are their content hashes. Safe
+    /// to repeat. The batch is one round trip per table on Postgres,
+    /// however deep the tree chain was; a store that has no batch form
+    /// stores the rows one by one. No id may differ from its body's
+    /// hash: the callers take each id from `encode_with_id`.
+    fn put_trees(&mut self, trees: &[(TreeId, Vec<u8>)]) -> Result<()> {
+        for (id, body) in trees {
+            let (tree, body_id) = Tree::decode_with_id(body)
+                .map_err(|e| Error::Corrupt(format!("tree {id}: {e}")))?;
+            if body_id != *id {
+                return Err(Error::Corrupt(format!(
+                    "tree {id} does not match its body's id {body_id}"
+                )));
+            }
+            self.put_tree(&tree)?;
+        }
+        Ok(())
+    }
+
     /// Reads a tree, and checks it against its ID.
     fn get_tree(&mut self, id: TreeId) -> Result<Tree>;
 
@@ -262,6 +325,17 @@ pub trait MetaTx {
 
     /// Adds a blob to the blobs that `repo` may name. `Ok(true)` if new.
     fn add_repo_blob(&mut self, repo: RepoId, blob: BlobId) -> Result<bool>;
+
+    /// Adds every blob to the blobs that `repo` may name. The batch is
+    /// one round trip on Postgres, however many blobs the changeset
+    /// puts; a store that has no batch form adds them one by one. Each
+    /// blob that is already there stays as it is.
+    fn add_repo_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<()> {
+        for blob in blobs {
+            self.add_repo_blob(repo, *blob)?;
+        }
+        Ok(())
+    }
 
     /// Inserts a land, or finds the land for the same request key. Returns
     /// the repo and the land's outcome, pending or final. `pending_limit`

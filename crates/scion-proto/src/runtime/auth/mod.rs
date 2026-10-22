@@ -1013,6 +1013,40 @@ mod tests {
         read_shared_file(&file).unwrap();
     }
 
+    /// An ACL added to a file and then removed leaves no empty ACL
+    /// behind: the read passes both with the deny entry (deny only) and
+    /// after its removal, as if the file had never carried an ACL.
+    /// Measured on macOS: `chmod +a` then `chmod -a` collapses the ACL,
+    /// and `acl_get_fd_np` answers `ENOENT` again — the no-ACL case —
+    /// so the walk never sees a zero-entry handle whose first call
+    /// would answer `EINVAL`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_acl_added_and_removed_leaves_no_empty_acl_behind() {
+        let (tmp, _me) = tempdir();
+        let file = tmp.path().join("shared");
+        fs::write(&file, b"bytes").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("chmod")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(
+            run(["+a", "everyone deny delete", &file.to_string_lossy()].as_ref())
+                .status
+                .success()
+        );
+        read_shared_file(&file).unwrap();
+        assert!(
+            run(["-a", "everyone deny delete", &file.to_string_lossy()].as_ref())
+                .status
+                .success()
+        );
+        read_shared_file(&file).unwrap();
+    }
+
     /// A parent that carries only deny entries passes
     /// [`check_ancestors`]: the walk of the ancestors accepts a
     /// deny-only ACL, the ambient macOS home-folder shape, because a

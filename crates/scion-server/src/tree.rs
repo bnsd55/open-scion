@@ -108,7 +108,10 @@ pub fn apply(
             root.put(c, path, &parts(path), 0, entry)?;
         }
     }
-    root.store(c)
+    let mut rows = Vec::new();
+    let tree = root.store(&mut rows)?;
+    c.put_trees(&rows)?;
+    Ok(tree)
 }
 
 /// Finds the entry at `path` under `root`.
@@ -268,9 +271,12 @@ pub fn store_changeset(
         .transpose()?;
     let tree = apply(c, base, cs.changes(), lens)?;
     let id = c.insert_changeset(repo, cs)?;
-    for (_, blob) in db::puts(cs) {
-        c.add_repo_blob(repo, blob)?;
-    }
+    // One round trip for every blob the changeset puts, however many
+    // paths name the same one.
+    let mut puts: Vec<BlobId> = db::puts(cs).map(|(_, blob)| blob).collect();
+    puts.sort();
+    puts.dedup();
+    c.add_repo_blobs(repo, &puts)?;
     derived::put::<RootTree>(c, id, &tree)?;
     derived::remove_old::<RootTree>(c)?;
     derived::on_write::<CommitGraph>(c, id, cs, lens)?;
@@ -380,7 +386,7 @@ impl Dir {
     // 500 KB for 10,000 names of 12 bytes. Upgrade: directories cut into
     // chunks, a new tree format, so a write stores only the chunks it changes
     // (https://github.com/bnsd55/openscion/issues/114).
-    fn store(self, c: &mut dyn MetaTx) -> Result<TreeId> {
+    fn store(self, rows: &mut Vec<(TreeId, Vec<u8>)>) -> Result<TreeId> {
         match self {
             Self::Stored(id) => Ok(id),
             Self::Loaded(entries) => {
@@ -388,12 +394,17 @@ impl Dir {
                 for (name, node) in entries {
                     let entry = match node {
                         Node::File(file) => Entry::File(file),
-                        Node::Dir(dir) => Entry::Dir(dir.store(c)?),
+                        Node::Dir(dir) => Entry::Dir(dir.store(rows)?),
                     };
                     loaded.insert(name, entry);
                 }
                 let tree = Tree::new(loaded).expect("loaded entries fit the format");
-                c.put_tree(&tree)
+                // The id is the body's hash, so the chain can be built
+                // before anything is stored, and the whole chain lands as
+                // one batch of rows.
+                let (body, id) = tree.encode_with_id();
+                rows.push((id, body));
+                Ok(id)
             }
         }
     }

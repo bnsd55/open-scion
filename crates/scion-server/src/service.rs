@@ -146,6 +146,16 @@ fn spawn_free_space_poll(
     });
 }
 
+/// Set when the server's first stale-land sweep has finished. A test
+/// hook: the land round-trip guard waits for it before it resets the
+/// statement counter, so the sweep's own statements cannot fall inside
+/// the counted window - the only database-speaking background task the
+/// server runs is this sweep, and after its first pass the next one is
+/// [`SWEEP_PERIOD`] away.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) static TEST_FIRST_SWEEP_DONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Runs the stale-land sweep at once, then once per [`SWEEP_PERIOD`], until
 /// `stop` resolves. The first sweep settles what a restart left pending
 /// before the first client asks.
@@ -162,6 +172,8 @@ async fn sweeps(
         let rejected =
             tokio::task::spawn_blocking(move || lands.sweep_stale(&store, stale_secs, &audit))
                 .await;
+        #[cfg(any(test, feature = "test-hooks"))]
+        TEST_FIRST_SWEEP_DONE.store(true, std::sync::atomic::Ordering::Release);
         match rejected {
             Ok(Ok(0)) => {}
             Ok(Ok(n)) => tracing::info!(rejected = n, "rejected stale pending lands"),

@@ -430,6 +430,26 @@ impl Backend {
             Inner::Postgres(pg) => pg.tx_age(),
         }
     }
+
+    /// Runs `f` so every statement sees one snapshot, as an export's
+    /// sections claim. On Postgres, [`Backend::read`] already runs in one
+    /// REPEATABLE READ transaction. On SQLite, [`Backend::read`] runs each
+    /// statement autocommit, so the snapshot needs an explicit read
+    /// transaction on the reader connection.
+    ///
+    /// # Errors
+    ///
+    /// What `f` returns, or a database error from the transaction's
+    /// begin.
+    pub(crate) fn read_snapshot<T>(
+        &self,
+        f: impl FnOnce(&mut BackendTx<'_>) -> Result<T>,
+    ) -> Result<T> {
+        match &self.inner {
+            Inner::Sqlite(store) => store.read_snapshot(|tx| f(&mut BackendTx::Sqlite(tx))),
+            Inner::Postgres(pg) => pg.read(|tx| f(&mut BackendTx::Postgres(tx.reborrow()))),
+        }
+    }
 }
 
 impl Backend {}
@@ -627,6 +647,13 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn put_trees(&mut self, trees: &[(TreeId, Vec<u8>)]) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.put_trees(trees),
+            Self::Postgres(pg) => pg.put_trees(trees),
+        }
+    }
+
     fn get_tree(&mut self, id: TreeId) -> Result<Tree> {
         match self {
             Self::Sqlite(tx) => tx.get_tree(id),
@@ -652,6 +679,13 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.add_repo_blob(repo, blob),
             Self::Postgres(pg) => pg.add_repo_blob(repo, blob),
+        }
+    }
+
+    fn add_repo_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.add_repo_blobs(repo, blobs),
+            Self::Postgres(pg) => pg.add_repo_blobs(repo, blobs),
         }
     }
 
@@ -886,6 +920,31 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.get_derived(kind, version, cs),
             Self::Postgres(pg) => pg.get_derived(kind, version, cs),
+        }
+    }
+
+    fn get_derived_batch(
+        &mut self,
+        kind: &str,
+        version: u32,
+        ids: &[ChangesetId],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        match self {
+            Self::Sqlite(tx) => tx.get_derived_batch(kind, version, ids),
+            Self::Postgres(pg) => pg.get_derived_batch(kind, version, ids),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn bulk_seed(
+        &mut self,
+        repo: RepoId,
+        css: &[scion_core::Changeset],
+        derived: &[(&'static str, u32, ChangesetId, Vec<u8>)],
+    ) -> Result<Vec<ChangesetId>> {
+        match self {
+            Self::Sqlite(tx) => tx.bulk_seed(repo, css, derived),
+            Self::Postgres(pg) => pg.bulk_seed(repo, css, derived),
         }
     }
 

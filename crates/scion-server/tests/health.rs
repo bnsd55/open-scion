@@ -15,7 +15,6 @@ use std::path::Path;
 use std::process::{Child, Command};
 use std::time::Duration;
 
-use tonic::transport::Channel;
 use tonic_health::pb::HealthCheckRequest;
 use tonic_health::pb::health_check_response::ServingStatus;
 use tonic_health::pb::health_client::HealthClient;
@@ -92,9 +91,7 @@ async fn wait_serving(server: &mut Server, log: &Path) {
         assert!(started.elapsed() < Duration::from_secs(10), "timed out");
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
+    let channel = common::channel(&format!("http://{addr}"))
         .await
         .expect("the server listens");
     let mut client = HealthClient::new(channel);
@@ -109,9 +106,7 @@ async fn wait_serving(server: &mut Server, log: &Path) {
     // connection, so the test does not depend on how one connection
     // multiplexes two idle streams.
     let addr2 = bound_addr(log).expect("the address again");
-    let channel2 = Channel::from_shared(format!("http://{addr2}"))
-        .unwrap()
-        .connect()
+    let channel2 = common::channel(&format!("http://{addr2}"))
         .await
         .expect("the server listens again");
     let mut client2 = HealthClient::new(channel2);
