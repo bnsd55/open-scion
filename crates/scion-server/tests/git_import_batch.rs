@@ -103,7 +103,7 @@ fn the_restore_of_a_thousand_pairs_costs_three_provenance_statements() {
         let target = tempfile::tempdir().unwrap();
         Backend::test_reset_statement_count();
         let restored = archive::restore(&out, target.path(), Some(&url), None).unwrap();
-        assert_eq!(restored, vec![REPO.to_owned()]);
+        assert_eq!(restored.repos, vec![REPO.to_owned()]);
         let puts = Backend::test_statement_log()
             .iter()
             .filter(|sql| sql.starts_with("INSERT INTO git_import"))
