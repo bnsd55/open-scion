@@ -1309,7 +1309,7 @@ enum SetupOutcome {
     /// The database answered and refused the one-server lock: another
     /// session holds it.
     LockRefused,
-    /// The URL's search_path names no existing schema: the database
+    /// The URL's `search_path` names no existing schema: the database
     /// answered, only the schema is missing. A refusal, not an
     /// unreachable: no retry can fix the URL.
     NoSchema,
