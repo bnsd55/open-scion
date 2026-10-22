@@ -925,12 +925,13 @@ impl Pg {
     ) -> Result<T> {
         self.check_fenced()?;
         let (mut writer, _waiting) = self.lock_writer();
+        let mut pending = Vec::new();
         let mut pg = PgTx {
             c: &mut writer,
             gen_cache: std::collections::HashMap::new(),
             inserted_gens: std::collections::HashMap::new(),
             cs_batching: false,
-            cs_pending: Vec::new(),
+            cs_pending: Some(&mut pending),
             ended: true,
         };
         f(&mut pg)
@@ -989,7 +990,8 @@ impl Pg {
         // A write transaction runs at READ COMMITTED, the Postgres
         // default: every change of the caller checks the newest state of
         // the row it touches (the CAS predicates).
-        let mut tx = PgTx::begin(&mut writer)?;
+        let mut pending = Vec::new();
+        let mut tx = PgTx::begin(&mut writer, &mut pending)?;
         // Every writer and the collector's batches of one schema order on
         // one advisory key, held to the end of the transaction: what a
         // SQLite write transaction gets from the data directory's one
@@ -1036,6 +1038,28 @@ impl Pg {
         )?;
         match f(&mut tx) {
             Ok(value) => {
+                if tx
+                    .cs_pending
+                    .as_deref()
+                    .is_some_and(|pending| !pending.is_empty())
+                {
+                    // A caller that turned the importer's batching on and
+                    // ended the transaction without the flush would
+                    // commit changesets with no parents and no repo
+                    // membership: rows that name changesets no read can
+                    // reach. The transaction rolls back and refuses, so
+                    // the bug surfaces at the caller that forgot the
+                    // flush, not as missing rows later.
+                    tracing::error!(
+                        pending = tx.cs_pending.as_ref().map_or(0, |pending| pending.len()),
+                        "the transaction holds changeset rows it never flushed; \
+                         the transaction rolls back"
+                    );
+                    let _ = tx.rollback();
+                    return Err(Error::FailedPrecondition(
+                        "the transaction holds changeset rows it never flushed".to_owned(),
+                    ));
+                }
                 tx.commit()?;
                 Ok(value)
             }
@@ -1174,25 +1198,36 @@ pub struct PgTx<'a> {
     /// changesets row cannot wait: the derived rows of the same commit
     /// name it by a foreign key that checks at the statement.
     cs_batching: bool,
-    /// The changesets the transaction inserted while batching, in insert
-    /// order: (changeset, parents). The flush writes their parents at
-    /// their places and their repo membership.
-    cs_pending: Vec<(ChangesetId, Vec<ChangesetId>)>,
+    /// The changesets the transaction inserted while batching: their
+    /// parents and repo membership rows wait for the flush at the
+    /// transaction's end, which writes them one statement per 1,000
+    /// rows. A crash loses whole commits either way: the rows land in
+    /// the caller's transaction, before its commit. The list is shared
+    /// with the transaction's reborrows (the backend's transaction
+    /// wrapper runs the caller's closure on one), so the commit path of
+    /// the original transaction sees what they inserted and refuses to
+    /// commit without the flush. `None` on a read transaction, which
+    /// inserts nothing.
+    cs_pending: Option<&'a mut Vec<(ChangesetId, Vec<ChangesetId>)>>,
     /// The transaction was ended by `commit` or `rollback`; a drop then
     /// leaves the client alone.
     ended: bool,
 }
 
 impl<'a> PgTx<'a> {
-    /// Begins one transaction on the client.
-    fn begin(c: &'a mut PgClient) -> Result<PgTx<'a>> {
+    /// Begins one transaction on the client, sharing `pending` with the
+    /// caller, which flushes it and refuses to commit while it holds rows.
+    fn begin(
+        c: &'a mut PgClient,
+        pending: &'a mut Vec<(ChangesetId, Vec<ChangesetId>)>,
+    ) -> Result<PgTx<'a>> {
         c.execute("BEGIN", &[])?;
         Ok(Self {
             c,
             gen_cache: std::collections::HashMap::new(),
             inserted_gens: std::collections::HashMap::new(),
             cs_batching: false,
-            cs_pending: Vec::new(),
+            cs_pending: Some(pending),
             ended: false,
         })
     }
@@ -1227,7 +1262,7 @@ impl<'a> PgTx<'a> {
             gen_cache: std::collections::HashMap::new(),
             inserted_gens: std::collections::HashMap::new(),
             cs_batching: false,
-            cs_pending: Vec::new(),
+            cs_pending: None,
             ended: false,
         };
         tx.c.execute(
@@ -1252,7 +1287,9 @@ impl<'a> PgTx<'a> {
             gen_cache: std::collections::HashMap::new(),
             inserted_gens: std::collections::HashMap::new(),
             cs_batching: false,
-            cs_pending: Vec::new(),
+            // The reborrows share the pending list with the original, so
+            // its commit path sees what they inserted.
+            cs_pending: self.cs_pending.as_deref_mut(),
             ended: true,
         }
     }
@@ -1973,7 +2010,8 @@ fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
         // migration that fails rolls its own statements back, and the
         // versions before it stand.
         let step = std::time::Instant::now();
-        let mut tx = PgTx::begin(client)?;
+        let mut pending = Vec::new();
+        let mut tx = PgTx::begin(client, &mut pending)?;
         tx.c.batch(&format!(
             "{sql}\nINSERT INTO schema_migrations (version, name) \
              VALUES ({}, 'postgres schema')",
@@ -2136,7 +2174,9 @@ impl MetaTx for PgTx<'_> {
         // order the foreign keys read: changesets, changeset_parents,
         // repo_changesets, derived, history, git_import.
         if self.cs_batching {
-            self.cs_pending.push((id, cs.parents().to_vec()));
+            if let Some(pending) = self.cs_pending.as_deref_mut() {
+                pending.push((id, cs.parents().to_vec()));
+            }
             return Ok(id);
         }
         // Every parent as one statement, however many a merge has: the
@@ -2167,8 +2207,8 @@ impl MetaTx for PgTx<'_> {
     /// `flush_changeset_rows`.
     fn set_changeset_batching(&mut self, on: bool) {
         self.cs_batching = on;
-        if !on {
-            self.cs_pending.clear();
+        if !on && let Some(pending) = self.cs_pending.as_deref_mut() {
+            pending.clear();
         }
     }
 
@@ -2183,12 +2223,15 @@ impl MetaTx for PgTx<'_> {
     /// Database errors.
     fn flush_changeset_rows(&mut self, repo: RepoId) -> Result<()> {
         const CHUNK: usize = 1_000;
-        if self.cs_pending.is_empty() {
+        let Some(pending) = self.cs_pending.as_deref_mut() else {
+            return Ok(());
+        };
+        if pending.is_empty() {
             return Ok(());
         }
         let mut parent_rows: Vec<(Vec<u8>, i64, Vec<u8>)> = Vec::new();
         let mut member_rows: Vec<(i64, Vec<u8>)> = Vec::new();
-        for (id, parents) in self.cs_pending.drain(..) {
+        for (id, parents) in pending.drain(..) {
             let key = id_bytes(id.as_bytes());
             for (n, parent) in (1_i64..).zip(&parents) {
                 parent_rows.push((key.clone(), n, id_bytes(parent.as_bytes())));
@@ -4438,5 +4481,54 @@ mod pool_tests {
             assert!(!full, "{code} must not map to the disk-full class");
             assert_eq!(status.code(), tonic::Code::Internal, "{code}");
         }
+    }
+
+    /// The importer's batching holds a transaction's parents and repo
+    /// membership for the flush: a transaction that ends without the
+    /// flush refuses, rolls back, and writes nothing ([#545] review).
+    #[test]
+    fn a_batch_that_never_flushes_refuses_to_commit() {
+        use crate::test_support::meta::{Meta as _, MetaTx as _};
+
+        if !crate::Backend::test_is_postgres() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Backend::open_test(dir.path()).unwrap();
+        let repo = store.write(|c| c.create_repo("main")).unwrap();
+        let cs = Changeset::new(
+            Vec::new(),
+            scion_core::IdentityTime::new(
+                b"Ada".to_vec(),
+                b"ada@example.com".to_vec(),
+                1_700_000_000,
+                0,
+            )
+            .unwrap(),
+            None,
+            b"t\n".to_vec(),
+            std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        let (_body, id) = cs.encode_with_id();
+        let error = store
+            .write(|c| {
+                c.set_changeset_batching(true);
+                c.insert_changeset(repo, &cs)
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("never flushed"),
+            "the refusal names the flush: {error}"
+        );
+        // The transaction rolled back: the changeset row is not in the
+        // database.
+        assert!(
+            !store.read(|c| c.has_changeset(repo, id)).unwrap(),
+            "the changeset row of a transaction that never flushed survived"
+        );
+        // A normal write after the refusal writes as before.
+        let again = store.write(|c| c.insert_changeset(repo, &cs)).unwrap();
+        assert_eq!(again, id);
     }
 }
