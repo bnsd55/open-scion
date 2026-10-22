@@ -298,17 +298,18 @@ jobs:
           # the scn crate's tests read sqlite-typed rows by
           # construction. The default-backend slices cover the rest of
           # the workspace; the merged number sees it all.
+          nextest_args=(--no-fail-fast)
           if [ "${{ matrix.value }}" = postgres ]; then
-            pkgs="-p open-scion-server"
+            nextest_args+=(-p open-scion-server)
             # SHORTCUT: one graph walk runs longer than eight minutes
             # under postgres plus instrumentation (it passes in seconds
             # on the default backend, whose slices give its lines
             # coverage); exclude it from the postgres slices until the
             # walk is bounded. The upgrade path is a bounded-depth walk
             # in the test itself.
-            pkgs="$pkgs -E 'not test(graph_queries_across_many_merges_answer)'"
+            nextest_args+=(-E 'not test(graph_queries_across_many_merges_answer)')
           else
-            pkgs="--workspace"
+            nextest_args+=(--workspace)
           fi
           # A per-process address-space cap of 6 GB: a test whose
           # allocations run away under instrumentation freezes the
@@ -318,8 +319,8 @@ jobs:
           # cleanly, and the artifact carries its name.
           ulimit -v 6291456
           # shellcheck disable=SC2086
-          nice -n 19 timeout -k 60 1200 cargo nextest run $pkgs \
-            --no-fail-fast \
+          nice -n 19 timeout -k 60 1200 cargo nextest run \
+            "${nextest_args[@]}" \
             --partition hash:${{ matrix.slice }}/${{ matrix.total }} \
             > measure.log 2>&1
           status=$?
