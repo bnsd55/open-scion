@@ -8,6 +8,7 @@ use rusqlite::{Connection, params};
 use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileEntry, FileState, IdentityTime, RepoPath,
 };
+use scion_server::test_support::deadline::Deadline;
 use scion_server::test_support::error::ApplyError;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::store::BlobStatus;
@@ -16,6 +17,11 @@ use scion_server::test_support::write::{
 };
 use scion_server::{Backend, Error, test_support::tree};
 use tempfile::TempDir;
+
+/// A deadline a test does not reach.
+fn later() -> Deadline {
+    Deadline::new(std::time::Instant::now() + std::time::Duration::from_secs(600))
+}
 
 const REPO: &str = "main";
 
@@ -153,7 +159,7 @@ fn concurrent_creates_of_one_changeset_store_it_once() {
     let before = count_of(&f.store, f.dir.path());
     let ids: Vec<ChangesetId> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..100)
-            .map(|_| s.spawn(|| create_changeset(&f.store, REPO, &bytes)))
+            .map(|_| s.spawn(|| create_changeset(&f.store, REPO, &bytes, &later())))
             .collect();
         handles
             .into_iter()
@@ -313,7 +319,7 @@ fn bad_requests_are_rejected_and_store_nothing() {
         ),
     ];
     for (case, bytes, fragment) in invalid {
-        match create_changeset(&f.store, REPO, &bytes) {
+        match create_changeset(&f.store, REPO, &bytes, &later()) {
             Err(Error::InvalidArgument(why)) => {
                 assert!(why.contains(fragment), "{case}: {why}");
             }
@@ -333,7 +339,7 @@ fn bad_requests_are_rejected_and_store_nothing() {
     ];
     for (change, expected) in unapplicable {
         let bytes = changeset(vec![f.root], &[change]).encode();
-        match create_changeset(&f.store, REPO, &bytes) {
+        match create_changeset(&f.store, REPO, &bytes, &later()) {
             Err(Error::Apply(e)) => assert_eq!(e, expected),
             other => panic!("expected {expected:?}, got {other:?}"),
         }
@@ -341,7 +347,7 @@ fn bad_requests_are_rejected_and_store_nothing() {
 
     let valid = changeset(vec![f.root], &[("dir/new", Some(regular("new")))]).encode();
     assert!(matches!(
-        create_changeset(&f.store, "nope", &valid),
+        create_changeset(&f.store, "nope", &valid, &later()),
         Err(Error::NotFound(_))
     ));
     assert_eq!(
@@ -363,6 +369,7 @@ fn created_changesets_have_the_expected_root_tree() {
         &f.store,
         REPO,
         &changeset(vec![f.root], &[("a", None), ("dir/new", Some(exec))]).encode(),
+        &later(),
     )
     .unwrap();
     // A file becomes a directory, on top of a created changeset.
@@ -374,6 +381,7 @@ fn created_changesets_have_the_expected_root_tree() {
             &[("dir/b", None), ("dir/b/inner", Some(regular("b")))],
         )
         .encode(),
+        &later(),
     )
     .unwrap();
 
@@ -419,10 +427,10 @@ fn a_blob_that_a_changeset_of_the_repo_names_needs_no_upload() {
         .unwrap();
     // A rename names it again.
     let rename = changeset(vec![root], &[("f", None), ("g", Some(file))]).encode();
-    create_changeset(&f.store, "imported", &rename).unwrap();
+    create_changeset(&f.store, "imported", &rename, &later()).unwrap();
     // Another repo still may not name it.
     let theirs = changeset(vec![f.root], &[("g", Some(file))]).encode();
-    match create_changeset(&f.store, REPO, &theirs) {
+    match create_changeset(&f.store, REPO, &theirs, &later()) {
         Err(Error::InvalidArgument(why)) => assert!(why.contains("is not stored"), "{why}"),
         other => panic!("expected InvalidArgument, got {other:?}"),
     }
@@ -453,7 +461,7 @@ fn a_damaged_blob_is_rejected_until_put_rewrites_it() {
         assert_eq!(blobs.verify(id).unwrap(), BlobStatus::Corrupt, "{case}");
         assert!(matches!(blobs.get(id), Err(Error::Corrupt(_))), "{case}");
         let child = changeset(vec![f.root], &[("dir/new", Some(regular("new")))]).encode();
-        match create_changeset(&f.store, REPO, &child) {
+        match create_changeset(&f.store, REPO, &child, &later()) {
             Err(Error::InvalidArgument(why)) => {
                 assert!(why.contains("is corrupt"), "{case}: {why}");
             }
@@ -463,7 +471,7 @@ fn a_damaged_blob_is_rejected_until_put_rewrites_it() {
         assert_eq!(blobs.put(b"new").unwrap(), id, "{case}");
         assert_eq!(blobs.verify(id).unwrap(), BlobStatus::Valid, "{case}");
         assert_eq!(blobs.get(id).unwrap(), b"new", "{case}");
-        create_changeset(&f.store, REPO, &child).unwrap();
+        create_changeset(&f.store, REPO, &child, &later()).unwrap();
     }
 }
 

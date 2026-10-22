@@ -485,6 +485,11 @@ mod tests {
     use std::time::Instant;
     use tempfile::TempDir;
 
+    /// A deadline a test does not reach.
+    fn later() -> Deadline {
+        Deadline::new(Instant::now() + std::time::Duration::from_secs(600))
+    }
+
     const REPO: &str = "gc";
     /// Older than the default grace of seven days.
     const OLD: Duration = Duration::from_secs(8 * 24 * 60 * 60);
@@ -1173,7 +1178,7 @@ mod tests {
         std::fs::write(hooks.join(format!("park-{b}")), b"").unwrap();
         let writer = store.clone();
         let created = std::thread::spawn(move || {
-            create_changeset(&writer, REPO, &bytes).map_err(|e| e.to_string())
+            create_changeset(&writer, REPO, &bytes, &later()).map_err(|e| e.to_string())
         });
         wait_parked(&hooks, b);
         let report = collect(&store, Duration::from_secs(DEFAULT_GRACE_SECS), &mut |_| {});
