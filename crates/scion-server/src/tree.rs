@@ -10,7 +10,7 @@
 // through a re-export, so this marker would fire on all of them
 // under any feature set.
 #![allow(unreachable_pub)]
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileEntry, FileState, PathElem, RepoPath, Tree, TreeId,
@@ -290,9 +290,12 @@ pub fn store_changeset(
 
 /// The stored trees on every changed path's directory chain, level by
 /// level: level 0 is the root, and each round reads every directory the
-/// paths' previous level holds, in one `get_trees`. A directory the base
-/// does not store is built as the apply goes, and reads nothing. The
-/// bytes are decoded and checked against their ids, as `get_tree` does.
+/// round before resolved, in one `get_trees`. One cursor per path
+/// advances one part per round, so the whole walk grows with paths x
+/// depth, once, and the next round's ids dedupe through a set. A
+/// directory the base does not store is built as the apply goes, and
+/// reads nothing. The bytes are decoded and checked against their ids,
+/// as `get_tree` does.
 fn prefetch(
     c: &mut dyn MetaTx,
     base: Option<TreeId>,
@@ -305,9 +308,18 @@ fn prefetch(
     // Each changed path's parts; a path of length L has its file at the
     // last part, so its directories are the parts before it.
     let paths: Vec<Vec<PathElem>> = changes.keys().map(parts).collect();
-    let depth = paths.iter().map(Vec::len).max().unwrap_or(0);
-    let mut level = vec![root];
-    for _ in 0..depth {
+    // One cursor per path that has a directory above its file: the path's
+    // index, the tree the cursor sits at (its entries hold the part to
+    // resolve next), and that part's index. A cursor steps one part per
+    // round, so the whole walk grows with paths x depth, once.
+    let mut cursors: Vec<(usize, TreeId, usize)> = paths
+        .iter()
+        .enumerate()
+        .filter(|(_, path)| path.len() > 1)
+        .map(|(i, _)| (i, root, 0))
+        .collect();
+    let mut level: Vec<TreeId> = vec![root];
+    while !level.is_empty() {
         let bodies = c.get_trees(&level)?;
         for (id, body) in level.iter().zip(bodies) {
             let Some(body) = body else {
@@ -321,29 +333,31 @@ fn prefetch(
             }
             trees.insert(*id, tree);
         }
-        // The next level's directories: each path's directory at this
-        // depth, resolved through the trees this loop now holds.
+        // Each cursor resolves its path's part at this level and steps one
+        // part down; a cursor whose child is its file's directory retires
+        // after queuing that child.
         let mut next: Vec<TreeId> = Vec::new();
-        for path in &paths {
-            let mut id = root;
-            let mut stored = true;
-            for part in path.iter().take(path.len() - 1) {
-                if let Some(Entry::Dir(child)) =
-                    trees.get(&id).and_then(|tree| tree.entries().get(part))
-                {
-                    id = *child;
-                } else {
-                    stored = false;
-                    break;
-                }
+        let mut queued: HashSet<TreeId> = HashSet::new();
+        cursors.retain_mut(|(i, current, part_index)| {
+            let path = &paths[*i];
+            let Some(Entry::Dir(child)) = trees
+                .get(current)
+                .and_then(|tree| tree.entries().get(&path[*part_index]))
+            else {
+                return false; // the base holds no such directory; the apply
+                // builds it, or refuses, as before
+            };
+            if queued.insert(*child) && !trees.contains_key(child) {
+                next.push(*child);
             }
-            if stored && !trees.contains_key(&id) && !next.contains(&id) {
-                next.push(id);
+            if *part_index + 2 == path.len() {
+                false // the child is the file's directory: nothing below it
+            } else {
+                *current = *child;
+                *part_index += 1;
+                true
             }
-        }
-        if next.is_empty() {
-            break;
-        }
+        });
         level = next;
     }
     Ok(trees)
