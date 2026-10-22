@@ -274,14 +274,27 @@ fn prune_rows(
         for chunk in dead.chunks(PRUNE_BATCH) {
             let started = std::time::Instant::now();
             store.write(|c| {
-                let mut fresh = BTreeSet::new();
+                // The changesets this repo gained since the snapshot walk:
+                // their IDs, collected under the write lock the deletes
+                // share.
+                let mut unseen = Vec::new();
                 for cs in c.repo_changeset_ids(repo)? {
                     let Ok(cs) = ChangesetId::try_from(cs.as_slice()) else {
                         continue; // fsck reports the bad ID
                     };
                     if seen.insert(cs) {
-                        let Some(body) = c.stored_changeset_body(cs.as_bytes())? else {
-                            continue;
+                        unseen.push(cs.as_bytes().to_vec());
+                    }
+                }
+                // The puts of every new changeset, bodies in chunks of
+                // [`DERIVED_BATCH`]: one statement per 1,000 ids instead
+                // of one per changeset. A missing body is skipped, as the
+                // walk reads it: `fsck` reports it.
+                let mut fresh = BTreeSet::new();
+                for ids in unseen.chunks(crate::meta::DERIVED_BATCH) {
+                    for (id, body) in c.stored_changeset_bodies(ids)? {
+                        let Ok(cs) = ChangesetId::try_from(id.as_slice()) else {
+                            continue; // fsck reports the bad ID
                         };
                         let (cs, _) = Changeset::decode_with_id(&body)
                             .map_err(|e| crate::Error::Corrupt(format!("changeset {cs}: {e}")))?;
@@ -290,15 +303,16 @@ fn prune_rows(
                         }
                     }
                 }
-                for blob in chunk {
-                    if fresh.contains(blob) {
-                        continue;
-                    }
-                    if !dry_run {
-                        c.delete_repo_blob(repo, blob.as_bytes())?;
-                    }
-                    report.rows_pruned += 1;
+                // The chunk's dead rows leave in one statement.
+                let gone: Vec<Vec<u8>> = chunk
+                    .iter()
+                    .filter(|blob| !fresh.contains(*blob))
+                    .map(|blob| blob.as_bytes().to_vec())
+                    .collect();
+                if !dry_run && !gone.is_empty() {
+                    c.delete_repo_blobs(repo, &gone)?;
                 }
+                report.rows_pruned += u64::try_from(gone.len()).unwrap_or(u64::MAX);
                 Ok(())
             })?;
             tracing::info!(
