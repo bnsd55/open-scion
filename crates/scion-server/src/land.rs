@@ -339,8 +339,9 @@ impl Lands {
         // while, so it happens here, outside every lock.
         let evicted = mem::take(&mut *self.evicted.lock().unwrap_or_else(PoisonError::into_inner));
         drop(evicted);
-        let outcome = outcome?;
-        if let Some(metrics) = &self.metrics {
+        if let Ok(outcome) = &outcome
+            && let Some(metrics) = &self.metrics
+        {
             metrics.land(match outcome.state {
                 LandState::Landed => "landed",
                 LandState::Conflict => "conflict",
@@ -350,9 +351,12 @@ impl Lands {
             });
         }
         // Lands on one ref commit one at a time. Waiting for the flush after
-        // the ref lock is released lets them share it.
+        // the ref lock is released lets them share it. Every reply waits for
+        // the flush, the error replies included: a reply that says the land
+        // stays pending rests on the row the land recorded, and that row
+        // must be durable before the reply goes out.
         store.flush()?;
-        Ok(outcome)
+        outcome
     }
 
     /// [`Lands::land`], up to commits that are not durable yet. Its reads do
@@ -652,12 +656,16 @@ fn finish(
             plan(lands, c, repo, req, index).map(Planned::Do)
         })?;
         #[cfg(test)]
-        if let Some(step) = lands
+        let step = lands
             .before_settle
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
+            .take();
+        #[cfg(test)]
+        // The hook runs with the seam's lock released: a hook that arms
+        // the next one (a land that must lose the CAS at every attempt)
+        // takes the same lock to set it.
+        if let Some(step) = step {
             step();
         }
         let plan = match planned {
@@ -1633,6 +1641,69 @@ mod tests {
             f.store.blobs().full_flushes() - before,
             u64::from(FSYNC_LEAVES_DRIVE_CACHE)
         );
+    }
+
+    /// An error reply says the land stays pending and a retry with the
+    /// same request key resumes it. The row that promise rests on must be
+    /// durable before the reply goes out, so a crash that follows the
+    /// reply cannot lose it. The call's guard drops before the plan
+    /// starts, so the land ends in that error reply right after it records
+    /// its row, before any settle work runs.
+    #[test]
+    fn an_error_reply_waits_for_the_pending_row_to_be_durable() {
+        let f = fixture();
+        // The index starts at B, so the import below moves main past it,
+        // and the plan's next step checks the deadline before it derives
+        // anything.
+        f.move_main(f.commit(f.root, &[put("b/y", "B")]));
+        f.fill("f", 1);
+        f.move_main(f.commit(f.main().target, &[put("c", "import")]));
+        let cs = f.commit(f.main().target, &[put("a/x", "mine")]);
+        // The call went before the plan started: the guard drops, the
+        // deadline itself is far in the future.
+        let deadline = Deadline::new(Instant::now() + std::time::Duration::from_secs(600));
+        let guard = deadline.guard();
+        let gone = LandRequest {
+            deadline,
+            ..req(cs, "k")
+        };
+        drop(guard);
+        let commits_before = f.store.commits();
+        let err = f.lands.land(&f.store, &caller(), &gone).unwrap_err();
+        // The reply says the land stays pending, and a retry with the
+        // same request key resumes it.
+        assert!(
+            matches!(err, Error::Cancelled(ref d)
+                if d.contains("the land stays pending, retry with the same request key")),
+            "{err}"
+        );
+        // The row's commit is durable when the reply is built: a flush
+        // covered every commit made before the reply, the pending row's
+        // included. `flushed_upto` is the store's own durability mark, the
+        // one a flush updates on every platform. The check runs before any
+        // read of this test: a read of an unflushed commit flushes on its
+        // own, which would hide the bug.
+        assert!(
+            f.store.flushed_upto() > commits_before,
+            "the error reply went out before the pending row was durable: \
+             flushed to {}, commits reach {}",
+            f.store.flushed_upto(),
+            commits_before + 1,
+        );
+        let state: String = f
+            .store
+            .read(|c| {
+                c.sqlite()
+                    .unwrap()
+                    .query_row(
+                        "SELECT state FROM lands WHERE request_key = 'k'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(crate::error::from_sqlite)
+            })
+            .unwrap();
+        assert_eq!(state, "pending");
     }
 
     #[test]
