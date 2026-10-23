@@ -130,7 +130,14 @@ jobs:
           # The image may already run a swap file (this one does);
           # only grow the machine when it has none.
           if [ -z "$(swapon --show)" ]; then
-            sudo fallocate -l 4G /covswap && sudo chmod 600 /covswap               && sudo mkswap /covswap && sudo swapon /covswap || true
+            if sudo fallocate -l 4G /covswap \
+              && sudo chmod 600 /covswap \
+              && sudo mkswap /covswap \
+              && sudo swapon /covswap; then
+              echo "a 4G swap file is on"
+            else
+              echo "the swap file did not come up; the build lives without it"
+            fi
           fi
           swapon --show || true
           df -h / | tail -1; free -m | awk 'NR==2'
@@ -271,7 +278,14 @@ jobs:
           # The image may already run a swap file (this one does);
           # only grow the machine when it has none.
           if [ -z "$(swapon --show)" ]; then
-            sudo fallocate -l 4G /covswap && sudo chmod 600 /covswap               && sudo mkswap /covswap && sudo swapon /covswap || true
+            if sudo fallocate -l 4G /covswap \
+              && sudo chmod 600 /covswap \
+              && sudo mkswap /covswap \
+              && sudo swapon /covswap; then
+              echo "a 4G swap file is on"
+            else
+              echo "the swap file did not come up; the build lives without it"
+            fi
           fi
           swapon --show || true
           df -h / | tail -1; free -m | awk 'NR==2'
