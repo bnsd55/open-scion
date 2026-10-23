@@ -28,6 +28,11 @@ use scion_server::test_support::land::{LandRequest, LandState, Lands};
 use scion_server::test_support::meta::{Meta as _, MetaTx as _, RefState};
 use scion_server::test_support::{read, tree, write};
 use scion_server::{Backend, Error};
+
+/// A deadline a test does not reach.
+fn later() -> Deadline {
+    Deadline::new(std::time::Instant::now() + std::time::Duration::from_secs(600))
+}
 use scion_server::{ImportOptions, ImportReport, import_git};
 use tempfile::TempDir;
 
@@ -897,7 +902,7 @@ fn create(store: &Backend, base: ChangesetId, path: &str) -> ChangesetId {
         BTreeMap::from([(self::path(path), Some(file))]),
     )
     .expect("changeset fits the format");
-    write::create_changeset(store, "r", &cs.encode()).unwrap()
+    write::create_changeset(store, "r", &cs.encode(), &later()).unwrap()
 }
 
 /// Lands `cs` on `main`, and retries with the same key while the ref moves.
@@ -1185,7 +1190,7 @@ fn a_second_server_process_is_refused() {
     let said = if extra.is_empty() {
         stderr.contains("in use by another server")
     } else {
-        stderr.contains("another server holds this database")
+        stderr.contains("another server holds this store")
     };
     assert!(said, "{stderr}");
 }

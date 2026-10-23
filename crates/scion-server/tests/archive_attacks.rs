@@ -242,9 +242,9 @@ fn a_duplicated_member_line_verifies_and_restores() {
         "a duplicated member line is noise, not damage: {damages:?}"
     );
     let empty = tempfile::tempdir().unwrap();
-    let names = archive::restore(&out, empty.path(), None, None)
+    let report = archive::restore(&out, empty.path(), None, None)
         .expect("a duplicated member line must not break the restore");
-    assert_eq!(names.len(), 2);
+    assert_eq!(report.repos.len(), 2);
 }
 
 /// The attack: a ref in `second` that names a changeset of `main` —

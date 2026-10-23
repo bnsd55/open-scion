@@ -148,30 +148,51 @@ fn a_damaged_marker_refuses_both_opens() {
 /// A write that another writer blocks answers busy in seconds, not past
 /// the minute-long statement clock: the open sets a lock timeout like the
 /// SQLite busy timeout, and a lock the database cannot give in it maps to
-/// busy, so the client retries.
+/// busy, so the client retries. The SQLite side of the row runs here too:
+/// another connection of the test holds the write lock past the same
+/// clock, through the busy timeout the open sets.
 #[test]
 fn a_write_blocked_by_another_writer_answers_busy_in_seconds() {
-    if skip_on_sqlite() {
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
     let store = Backend::open_test(dir.path()).unwrap();
-    // A connection of the test holds the name in an open transaction: it
-    // inserted the row and never ended the transaction, so every writer
-    // of the same name waits for it.
-    let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
-    let schema = Backend::test_schema(dir.path()).unwrap();
-    let mut held = postgres::Client::connect(&url, postgres::NoTls).unwrap();
-    held.batch_execute(&format!("SET search_path TO {schema}"))
-        .unwrap();
-    held.batch_execute("BEGIN; INSERT INTO repos (name) VALUES ('held');")
-        .unwrap();
+    if Backend::test_is_postgres() {
+        // A connection of the test holds the name in an open transaction: it
+        // inserted the row and never ended the transaction, so every writer
+        // of the same name waits for it.
+        let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+        let schema = Backend::test_schema(dir.path()).unwrap();
+        let mut held = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        held.batch_execute(&format!("SET search_path TO {schema}"))
+            .unwrap();
+        held.batch_execute("BEGIN; INSERT INTO repos (name) VALUES ('held');")
+            .unwrap();
+        let error = run_blocked_write(&store);
+        let _ = held.batch_execute("ROLLBACK");
+        let _ = error;
+    } else {
+        // A raw connection of the test holds the write lock: BEGIN
+        // IMMEDIATE takes the lock the store's writer wants, and holds
+        // it while the store waits out its busy timeout.
+        let held = rusqlite::Connection::open(dir.path().join("scion.db")).unwrap();
+        held.busy_timeout(std::time::Duration::from_millis(100))
+            .unwrap();
+        held.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let error = run_blocked_write(&store);
+        let _ = held.execute_batch("ROLLBACK");
+        let _ = error;
+    }
+}
+
+/// The blocked write of [`a_write_blocked_by_another_writer_answers_busy_in_seconds`],
+/// timed and checked for the busy answer. Returns the error so a caller
+/// may roll its holder back before the store drops; the checks above
+/// have already proven the answer.
+fn run_blocked_write(store: &Backend) -> scion_server::Error {
     let started = std::time::Instant::now();
     let error = store
         .write(|c| c.create_repo("held").map(|_| ()))
         .expect_err("the held name refuses the write");
     let waited = started.elapsed();
-    let _ = held.batch_execute("ROLLBACK");
     assert!(error.is_busy(), "{error:?}");
     assert!(
         waited >= std::time::Duration::from_secs(4),
@@ -181,6 +202,7 @@ fn a_write_blocked_by_another_writer_answers_busy_in_seconds() {
         waited < std::time::Duration::from_secs(20),
         "answered after {waited:?}"
     );
+    error
 }
 
 /// The store UUID: the first Postgres open mints one, the marker file
@@ -420,4 +442,289 @@ fn a_fsck_of_a_postgres_backed_store_finds_missing_blob_files() {
         "{:?}",
         report.problems
     );
+}
+
+/// One throwaway database per test, so the lock scope of a production
+/// open is checked on a real open without touching the shared test
+/// database's default schema.
+struct Throwaway {
+    url: String,
+    name: String,
+}
+
+impl Throwaway {
+    /// One throwaway database per test, named after the test, so
+    /// parallel tests of this file do not drop each other's database.
+    fn new(who: &str) -> Self {
+        let base = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+        // The name carries the test, so parallel tests of this file do
+        // not drop each other's database.
+        let name = format!("scion_test_lockcheck_{}_{}", who, std::process::id());
+        let mut admin = postgres::Client::connect(&base, postgres::NoTls).unwrap();
+        admin
+            .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+            .unwrap();
+        admin
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .unwrap();
+        let cut = base.rfind('/').expect("the test URL names a database");
+        Self {
+            url: format!("{}/{}", &base[..cut], name),
+            name,
+        }
+    }
+
+    /// The URL of this database, riding `schema` when one is given.
+    fn url_riding(&self, schema: Option<&str>) -> String {
+        match schema {
+            Some(schema) => format!("{}?options=--search_path%3D{schema}", self.url),
+            None => self.url.clone(),
+        }
+    }
+}
+
+impl Drop for Throwaway {
+    fn drop(&mut self) {
+        let base = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+        let Ok(mut admin) = postgres::Client::connect(&base, postgres::NoTls) else {
+            return;
+        };
+        let _ = admin.batch_execute(&format!(
+            "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+            self.name
+        ));
+    }
+}
+
+/// The one-server lock keys on the schema the connection lands in, not
+/// on the words of the URL: a plain URL and one that rides
+/// `--search_path=public` land in the same schema of one database, so
+/// the second open is refused, however differently the two URLs spell
+/// where they go. A production behavior change: a URL that names its own
+/// schema fences one schema, not the whole database.
+#[test]
+fn a_plain_url_and_one_that_rides_public_fence_each_other() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let db = Throwaway::new("fence");
+    let dir_a = tempfile::tempdir().unwrap();
+    let _a = Backend::open(dir_a.path(), Some(&db.url), None).expect("the plain URL opens");
+    let dir_b = tempfile::tempdir().unwrap();
+    let Err(error) = Backend::open(dir_b.path(), Some(&db.url_riding(Some("public"))), None) else {
+        panic!("the second open of one schema is refused");
+    };
+    assert!(
+        error.to_string().contains("another server holds"),
+        "{error}"
+    );
+}
+
+/// Two URLs that ride different schemas of one database open side by
+/// side: each fences its own schema, which is what lets the parallel
+/// tests of one database each hold one server.
+#[test]
+fn two_urls_that_ride_different_schemas_open_side_by_side() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let db = Throwaway::new("side_by_side");
+    let mut admin = postgres::Client::connect(&db.url, postgres::NoTls).unwrap();
+    admin
+        .batch_execute("CREATE SCHEMA scion_test_lock_one; CREATE SCHEMA scion_test_lock_two;")
+        .unwrap();
+    let dir_a = tempfile::tempdir().unwrap();
+    let a = Backend::open(
+        dir_a.path(),
+        Some(&db.url_riding(Some("scion_test_lock_one"))),
+        None,
+    )
+    .expect("the first schema opens");
+    let dir_b = tempfile::tempdir().unwrap();
+    let b = Backend::open(
+        dir_b.path(),
+        Some(&db.url_riding(Some("scion_test_lock_two"))),
+        None,
+    )
+    .expect("the second schema opens beside it");
+    // Each store keeps its rows in its own schema: one repo apiece, and
+    // the other schema's table stays empty.
+    a.write(|c| c.create_repo("one").map(|_| ())).unwrap();
+    b.write(|c| c.create_repo("two").map(|_| ())).unwrap();
+    for (schema, name) in [
+        ("scion_test_lock_one", "one"),
+        ("scion_test_lock_two", "two"),
+    ] {
+        let rows = admin
+            .query(
+                &format!("SELECT name FROM {schema}.repos WHERE name = '{name}'"),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{schema} holds {name}");
+    }
+}
+
+/// 16 bytes as 32 lowercase hex digits, as the marker spells them.
+fn hex16_of(bytes: &[u8; 16]) -> String {
+    let mut hex = String::with_capacity(32);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// A data directory that names a store refuses a database schema that
+/// holds no store: the open would adopt the marker's UUID into an empty
+/// schema and serve nothing, and every caller would read "repo not
+/// found" with no error at the start. A `--postgres-url` that names the
+/// wrong schema (a `search_path` typo, or a schema never served) must
+/// refuse at the open.
+#[test]
+fn a_directory_that_names_a_store_refuses_an_empty_schema() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let db = Throwaway::new("empty_schema");
+    let mut admin = postgres::Client::connect(&db.url, postgres::NoTls).unwrap();
+    admin
+        .batch_execute("CREATE SCHEMA a; CREATE SCHEMA b;")
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // Schema `a` serves once: it mints the store, the directory's marker
+    // takes its UUID, and the schema holds the store's data.
+    let served = Backend::open(dir.path(), Some(&db.url_riding(Some("a"))), None)
+        .expect("the first schema opens");
+    served.write(|c| c.create_repo("r").map(|_| ())).unwrap();
+    drop(served);
+    let marker = std::fs::read_to_string(dir.path().join("backend")).unwrap();
+    let uuid = marker.lines().nth(1).unwrap().trim().to_owned();
+    assert_eq!(uuid.len(), 32, "{marker}");
+    // The same directory against schema `b`, which no store ever served:
+    // refuse, and name the store the directory belongs to.
+    let Err(error) = Backend::open(dir.path(), Some(&db.url_riding(Some("b"))), None) else {
+        panic!("the empty schema adopts the marker's store");
+    };
+    assert!(
+        matches!(error, scion_server::Error::FailedPrecondition(_)),
+        "{error:?}"
+    );
+    let text = error.to_string();
+    assert!(text.contains("holds no store"), "{error}");
+    assert!(
+        text.contains(&uuid),
+        "the refusal names the marker's store: {text}"
+    );
+    assert!(
+        text.contains("search_path"),
+        "the refusal says what to check: {text}"
+    );
+}
+
+/// The adopt keeps its legit case: a schema that holds a store's rows
+/// but no `store_uuid` row - a dump taken before the UUID existed - is
+/// adopted by the marker's directory, and the reopened store serves its
+/// rows and writes the UUID back.
+#[test]
+fn a_schema_that_holds_a_store_but_no_uuid_row_still_adopts() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let db = Throwaway::new("adopt");
+    let mut admin = postgres::Client::connect(&db.url, postgres::NoTls).unwrap();
+    admin.batch_execute("CREATE SCHEMA a;").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let served = Backend::open(dir.path(), Some(&db.url_riding(Some("a"))), None)
+        .expect("the first open mints");
+    served.write(|c| c.create_repo("r").map(|_| ())).unwrap();
+    drop(served);
+    let marker = std::fs::read_to_string(dir.path().join("backend")).unwrap();
+    let uuid = marker.lines().nth(1).unwrap().trim().to_owned();
+    // The dump's shape: the rows stay, the `store_uuid` row goes.
+    admin.batch_execute("DELETE FROM a.store_uuid;").unwrap();
+    let reopened = Backend::open(dir.path(), Some(&db.url_riding(Some("a"))), None)
+        .expect("the dump's schema is adopted");
+    assert!(reopened.read(|c| c.repo_id("r")).is_ok(), "the rows serve");
+    drop(reopened);
+    let row: Vec<u8> = postgres::Client::connect(&db.url_riding(Some("a")), postgres::NoTls)
+        .unwrap()
+        .query("SELECT uuid FROM store_uuid WHERE one = 1", &[])
+        .unwrap()[0]
+        .get(0);
+    let mut back = [0u8; 16];
+    back.copy_from_slice(&row);
+    assert_eq!(
+        hex16_of(&back),
+        uuid,
+        "the adopted identity is the marker's"
+    );
+}
+/// A first open cut between its store's UUID row and its marker opens
+/// again: the row commits early in the open, the marker is written at
+/// its end, and a kill in between left a store that could never open
+/// without hand repair. The store was empty - no repos row, so no blob
+/// of another disk can be named - so the directory that returns takes
+/// the database's store as its own, and this open writes the marker the
+/// cut fell before.
+#[test]
+fn a_first_open_cut_before_its_marker_opens_again() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let db = Throwaway::new("marker_window");
+    let mut admin = postgres::Client::connect(&db.url, postgres::NoTls).unwrap();
+    admin.batch_execute("CREATE SCHEMA a;").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // The first open mints the store's row; the cut takes the marker the
+    // open writes at its end.
+    let first = Backend::open(dir.path(), Some(&db.url_riding(Some("a"))), None)
+        .expect("the first open mints");
+    drop(first);
+    std::fs::remove_file(dir.path().join("backend")).unwrap();
+    // The kill's shape: the row stands, the marker is gone, the schema
+    // holds no repo. The next open serves, and writes the marker back.
+    let again = Backend::open(dir.path(), Some(&db.url_riding(Some("a"))), None)
+        .expect("the first open cut before its marker opens again");
+    again
+        .write(|c| c.create_repo("r").map(|_| ()))
+        .expect("the reopened store serves");
+    drop(again);
+    let row: Vec<u8> = postgres::Client::connect(&db.url_riding(Some("a")), postgres::NoTls)
+        .unwrap()
+        .query("SELECT uuid FROM store_uuid WHERE one = 1", &[])
+        .unwrap()[0]
+        .get(0);
+    let mut minted = [0u8; 16];
+    minted.copy_from_slice(&row);
+    let marker = std::fs::read_to_string(dir.path().join("backend")).unwrap();
+    let written = marker.lines().nth(1).unwrap().trim();
+    assert_eq!(
+        written,
+        hex16_of(&minted),
+        "the marker names the store the row minted"
+    );
+}
+
+/// A served store whose marker went missing still refuses a directory
+/// that names no store: the schema holds repos, so a fresh directory
+/// here would serve metadata whose blobs are not on this disk.
+#[test]
+fn a_served_store_without_its_marker_refuses_a_fresh_directory() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let db = Throwaway::new("marker_served");
+    let mut admin = postgres::Client::connect(&db.url, postgres::NoTls).unwrap();
+    admin.batch_execute("CREATE SCHEMA a;").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let served = Backend::open(dir.path(), Some(&db.url_riding(Some("a"))), None)
+        .expect("the first open mints");
+    served.write(|c| c.create_repo("r").map(|_| ())).unwrap();
+    drop(served);
+    std::fs::remove_file(dir.path().join("backend")).unwrap();
+    let Err(error) = Backend::open(dir.path(), Some(&db.url_riding(Some("a"))), None) else {
+        panic!("a fresh directory serves a served store");
+    };
+    assert!(error.to_string().contains("carries no marker"), "{error}");
 }
