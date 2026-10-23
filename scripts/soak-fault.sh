@@ -463,9 +463,9 @@ $(count_fds "$SERVER_PID"),$(latency)" \
     >> "$WORK/metrics.csv"
   # The store's size on disk, next to the RSS it may share a cause with
   # (soak.sh, #365): what a 72-hour run-length decision needs (issue
-  # #239).
-  du -sk "$WORK/server" | awk -v e="$now" '{ print e "," $1 }' \
-    >> "$WORK/metrics-store.csv"
+  # #239). du_sample keeps the size through the server's temp-file
+  # churn (its vanished-file errors) and fails on anything else.
+  du_sample "$WORK/metrics-store.csv" "$WORK/server" "$now" || fail=1
   sleep 10
 done
 

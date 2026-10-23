@@ -60,6 +60,29 @@ need() {
   [ -x /usr/bin/time ] || die "needs /usr/bin/time (Debian, Ubuntu: apt install time)"
 }
 
+# du_sample CSV DATA_DIR NOW: append the store's size as `NOW,size`.
+# du walks the live store: a temp file the server makes and deletes
+# while du reads vanishes, du reports it on stderr and exits 1 (the
+# 10-19 and 10-20 nightly failures, #561). A vanished file is churn,
+# not a failure: the size stands. Any other du complaint, or a du that
+# printed no size at all (a sample that reads nothing), fails the run.
+du_sample() {
+  local csv=$1 dir=$2 now=$3 err="$WORK/.du.err" size
+  size=$(du -sk "$dir" 2> "$err") || {
+    grep -v 'No such file or directory' "$err" > "$err.flt" || true
+    if [ -s "$err.flt" ]; then
+      cat "$err.flt" >&2
+      echo "FAIL: du failed reading $dir" >&2
+      return 1
+    fi
+  }
+  if [ -z "$size" ]; then
+    echo "FAIL: du printed no size for $dir: the sample reads nothing" >&2
+    return 1
+  fi
+  printf '%s,%s\n' "$now" "$(printf '%s' "$size" | cut -f1)" >> "$csv"
+}
+
 # make_work NAME: makes $WORK, and arranges for cleanup on exit.
 make_work() {
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/scion-$1.XXXXXX")
@@ -235,25 +258,55 @@ owned_cleanup() {
 # record with no group (a function loop) falls back to the pid, and a
 # live pid whose program is not the recorded one is skipped, with a
 # line saying so: silence here is how a skipped cleanup hides.
+#
+# Either way, the kill bounds the leader, not the members: a member
+# that missed the TERM (one only starting as the TERM landed) can
+# still be writing into $WORK while the caller's rm removes it —
+# #561's "rm: Directory not empty". So after the kill, wait, bounded,
+# until the leader, its group and its direct children are all gone,
+# KILL whatever is still live on each round, and only then release
+# the pidfile.
 owned_stop_one() {
-  local f=$1 pid pgid job have
+  local f=$1 pid pgid job have n stopped
   pid=$(sed -n 's/^pid=//p' "$f")
   pgid=$(sed -n 's/^pgid=//p' "$f")
   job=$(sed -n 's/^job=//p' "$f")
   [ -n "$pid" ] || { rm -f "$f"; return 0; }
+  stopped=
   if [ -n "$pgid" ] && kill -0 "-$pgid" 2> /dev/null; then
     owned_kill "$pid" "$pgid"
+    stopped=1
   elif kill -0 "$pid" 2> /dev/null; then
     have=$(ps -o comm= -p "$pid" 2> /dev/null)
     case "$have" in
       *bash)
         owned_kill "$pid" ""
+        stopped=1
         ;;
       *)
         echo "owned: skipped $f: pid $pid runs '$have', not what the record names" >&2
         ;;
     esac
   fi
+  # The member wait, only for a record the kill ran on: a skipped
+  # record is not ours, and its pid must not be touched. The kill
+  # bounds the leader, and a member it missed would race the rm that
+  # follows the cleanup. Wait them out, KILL on each live round, then
+  # release the record.
+  [ -n "$stopped" ] || { rm -f "$f"; return 0; }
+  n=0
+  while [ "$n" -lt 10 ]; do
+    if ! kill -0 "$pid" 2> /dev/null \
+      && ! { [ -n "$pgid" ] && kill -0 "-$pgid" 2> /dev/null; } \
+      && ! pgrep -P "$pid" > /dev/null 2>&1; then
+      break
+    fi
+    [ -n "$pgid" ] && kill -KILL "-$pgid" 2> /dev/null
+    kill -KILL "$pid" 2> /dev/null
+    pkill -KILL -P "$pid" 2> /dev/null
+    sleep 0.5
+    n=$((n + 1))
+  done
   rm -f "$f"
   wait "$job" 2> /dev/null || true
 }

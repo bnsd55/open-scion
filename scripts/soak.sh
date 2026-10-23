@@ -197,9 +197,10 @@ while [ "$(date +%s)" -lt "$END" ]; do
 $(sed -n 1p "$WORK/last.sample" | cut -d, -f2),$(latency)" >> "$WORK/metrics.csv"
   # The store's size on disk, next to the RSS it may share a cause with:
   # files a leak of disk would grow, and what Ben's run-length decision
-  # needs (issue #239).
-  du -sk "$WORK/server" | awk -v e="$now" '{ print e "," $1 }' \
-    >> "$WORK/metrics-store.csv"
+  # needs (issue #239). du_sample keeps the size through the server's
+  # temp-file churn (its vanished-file errors) and fails on anything
+  # else, including a sample that reads nothing.
+  du_sample "$WORK/metrics-store.csv" "$WORK/server" "$now" || fail=1
   if [ -z "$warm_rss" ] && [ $((now - T0)) -ge "$SOAK_WARM_SECONDS" ]; then
     warm_rss=$rss
   fi
