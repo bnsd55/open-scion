@@ -153,8 +153,7 @@ fetch_dataset() {
 # sets $COMMITS. Its times are in $WORK/import.log.
 import_dataset() {
   note "importing"
-  /usr/bin/time -p "$BIN/scion-server" --data "$WORK/server" \
-    "${PGFLAGS[@]+"${PGFLAGS[@]}"}" import --rev main "$WORK/src.git" \
+  /usr/bin/time -p "$BIN/scion-server" --data "$WORK/server" import --rev main "$WORK/src.git" \
     > "$WORK/import.out" 2> "$WORK/import.log" || {
     tail -n 20 "$WORK/import.log" >&2
     die "import failed"
@@ -268,17 +267,32 @@ owned_cleanup() {
   # A member that reparented when its loop shell died is invisible to
   # the parentage probes in owned_stop_one, but every client this
   # script raised carries a path under $WORK in its command line (the
-  # socket, the data dir, an output file). Sweep them, bounded, then
-  # KILL what remains: the rm that follows cannot lose to a writer it
-  # cannot name (#561's rm: Directory not empty).
+  # socket, the data dir, an output file). Sweep them, bounded: TERM on
+  # the first round, KILL from the second on, each live pid named on
+  # stderr; after 10 rounds name what survived. The rm that follows
+  # cannot lose to a writer it cannot name (#561's rm: Directory not
+  # empty).
   n=0
   while [ "$n" -lt 10 ]; do
     live=$(pgrep -f "$WORK/" 2> /dev/null || true)
     [ -z "$live" ] && break
-    pkill -KILL -f "$WORK/" 2> /dev/null || true
+    for pid in $live; do
+      ps -o pid=,comm= -p "$pid" >&2
+    done
+    if [ "$n" -eq 0 ]; then
+      pkill -TERM -f "$WORK/" 2> /dev/null || true
+    else
+      pkill -KILL -f "$WORK/" 2> /dev/null || true
+    fi
     sleep 0.5
     n=$((n + 1))
   done
+  if live=$(pgrep -f "$WORK/" 2> /dev/null) && [ -n "$live" ]; then
+    echo "owned: survivors after the sweep:" >&2
+    for pid in $live; do
+      ps -o pid=,comm= -p "$pid" >&2
+    done
+  fi
 }
 
 # owned_stop_one PIDFILE: the one process one pidfile names. The group
@@ -391,7 +405,6 @@ start_scion() {
   fi
   start server serving "$BIN/scion-server" --data "$WORK/server" serve \
     --listen "127.0.0.1:$SERVER_PORT" \
-    "${PGFLAGS[@]+"${PGFLAGS[@]}"}" \
     --ticket-key "$WORK/ticket.key" \
     --metrics-listen "127.0.0.1:$SERVER_METRICS_PORT"
   start cache serving "$BIN/scion-cache" --listen "127.0.0.1:$CACHE_PORT" \
