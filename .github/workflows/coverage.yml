@@ -303,6 +303,10 @@ jobs:
         env:
           SCION_TEST_BACKEND: postgres
           SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+          # The backup and crash tests restart the job's own database, as
+          # ci.yml's postgres job lets them: the container's id is the
+          # handle.
+          SCION_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
       - name: upload the measure's profiles
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
