@@ -343,6 +343,17 @@ impl FlightKey {
 /// The flights map, made on first use.
 /// Joins the walk of `key`, or owns it: the caller that finds no flight
 /// running owns the next walk, and the others wait for it.
+/// Retires the walk's flight on every exit of its owner: a normal
+/// return, an early `?`, and a panic unwind. A flight that leaks would
+/// hold every later joiner of the repo (5b).
+struct RetireOnDrop<'a, 'b>(&'a DeriveFlights, &'b Arc<Flight>);
+
+impl Drop for RetireOnDrop<'_, '_> {
+    fn drop(&mut self) {
+        retire(self.0, self.1);
+    }
+}
+
 fn join<K: Kind>(walks: &DeriveFlights, repo: RepoId) -> (Arc<Flight>, bool) {
     let mut flights = walks.flights.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(flight) = flights.get(&FlightKey::of::<K>(repo)) {
@@ -422,22 +433,15 @@ fn in_one_walk<K: Kind>(
         // repo or kind ([#142]).
         let (flight, owner) = join::<K>(walks, repo);
         if owner {
+            // One guard retires the flight on every exit: a normal return,
+            // an early `?` (the permit wait's deadline below), and a panic
+            // unwind. A flight that leaks would hold every later joiner of
+            // the repo — one without a deadline forever (5b).
+            let _retire = RetireOnDrop(walks, &flight);
             // The walk's permit: walks beyond the cap only repeat work,
             // and starve the writes. Wait for one until the deadline.
             let _permit = take_walk_permit(walks, deadline)?;
-            // A panic inside the walk unwinds past `retire` and leaves the
-            // flight in the map: every later joiner of that repo waits for
-            // a walk counter that never moves, and one without a deadline
-            // waits forever. So the flight retires on unwind, and the
-            // panic still propagates to the caller that owns the walk.
-            let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                fill_until::<K>(store, repo, cs, deadline).map(|(value, _)| value)
-            }));
-            retire(walks, &flight);
-            return match value {
-                Ok(result) => result,
-                Err(payload) => std::panic::resume_unwind(payload),
-            };
+            return fill_until::<K>(store, repo, cs, deadline).map(|(value, _)| value);
         }
         let before = *flight.walks.lock().unwrap_or_else(PoisonError::into_inner);
         if !waited(&flight, before, deadline) {
@@ -2284,6 +2288,42 @@ mod tests {
             let value = get_by::<Cold<1>>(&store, repo, tip, &deadline).unwrap();
             assert_eq!(value, 6);
             assert_eq!(waiter.join().unwrap(), 2);
+        });
+    }
+
+    #[test]
+    fn a_permit_timeout_retires_the_flight() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        COLD_DERIVES.store(0, Ordering::Relaxed);
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::sqlite(Store::open_with_walks(dir.path(), 1).unwrap());
+        // r2's walk holds the store's only walk permit, parked at the
+        // gate. r1's owner then waits for a permit that never comes, and
+        // its short deadline fires inside the permit wait — an early `?`
+        // after the join made it an owner. The flight must retire on
+        // that exit too (5b, the same leak the panic path had): the next
+        // caller of r1 must own a fresh walk and finish. Red before the
+        // guard: the caller joined the leaked flight and hung until its
+        // deadline answered DeadlineExceeded.
+        let (r2, ids2) = another_chain(&store, "r2", &chain(2));
+        let (r1, ids1) = another_chain(&store, "r1", &chain(2));
+        let tip2 = *ids2.last().unwrap();
+        let tip1 = *ids1.last().unwrap();
+        std::thread::scope(|scope| {
+            let _gate = gate_closed();
+            let holder = scope.spawn(|| {
+                let deadline = Deadline::new(Instant::now() + Duration::from_secs(30));
+                get_by::<Cold<1>>(&store, r2, tip2, &deadline).unwrap()
+            });
+            wait_entered(1);
+            let short = Deadline::new(Instant::now() + Duration::from_millis(200));
+            let out = get_by::<Cold<1>>(&store, r1, tip1, &short);
+            assert!(matches!(out, Err(Error::ResourceExhausted(_))), "{out:?}");
+            gate_open();
+            assert_eq!(holder.join().unwrap(), 2);
+            let deadline = Deadline::new(Instant::now() + Duration::from_secs(30));
+            let value = get_by::<Cold<1>>(&store, r1, tip1, &deadline).unwrap();
+            assert_eq!(value, 2);
         });
     }
 
