@@ -155,6 +155,13 @@ pub const MAX_SCAN: usize = 1000;
 /// small bound, so that they reach it.
 pub const MAX_LOG_NODE_BYTES: usize = if cfg!(test) { 512 << 10 } else { 64 << 20 };
 
+/// How many entries a `Log` page reads between two checks of its deadline.
+/// A check reads the clock, which is a system call where the clocksource
+/// has no user-space read (HPET); there a check per entry made a page with
+/// a path about 5% slower. A check every 16 entries still stops a page
+/// within 16 entries of its deadline, or of its call going.
+pub(crate) const DEADLINE_EVERY: usize = 16;
+
 /// One page of first-parent history.
 #[derive(Debug)]
 pub struct LogPage {
@@ -223,7 +230,9 @@ pub fn log_page(
             // walk still holds a cursor. A page whose last entry ended the
             // walk comes back whole, whatever the clock says.
             while next.is_some() {
-                deadline.check()?;
+                if entries.len() % DEADLINE_EVERY == 0 {
+                    deadline.check()?;
+                }
                 let Some(entry) = next_change(c, repo, &mut next, &mut budget)? else {
                     break;
                 };
@@ -243,7 +252,9 @@ pub fn log_page(
         let mut entries = Vec::new();
         let mut next = Some(cs);
         while let Some(from) = next.filter(|_| entries.len() < limit) {
-            deadline.check()?;
+            if entries.len() % DEADLINE_EVERY == 0 {
+                deadline.check()?;
+            }
             if !entries.is_empty() && nodes.bytes() >= MAX_LOG_NODE_BYTES {
                 break;
             }
