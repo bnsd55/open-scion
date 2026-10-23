@@ -94,6 +94,47 @@ fn create_schema(schema: &str) {
         .expect("the test schema is created");
 }
 
+/// Builds the state a real pre-UUID store restores as: the schema holds
+/// the tables of migrations 1-3 and one served repo, at version 3, and
+/// the directory's marker names the store - a dump taken before the
+/// store UUID existed, restored next to its own directory. The next
+/// open upgrades 3 -> last and adopts the marker's store, because the
+/// schema holds the repo a served store always has.
+fn build_pre_uuid_store(schema: &str, data: &Path, rep: usize) {
+    let migrations = [
+        (1, include_str!("../migrations/postgres/0001_init.sql")),
+        (
+            2,
+            include_str!("../migrations/postgres/0002_view_roots.sql"),
+        ),
+        (
+            3,
+            include_str!("../migrations/postgres/0003_view_trees.sql"),
+        ),
+    ];
+    let mut sql = String::from(
+        // The ledger migrate() makes before the first migration runs.
+        "CREATE TABLE schema_migrations (\n             version BIGINT PRIMARY KEY,\n             name    TEXT NOT NULL\n         );\n",
+    );
+    for (version, file) in migrations {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            sql,
+            "{file}\nINSERT INTO schema_migrations (version, name) VALUES ({version}, 'postgres schema');"
+        );
+    }
+    // The repo a served store always has: without it the schema names no
+    // store, and the open refuses the marker instead of adopting it.
+    sql.push_str("INSERT INTO repos (name) VALUES ('old');\n");
+    raw(&pg_url())
+        .batch_execute(&format!("SET search_path TO {schema};\n{sql}"))
+        .expect("the pre-UUID store builds");
+    // The marker the directory held when the dump was taken: it names
+    // the store the dump belongs to, one identity per rep.
+    fs::write(data.join("backend"), format!("postgres\n{rep:032x}\n"))
+        .expect("the marker of the pre-UUID store is written");
+}
+
 /// A real server of this database opens on one database-wide
 /// one-server key, so two tests of this binary that run real servers
 /// at the same time refuse each other. One mutex, held by a test for
@@ -720,6 +761,18 @@ fn a_kill_during_a_schema_upgrade_leaves_one_whole_version() {
     for k in 1..64 {
         drop_schema(&schema);
         create_schema(&schema);
+        // Each rep restores the shape the store-UUID open adopts: a
+        // schema whose tables predate the store UUID, holding the repo a
+        // served store always has, beside the directory whose marker
+        // names that store - a dump taken before the UUID existed,
+        // restored next to its own directory. The cut start upgrades it
+        // 3 -> last, and every point a kill can land on leaves the
+        // marker and the schema agreeing: before the store UUID row
+        // exists the open adopts the marker's store (the schema holds
+        // repos), after it the row names the same store. A schema of
+        // empty tables beside a marker that names a store is a state
+        // production cannot reach, and the open refuses it.
+        build_pre_uuid_store(&schema, &data, k);
         let mut cut = PgServer::spawn_raw(&data, &schema, &log);
         std::thread::sleep(step * u32::try_from(k).unwrap());
         let served = bound_addr(&log).is_some();

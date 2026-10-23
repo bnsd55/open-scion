@@ -985,20 +985,29 @@ async fn a_land_cut_at_its_deadline_gets_exactly_one_answer() {
         // land finished inside the same poll), and the audit says which.
         let _ = ci.land(request).await;
     }
-    // A 1 ns deadline can expire while the client is still sending, so a
-    // try may never reach the server at all. Wait for the lines to
-    // settle, then hold every call that DID arrive to the promise: one
-    // intent, one answer, and at least one answer the drop wrote.
+    // A 1 ns deadline can expire while the client is still sending, so
+    // a try may never reach the server at all, and how many do is a
+    // race on any runner. A call that did reach the server records its
+    // intent before it answers, but the client's own deadline can fire
+    // while that record is still in flight, so every line can appear a
+    // beat after the call returned. Wait for the file to go quiet - a
+    // longer window than one poll, so a busy runner's lag cannot fake
+    // quiet - then hold every call that DID arrive to the promise: one
+    // intent, one answer, and at least one answer the drop wrote. The
+    // vacuity floor is one arrived call: the count of arrivals is a
+    // timing claim, not a promise.
     let count = || {
         let Ok(bytes) = std::fs::read(&audit_path) else {
             return 0;
         };
         String::from_utf8_lossy(&bytes).lines().count()
     };
-    for _ in 0..100 {
+    let mut quiet = 0;
+    for _ in 0..60 {
         let before = count();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if count() == before && before >= 2 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        quiet = if count() == before { quiet + 1 } else { 0 };
+        if quiet >= 3 && before >= 2 {
             break;
         }
     }
@@ -1036,7 +1045,7 @@ async fn a_land_cut_at_its_deadline_gets_exactly_one_answer() {
             cut += 1;
         }
     }
-    assert!(arrived >= 4, "most calls reached the server: {arrived}");
+    assert!(arrived >= 1, "no call reached the server: {arrived}");
     assert!(cut >= 1, "the 1 ns deadline cut a land");
     stop.send(()).unwrap();
 }

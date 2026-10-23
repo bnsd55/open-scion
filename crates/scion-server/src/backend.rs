@@ -233,8 +233,9 @@ fn marker_agrees(data: &Path, uuid: [u8; 16]) -> Result<()> {
         }
         Some(_) => {}
         None => {
-            // A fresh pair, or a marker that predates the UUID: the
-            // database's identity is the one this directory takes, and
+            // A fresh pair, a marker that predates the UUID, or a first
+            // open cut before it wrote the marker: the database's
+            // identity is the one this directory takes, and
             // `write_marker` writes it durable at once.
             write_marker(&marker, uuid)?;
         }
@@ -542,6 +543,40 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.repo_id(name),
             Self::Postgres(pg) => pg.repo_id(name),
+        }
+    }
+
+    fn set_changeset_batching(&mut self, on: bool) {
+        match self {
+            Self::Sqlite(tx) => tx.set_changeset_batching(on),
+            Self::Postgres(pg) => pg.set_changeset_batching(on),
+        }
+    }
+
+    fn preload_derived_chain(
+        &mut self,
+        kind: &str,
+        version: u32,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.preload_derived_chain(kind, version, start, limit),
+            Self::Postgres(pg) => pg.preload_derived_chain(kind, version, start, limit),
+        }
+    }
+
+    fn changeset_batching(&self) -> bool {
+        match self {
+            Self::Sqlite(tx) => tx.changeset_batching(),
+            Self::Postgres(pg) => pg.changeset_batching(),
+        }
+    }
+
+    fn flush_changeset_rows(&mut self, repo: RepoId) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.flush_changeset_rows(repo),
+            Self::Postgres(pg) => pg.flush_changeset_rows(repo),
         }
     }
 
