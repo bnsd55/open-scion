@@ -1,0 +1,5 @@
+# two callers put one path; the ref moves it after the first lands, so the
+# second conflicts rather than silently over it
+land 0 0 0 1
+land 1 0 1 1
+check
