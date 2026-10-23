@@ -1323,9 +1323,9 @@ fn the_shortcut_table_matches_the_markers() {
         let file = cells[1]
             .split('`')
             .find(|token| {
-                Path::new(token).extension().is_some_and(|ext| {
-                    matches!(ext.to_str(), Some("rs") | Some("sh") | Some("yml"))
-                })
+                Path::new(token)
+                    .extension()
+                    .is_some_and(|ext| matches!(ext.to_str(), Some("rs" | "sh" | "yml")))
             })
             .unwrap_or_else(|| panic!("a row names a file: {line}"))
             .to_owned();
@@ -1355,9 +1355,9 @@ fn the_shortcut_table_matches_the_markers() {
                     stack.push(path);
                     continue;
                 }
-                let is_scanned = path.extension().is_some_and(|ext| {
-                    matches!(ext.to_str(), Some("rs") | Some("sh") | Some("yml"))
-                });
+                let is_scanned = path
+                    .extension()
+                    .is_some_and(|ext| matches!(ext.to_str(), Some("rs" | "sh" | "yml")));
                 let is_self = path
                     .strip_prefix(&root)
                     .is_ok_and(|rel| rel.ends_with("scion-server/tests/query.rs"));
