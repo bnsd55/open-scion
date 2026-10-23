@@ -59,10 +59,79 @@ document landed on.
 
 ## 5. Failure paths
 
-| Finding | Evidence | Status |
+### 5a. The panic inventory (O7)
+
+Every `unwrap`, `expect`, `panic!`, `unreachable!` and `todo!` in
+non-test code of `scion-server`, `scn`, `scion-proto` and
+`scion-tier` (test-tail modules, `tests/` and the fuzz targets
+excluded). Verdicts:
+
+- **SAFE** — an invariant the code proves on the line before (named).
+- **REACHABLE** — a client request, a file on disk, the database, or
+  the OS can reach it; each one is fixed in the panic-fix PR with a
+  red/green test.
+
+| Site | What reaches it | Verdict |
 | --- | --- | --- |
-| `unwrap`/`expect` outside test code: 19 unwraps and 45 expects across the five production crates (test-tail modules excluded). Most are `try_into` after a length check that makes them uninhabitable; each needs that argument written down or the call replaced | e.g. `crates/scion-proto/src/ticket.rs:150,194,195,229`, `crates/scn/src/vfs.rs` (13), `crates/scion-server/src/pg.rs:325,599,621` | open |
-| Poisoned locks: every mutex recovers with `unwrap_or_else(PoisonError::into_inner)`. A panic while a thread holds the write connection hands the store to the next holder without any check that the panicked transaction left nothing behind | `crates/scion-server/src/derived.rs:257` and ~40 sites | open |
+| `scion-proto/src/ticket.rs:150,194,195,229` (`try_into().unwrap()`) | a ticket from the wire | SAFE — each `try_into` follows a `take(n)` that returns exactly `n` bytes or errors, so the conversion is uninhabitable |
+| `scion-proto/src/ticket.rs:365` (`unreachable!`) | the parse loop's exit | SAFE — the loop returns at every entry (the comment names it) |
+| `scion-proto/src/ticket.rs:388` (`trees.get(&id).unwrap()`) | a tree id just written to the same table | SAFE — the id is inserted two lines above |
+| `scion-proto/src/runtime/listen.rs:69,73,168` (`NonZero::new().unwrap()`) | process start | SAFE — the constants are literal non-zero values |
+| `scion-proto/src/runtime/listen.rs:559,633` (semaphore `.expect("never closed")`) | accept-loop teardown | SAFE — the semaphore is never closed while the listener lives; closing happens only in Drop |
+| `scion-proto/src/runtime/reply.rs:176` (stall-slot lock `.expect("not poisoned")`) | a panicked stall holder | SAFE — it fails loud (a panic, not a silent continue): the poisoned slot cannot be repaired, and the process dies naming it |
+| `scion-server/src/access.rs:295,308` (`unreachable!`) | the prefix-match loop | SAFE — the loop breaks on the first match, so the `_` arm is dead (the comment names the invariant) |
+| `scion-server/src/archive.rs:651` (`to.parent().expect`) | a crafted archive manifest | SAFE — `to` is built from a `BlobId` (`archive/blobs/xx/yy`), never a bare name; the parent is always present |
+| `scion-server/src/blame.rs:819` (`PathElem::new().expect`) | a repo path from the database | SAFE — `RepoPath::new` validated every part on the way in (no empty part, no `.`/`..`, no nul), and re-splitting a valid path yields exactly those parts |
+| `scion-server/src/blame.rs:881` (`line_u32`) | a blamed file with 2^32 lines | SAFE — `MAX_OBJECT_BYTES` is 100 MiB (`store.rs:84`), so a stored file has far fewer than 2^32 one-byte lines |
+| `scion-server/src/blame.rs:967` (16 of 32 hash bytes) | the hasher's output | SAFE — `blake3` always yields 32 bytes |
+| `scion-server/src/blame.rs:1033,1111,1112` (cursor/table `u32::try_from`) | a cursor field or window table | SAFE — the fields are built from one path (≤ `MAX_PATH_BYTES`) and one window over a store far below 2^32 changesets |
+| `scion-server/src/graph.rs:576` (`.expect("a queued changeset has a mark")`) | the walk's own queue | SAFE — the mark is inserted when the changeset is queued, two lines above |
+| `scion-server/src/main.rs:794,858,975,1064,1392,1402` (clap-conflict `unreachable!`/`expect`) | the command line | SAFE — clap refuses the conflicting flags before these arms run |
+| `scion-server/src/main.rs:1274` (`.expect("exactly one source is given")`) | the access-file flags | SAFE — clap's `conflicts_with` allows exactly one source |
+| `scion-server/src/pg.rs:325` (`.expect("a taken reader has a client")`) | the reader pool's taken flag | SAFE — `take` sets the client before returning the guard, and the guard's Drop clears it |
+| `scion-server/src/pg.rs:599` (`.expect("a raw job carries its closure")`) | the job queue | SAFE — the sender sets `raw` exactly for `Kind::Raw` jobs, checked one line above |
+| `scion-server/src/pg.rs:621` (`.expect("spawn the postgres worker")`) | the OS: thread-spawn `EAGAIN` under a thread limit | REACHABLE — fixed in the panic-fix PR (the open answers the error instead of crashing) |
+| `scion-server/src/pg.rs:645,658,666` (`unreachable!`) | a reply of the wrong shape | SAFE — each worker branch answers exactly the reply kind its job kind asked for |
+| `scion-server/src/pg.rs:905` (`writer.lock().unwrap()`) | a poisoned writer lock | SAFE — see 5b: a panic mid-probe leaves nothing behind |
+| `scion-server/src/service.rs:1295` (`walk.next.unwrap()`) | the log walk's state | SAFE — the `walk.next.is_none()` case returns 13 lines above |
+| `scion-server/src/service.rs:1841` (`.expect("asserted to fit in u32")`) | a reply size | SAFE — the `assert!` above bounds it |
+| `scion-server/src/tickets.rs:44` (`.expect("system randomness")`) | the OS entropy source | SAFE — `getrandom::fill` cannot fail on the supported platforms (Linux, macOS; `support.md`'s platform matrix); the doc comment states it |
+| `scion-server/src/tickets.rs:103` (`.expect("a key is 32 bytes")`) | the 32-byte secret minted above | SAFE — `getrandom::fill(&mut [0u8; 32])` fills exactly 32 |
+| `scion-server/src/views.rs:262` (`Tree::new(kept).expect`) | kept entries of a stored tree | SAFE — a subset of an already-valid tree re-validates (every name passed `PathElem` on the way in) |
+| `scion-server/src/pg.rs`, `test_support/*`, the fuzz targets | — | outside the audit (test-only builds; `test-hooks` is off in release) |
+| `scn/src/cmd/bench.rs:114,125`, `cmd/blame.rs:64`, `cmd/commit.rs:130,138` (`IdentityTime::new`/`Changeset::new` `.expect`) | argv and git config | SAFE — the fields come from `-m` argv (bounded by `ARG_MAX`) and git's config parser, both far below the format's `u32::MAX` field limit |
+| `scn/src/cmd/mount.rs:589,590` (signal `.expect`) | the OS signal masks | SAFE — `signal()` on an already-listened signal fails only on a broken runtime; the platforms guarantee it |
+| `scn/src/main.rs:208,216`, `scion-tier/src/bin/*:120,128,157,165,197` (clap-conflict `unreachable!`/`expect`) | the command line | SAFE — clap refuses the conflicting flags first |
+| `scn/src/vfs.rs:351,607,658,779,1167,1229,1278` (path/kind `expect`/`unreachable`) | the mount's own node table | SAFE — the guards above each call check the same field; a file node always carries its overlay path (the `Node` invariant the mount maintains) |
+| `scn/src/vfs.rs:713` (double `.unwrap()`) | an NFS setattr on a forged file id | SAFE — `get(&id)` returns None before it (answered `NFS3ERR_STALE`), and the kind check above returns for dirs, so the remaining node is a file with a path |
+| `scn/src/vfs.rs:720` (`file_mode().try_into().unwrap()`) | the mode constant | SAFE — 0o644 fits both Linux `u32` and macOS `u16`; the `useless_conversion` allow names it |
+| `scn/src/vfs.rs:811` (`.get(&id).unwrap()`) | a lookup one line after the same get | SAFE — the match above already answered the `None` case |
+| `scn/src/vfs.rs:1320,1384,1392` (`take(4).try_into().expect`) | a truncated index file | SAFE — `take(n)` returns exactly `n` bytes or an error; four bytes always fit `u32` |
+| `scn/src/vfs.rs:1510` (`.expect("cannot read /dev/urandom")`) | the OS entropy source | SAFE — `/dev/urandom` always opens on the supported platforms; the mount fails at startup, before it serves |
+| `scion-core`, `scion-proto` ticket decode, and every `take`-then-`try_into` in the codecs | the wire | SAFE — the same `take` contract |
+
+### 5b. The lock-poison inventory (O7)
+
+Every `Mutex`/`RwLock` that guards store or derived state. Policy:
+`unwrap_or_else(PoisonError::into_inner)` — a poisoned lock is used,
+not propagated. The question per lock: what a holder that panics
+leaves behind, and whether the next holder checks it.
+
+| Lock | Guards | A panicking holder leaves | Verdict |
+| --- | --- | --- | --- |
+| `store.rs:131` `db: Mutex<Connection>` (the SQLite write connection) | every commit and unflushed read | an open transaction — `SqliteTx`'s Drop rolls it back on unwind, so the connection is usable and the store keeps every committed byte | SAFE — the invariant is stated at `store.rs:649-651` and holds at every panic point inside `commit` (the txn guard drops before any code sees the poison) |
+| `store.rs:172` `writers: Mutex<usize>` + `write_woken` | the writer count for the handoff | a stale count | SAFE — the count is repaired by `WriteWaiter`'s Drop, which runs on unwind |
+| `store.rs:2021` the flush-state lock | the flush bookkeeping | a stale marker | SAFE — the holder holds it only across counter reads and `fetch_max`es; no panic point inside leaves an inconsistent value (counters are monotonic) |
+| `store.rs:2062,2114` `SPAWNS: RwLock` | the spawn-serialization guard | — | SAFE — it fails loud (`.expect("not poisoned")`), which is fail-closed |
+| `derived.rs:178` `flights: Mutex<HashMap<FlightKey, Arc<Flight>>>` | which repo/kind walks are live | a live flight whose walk never retires: every later joiner waits for a walk counter that never moves — a caller with no deadline waits forever | UNSAFE — fixed in the panic-fix PR: `retire` runs on unwind, the panic still propagates, and the next caller owns a fresh walk |
+| `derived.rs:180` `in_flight: Mutex<usize>` | the walk-permit count | a stale permit count | SAFE — `Permit`'s Drop runs on unwind and decrements |
+| `derived.rs` `flight.walks` per-flight counter + `woken` | the walk-end signal for waiters | a counter that never advances | covered by the `flights` fix above: with `retire` on unwind the waiters wake and take over a fresh walk |
+| `service.rs`/`listen.rs` semaphores and slot maps | connection/stream accounting | a leaked slot | SAFE — every holder holds it across `.await`-free counter ops; the panic points sit outside the critical sections, and the slot Drop runs on unwind |
+
+The fix PR carries: the flight-leak fix with a panicking test kind (red:
+the next caller hangs to its deadline; green: it owns a fresh walk),
+and the worker-spawn fix with the error path.
+
 | `todo!`/`unimplemented!` in production code: none | grep across the five crates | fixed (none exist) |
 | Warn-and-continue: the import records and counts per-commit failures against the ledger; the two `eprintln!` skip lines are inside test-only helpers | `crates/scion-server/src/pg.rs:4437`, `gc.rs:1017` (both test helpers) | fixed by design (no production warn-and-continue on a correctness boundary) |
 
@@ -117,8 +186,8 @@ section; its fixes landed as #561. Highlights, with the C50 verdicts:
 3. The unary reply caps: `whole_share` aggregates and slow-client
    pinning (§3), `scn commit` whole-file reads (§3), `lossy` JSON (§3).
 4. The database-loop sweep: SQL in loops, `ORDER BY`, isolation (§4).
-5. The `unwrap`/`expect` inventory with per-site arguments (§5), and the
-   poisoned-lock write-integrity audit (§5).
+5. The panic fixes the inventory (§5a) leaves: the worker-spawn
+   `EAGAIN` path, and the flight-leak fix's PR (§5b).
 6. The data-dir default create-vs-refuse question (§6).
 7. The additive contract goldens that enforce the format policies (§7).
 8. Digest pins for the service-container tags (§9).
