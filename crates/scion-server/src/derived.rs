@@ -340,9 +340,6 @@ impl FlightKey {
     }
 }
 
-/// The flights map, made on first use.
-/// Joins the walk of `key`, or owns it: the caller that finds no flight
-/// running owns the next walk, and the others wait for it.
 /// Retires the walk's flight on every exit of its owner: a normal
 /// return, an early `?`, and a panic unwind. A flight that leaks would
 /// hold every later joiner of the repo (5b).
@@ -354,6 +351,8 @@ impl Drop for RetireOnDrop<'_, '_> {
     }
 }
 
+/// Joins the walk of `key`, or owns it: the caller that finds no flight
+/// running owns the next walk, and the others wait for it.
 fn join<K: Kind>(walks: &DeriveFlights, repo: RepoId) -> (Arc<Flight>, bool) {
     let mut flights = walks.flights.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(flight) = flights.get(&FlightKey::of::<K>(repo)) {
