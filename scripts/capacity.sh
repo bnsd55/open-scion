@@ -26,9 +26,11 @@
 #
 # Set CAPACITY_MACHINE to the runner's public name and spec; the table's
 # caption carries it. Set RUN_URL to the workflow run's URL for the
-# footer. The store-size column is the SQLite store's growth; the
-# Postgres cells carry "-" there, because the database's disk is the
-# service container's, not a file tree this script can measure.
+# footer. The growth splits into two columns: the blob store's (the
+# data directory du samples) and, on Postgres, the database's own
+# (pg_database_size of the database the cell reset); SQLite has no
+# separate database, so its database column is "-". Both divide by the
+# lands the server's counter measured, not the lands the plan named.
 #
 # SHORTCUT: the readers and the sampling are the soak's shape, copied
 # here rather than lifted, because soak.sh and soak-fault.sh are two
@@ -37,6 +39,19 @@
 set -euo pipefail
 # shellcheck source=common.sh source-path=SCRIPTDIR
 . "$(dirname "$0")/common.sh"
+
+# The harness drops and recreates the database it runs on between
+# cells, so it runs only on a database of its own naming: an operator
+# URL that names a real database is refused here, before any psql and
+# so before any DROP.
+if [ -n "${SCION_PG_URL:-}" ]; then
+  pg_db="${SCION_PG_URL##*/}"
+  pg_db="${pg_db%%\?*}"
+  case $pg_db in
+    scion_capacity_*) ;;
+    *) die "SCION_PG_URL names database '${pg_db:-none}': the harness drops and creates the databases it runs on, so it runs only on a scion_capacity_* database" ;;
+  esac
+fi
 
 WRITERS=${WRITERS:-2 50 200}
 READERS=${READERS:-0 5 20}
@@ -97,8 +112,9 @@ fi
 echo "cell_start,reps,landed" > /dev/null
 
 # The summary's numbers live in one CSV row per repetition:
-# backend,writers,readers,rep,lands_per_min,land_p99_ms,checkout_p50_ms,
-# checkout_p99_ms,reader_failures,rss_end_kib,store_growth_kib_per_1k
+# backend,writers,readers,land_p99_ms,checkout_p50_ms,checkout_p99_ms,
+# reader_timeouts,errors,rss_end_kib,landed,blob_growth_kib_per_1k_lands,
+# db_growth_kib_per_1k_lands
 
 for backend in sqlite postgres; do
   if [ "$backend" = postgres ] && [ -z "${SCION_PG_URL:-}" ]; then
@@ -144,7 +160,16 @@ for backend in sqlite postgres; do
         tail -n 20 "$WORK/import-$backend.log" >&2
         die "the $backend import failed"
       }
-      STORE_START=$(du -sk "$WORK/server" | cut -f1)
+      du_sample "$WORK/store-sizes-$backend-w$w-r$r.csv" "$WORK/server" start
+      STORE_START=$(sed -n 's/^[^,]*,//p' "$WORK/store-sizes-$backend-w$w-r$r.csv" | tail -n 1)
+      if [ "$backend" = postgres ]; then
+        # The database's own disk at the cell's start, from the server
+        # of the reset: the database column measures this, so a
+        # Postgres row cannot look complete while the rows it grew sit
+        # unmeasured in the service container.
+        db_start_kib=$(psql "$admin_url" -X -A -t \
+          -c "SELECT pg_database_size('$pg_db')" | awk '{ print int(($1 + 1023) / 1024) }')
+      fi
       start_scion
       server_pid() {
         SERVER_PID=$(lsof -t -iTCP:"$SERVER_PORT" -sTCP:LISTEN 2> /dev/null | head -n 1)
@@ -246,7 +271,8 @@ for backend in sqlite postgres; do
       lands_end=$(curl -fsS "http://127.0.0.1:$SERVER_METRICS_PORT/metrics" 2> /dev/null |
         awk '/^scion_requests_total\{.*rpc="Scion\/Land"/ { s += $NF } END { print s + 0 }')
       stop_scion
-      note "cell $backend w$w r$r: $((lands_end - lands_before)) lands landed"
+      lands_landed=$((lands_end - lands_before))
+      note "cell $backend w$w r$r: $lands_landed lands landed (the plan named $((LANDS * REPS)))"
       reader_failures=0
       reader_log="$WORK/reads-$backend-w$w-r$r.log"
       [ -f "$reader_log" ] || { touch "$reader_log"; }
@@ -268,9 +294,20 @@ for backend in sqlite postgres; do
       c99=$(pct "$WORK/read-times.csv" 0.99)
       [ -n "$c50" ] || c50="-"
       [ -n "$c99" ] || c99="-"
-      store_end=$(du -sk "$WORK/server" | cut -f1)
-      growth=$(( (store_end - STORE_START) * 1000 / (LANDS * REPS) ))
-      echo "$backend,$w,$r,$land_p99,$c50,$c99,$reader_timeouts,$errors,$rss_end,$growth" \
+      du_sample "$WORK/store-sizes-$backend-w$w-r$r.csv" "$WORK/server" end
+      store_end=$(sed -n 's/^[^,]*,//p' "$WORK/store-sizes-$backend-w$w-r$r.csv" | tail -n 1)
+      # Per 1,000 lands, divided by the lands the counter measured: a
+      # cell that lost lands reports its own bytes over its own lands,
+      # never the plan's.
+      blob_growth=$(kib_per_1k "$STORE_START" "$store_end" "$lands_landed")
+      if [ "$backend" = postgres ]; then
+        db_end_kib=$(psql "$admin_url" -X -A -t \
+          -c "SELECT pg_database_size('$pg_db')" | awk '{ print int(($1 + 1023) / 1024) }')
+        db_growth=$(kib_per_1k "$db_start_kib" "$db_end_kib" "$lands_landed")
+      else
+        db_growth="-"
+      fi
+      echo "$backend,$w,$r,$land_p99,$c50,$c99,$reader_timeouts,$errors,$rss_end,$lands_landed,$blob_growth,$db_growth" \
         >> "$WORK/capacity.csv"
       if [ "$((errors + reader_timeouts))" -gt 0 ]; then
         note "cell $backend w$w r$r: $reader_timeouts timeouts, $errors errors (readers $reader_failures, bench $bench_fail) - recorded, next cell"
@@ -311,10 +348,10 @@ cp "$WORK"/bench-*.json "${RUNNER_TEMP:-/tmp}/capacity-artifacts/" 2> /dev/null 
 row() { printf '%-46s %s\n' "$1" "$2"; }
 echo "capacity envelope: machine $CAPACITY_MACHINE, commit $HEAD_HEX"
 echo
-echo "| backend | writers | readers | land p99 ms | checkout p50 ms | checkout p99 ms | timeouts | errors | server RSS MiB | store KiB per 1k lands |"
-echo "|---|---|---|---|---|---|---|---|---|---|"
-while IFS=, read -r backend w r land_p99 c50 c99 timeouts errors rss growth; do
-  echo "| $backend | $w | $r | $land_p99 | $c50 | $c99 | $timeouts | $errors | $((rss / 1024)) | $growth |"
+echo "| backend | writers | readers | land p99 ms | checkout p50 ms | checkout p99 ms | timeouts | errors | server RSS MiB | landed | blob store KiB per 1k lands | database KiB per 1k lands |"
+echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
+while IFS=, read -r backend w r land_p99 c50 c99 timeouts errors rss landed blob_growth db_growth; do
+  echo "| $backend | $w | $r | $land_p99 | $c50 | $c99 | $timeouts | $errors | $((rss / 1024)) | $landed | $blob_growth | $db_growth |"
 done < "$WORK/capacity.csv"
 echo
 row "commit" "$HEAD_HEX"

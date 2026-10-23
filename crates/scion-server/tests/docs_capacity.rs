@@ -131,7 +131,8 @@ fn every_cell_of_the_grid_has_a_row_in_order() {
 fn numeric_columns_parse_and_dashes_say_what_failed() {
     let doc = std::fs::read_to_string(Path::new(DOC)).expect("docs/operations.md exists");
     // Column indexes in the row: 3 land p99, 4 checkout p50, 5 checkout
-    // p99, 6 timeouts, 7 errors.
+    // p99, 6 timeouts, 7 errors, 9 landed, 10 blob growth, 11 database
+    // growth.
     for row in table_rows(capacity_section(&doc)) {
         check_row(&row);
     }
@@ -176,9 +177,19 @@ fn check_row(row: &[String]) {
     }
     // The counters and the resources are always numbers: the run
     // knows them whatever the bench did.
-    for cell in &row[6..] {
+    for cell in &row[6..10] {
         cell.parse::<f64>()
             .unwrap_or_else(|_| panic!("a number does not parse: {cell:?} in {row:?}"));
+    }
+    // The growth columns parse as numbers, or say why they do not:
+    // a "-" in the database column is SQLite (it has no separate
+    // database), and a "-" in a growth column is a cell whose counter
+    // grew by no lands at all.
+    for (cell, what) in row[10..].iter().zip(["blob growth", "database growth"]) {
+        if cell != "-" {
+            cell.parse::<f64>()
+                .unwrap_or_else(|_| panic!("{what} does not parse: {cell:?} in {row:?}"));
+        }
     }
 }
 
@@ -187,12 +198,36 @@ fn check_row(row: &[String]) {
 /// and the half-filled row that must never publish.
 #[test]
 fn a_no_reader_row_names_the_land_and_dashes_the_reads() {
-    let shapes: [(&[&str], bool); 4] = [
+    let shapes: [(&[&str], bool); 6] = [
         // (cells after the cell name, does the rule accept it?)
-        (&["63.1", "70", "115", "0", "0", "30376", "110660"], true), // a live cell
-        (&["63.1", "-", "-", "0", "0", "30376", "110660"], true),    // r=0: no readers ran
-        (&["-", "-", "-", "0", "2", "30376", "110660"], true),       // the bench died
-        (&["63.1", "-", "115", "0", "0", "30376", "110660"], false), // half-filled: never
+        (
+            &["63.1", "70", "115", "0", "0", "30376", "2000", "1106", "-"],
+            true,
+        ), // a live sqlite cell
+        (
+            &["63.1", "-", "-", "0", "0", "30376", "2000", "1106", "-"],
+            true,
+        ), // r=0: no readers ran
+        (
+            &["-", "-", "-", "0", "2", "30376", "1800", "990", "-"],
+            true,
+        ), // the bench died; the lands it got through still divide
+        (
+            &["63.1", "-", "115", "0", "0", "30376", "2000", "1106", "-"],
+            false,
+        ), // half-filled: never
+        (
+            &[
+                "63.1", "70", "115", "0", "0", "30376", "2000", "1106", "1402",
+            ],
+            true,
+        ), // a live postgres cell: both growth columns
+        (
+            &[
+                "63.1", "70", "115", "0", "0", "30376", "2000", "nonsense", "-",
+            ],
+            false,
+        ), // a growth column that is neither number nor "-": never
     ];
     for (cells, accepts) in shapes {
         let mut row: Vec<String> = vec!["sqlite".into(), "2".into(), "0".into()];
