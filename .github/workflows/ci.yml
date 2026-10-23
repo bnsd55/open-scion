@@ -218,6 +218,28 @@ jobs:
         with:
           tool: cargo-deny@0.20.2
       - run: cargo deny check
+      # Each fuzz sub-workspace holds its own Cargo.lock, which the
+      # root check never reads: an advisory can ride it unseen (it did:
+      # RUSTSEC-2026-0382 sat in all four fuzz lockfiles while the root
+      # was clean). The same config runs in each, so the floors the
+      # root holds hold here too.
+      - name: cargo deny check, in every fuzz sub-workspace
+        run: |
+          for lock in crates/*/fuzz/Cargo.lock; do
+            dir="$(dirname "$lock")"
+            # Fail closed: cargo-deny only warns when its config is
+            # missing and runs with defaults, which could pass with the
+            # wrong rules. A moved or renamed config fails the job here.
+            if [ ! -f "$dir/deny.toml" ]; then
+              echo "::error::$dir has no deny.toml; refusing to run cargo deny with defaults"
+              exit 1
+            fi
+            echo "== cargo deny check in $dir"
+            (cd "$dir" && cargo deny --config deny.toml check)
+          done
+      # A new sub-workspace whose lockfile sits outside the loop above
+      # would carry advisories unseen again; this names it.
+      - run: scripts/check-deny-coverage.sh
 
   test:
     name: test

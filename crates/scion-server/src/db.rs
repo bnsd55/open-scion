@@ -190,6 +190,34 @@ impl MetaTx for SqliteTx<'_> {
     /// # Errors
     ///
     /// [`Error::NotFound`] if a parent is not in `repo`.
+    /// Turns the importer's changeset batching on or off. SQLite writes
+    /// every row as its statement anyway (one write connection, so a
+    /// batch buys no round trips), so this holds nothing.
+    fn set_changeset_batching(&mut self, _on: bool) {}
+
+    fn preload_derived_chain(
+        &mut self,
+        _kind: &str,
+        _version: u32,
+        _start: ChangesetId,
+        _limit: i64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn changeset_batching(&self) -> bool {
+        false
+    }
+
+    /// Writes what the batching held back: nothing, on SQLite.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    fn flush_changeset_rows(&mut self, _repo: RepoId) -> Result<()> {
+        Ok(())
+    }
+
     fn insert_changeset(&mut self, repo: RepoId, cs: &Changeset) -> Result<ChangesetId> {
         let (body, id) = cs.encode_with_id();
         let mut parent_gen = 0;
@@ -606,7 +634,9 @@ impl MetaTx for SqliteTx<'_> {
         // One statement for the whole chain: the recursive term follows the
         // indexed first-parent rows (cs, n = 0), and the join keeps the
         // rows that carry a stored value. Every fetched changeset is an
-        // ancestor of `start`, so no repo filter is needed.
+        // ancestor of `start`, so no repo filter is needed. The reply is
+        // in walk order: newest first, from the asked node, the way
+        // first_parent_page orders.
         let mut stmt = self
             .0
             .prepare_cached(
@@ -620,7 +650,8 @@ impl MetaTx for SqliteTx<'_> {
              )
              SELECT d.cs, d.value FROM walk
              JOIN derived d ON d.cs = walk.id
-             WHERE d.kind = ?3 AND d.version = ?4",
+             WHERE d.kind = ?3 AND d.version = ?4
+             ORDER BY walk.depth",
             )
             .map_err(crate::error::from_sqlite)?;
         let rows = stmt

@@ -1,0 +1,35 @@
+# The supply-chain check for this fuzz sub-workspace. It holds its own
+# Cargo.lock, which the root check never reads, so the same advisories
+# floor runs here; the licenses list adds what the fuzz harness alone
+# pulls in, and the bans are looser where a fuzz workspace differs from
+# the product by design (its path dependency carries no version).
+
+[advisories]
+version = 2
+yanked = "warn"
+unmaintained = "workspace"
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "NCSA",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
