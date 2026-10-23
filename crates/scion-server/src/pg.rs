@@ -481,7 +481,12 @@ struct PgClient {
 
 impl PgClient {
     /// Puts `client` on its own worker thread.
-    fn spawn(cfg: ClientConfig) -> PgClient {
+    ///
+    /// # Errors
+    ///
+    /// The OS refused the worker thread (a thread limit, `EAGAIN`): the
+    /// open answers it instead of crashing.
+    fn spawn(cfg: ClientConfig) -> Result<PgClient> {
         let (jobs, rx) = std::sync::mpsc::channel::<Job>();
         std::thread::Builder::new()
             .name("postgres-client".into())
@@ -618,8 +623,12 @@ impl PgClient {
                     }
                 }
             })
-            .expect("spawn the postgres worker");
-        Self { jobs }
+            .map_err(|error| {
+                Error::Unavailable(format!(
+                    "the OS refused the postgres worker thread: {error}"
+                ))
+            })?;
+        Ok(Self { jobs })
     }
 
     /// Runs one statement and waits for its reply.
@@ -1901,7 +1910,7 @@ fn spawn_client(
         std::thread::scope(|scope| scope.spawn(|| connect_on(url, ca, options)).join().unwrap())?;
     // The lock is taken on the worker thread, like every statement: the
     // caller may be a tokio one, which must never block on this client.
-    Ok(PgClient::spawn(ClientConfig {
+    PgClient::spawn(ClientConfig {
         client,
         conn: Conn {
             url: url.to_owned(),
@@ -1911,7 +1920,7 @@ fn spawn_client(
             exclusive,
         },
         fence,
-    }))
+    })
 }
 
 /// The libpq `options` a connection starts with: the ones the URL carries

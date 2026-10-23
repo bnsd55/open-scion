@@ -425,9 +425,19 @@ fn in_one_walk<K: Kind>(
             // The walk's permit: walks beyond the cap only repeat work,
             // and starve the writes. Wait for one until the deadline.
             let _permit = take_walk_permit(walks, deadline)?;
-            let value = fill_until::<K>(store, repo, cs, deadline).map(|(value, _)| value);
+            // A panic inside the walk unwinds past `retire` and leaves the
+            // flight in the map: every later joiner of that repo waits for
+            // a walk counter that never moves, and one without a deadline
+            // waits forever. So the flight retires on unwind, and the
+            // panic still propagates to the caller that owns the walk.
+            let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fill_until::<K>(store, repo, cs, deadline).map(|(value, _)| value)
+            }));
             retire(walks, &flight);
-            return value;
+            return match value {
+                Ok(result) => result,
+                Err(payload) => std::panic::resume_unwind(payload),
+            };
         }
         let before = *flight.walks.lock().unwrap_or_else(PoisonError::into_inner);
         if !waited(&flight, before, deadline) {
@@ -970,7 +980,7 @@ mod tests {
     use rusqlite::Connection;
     use std::cell::Cell;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
     use std::time::{Duration, Instant};
 
@@ -1073,6 +1083,12 @@ mod tests {
     /// connection while they sleep, so a write that arrives then has to
     /// wait for the walkers' transactions to end.
     static COLD_SLEEP: AtomicUsize = AtomicUsize::new(0);
+
+    /// When set, the next derive of the flight kind panics after the
+    /// gate. The flight-leak test arms it: the walk dies mid-derive, and
+    /// the next caller must own a fresh walk, not hang on a leaked
+    /// flight.
+    static COLD_BOMB: AtomicBool = AtomicBool::new(false);
 
     /// How many derives of the flight kind have entered the gate. A test
     /// that closes the gate waits for a count, so it knows its walking
@@ -1191,6 +1207,10 @@ mod tests {
                 COLD_SLEEP.load(Ordering::Relaxed) as u64
             ));
             COLD_DERIVES.fetch_add(1, Ordering::Relaxed);
+            if COLD_BOMB.load(Ordering::Relaxed) {
+                COLD_BOMB.store(false, Ordering::Relaxed);
+                panic!("the flight-leak test's derive blew up");
+            }
             Ok(parents.first().copied().unwrap_or(0) + 1)
         }
 
@@ -2265,6 +2285,35 @@ mod tests {
             assert_eq!(value, 6);
             assert_eq!(waiter.join().unwrap(), 2);
         });
+    }
+
+    #[test]
+    fn a_panicking_derive_leaves_no_leaked_flight() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        COLD_DERIVES.store(0, Ordering::Relaxed);
+        let (_dir, store, repo, ids) = store_with(&chain(4));
+        let tip = *ids.last().unwrap();
+        // The first derive panics mid-walk. The panic must retire the
+        // walk's flight (5b): a leaked flight would hold every later
+        // caller of the repo — one without a deadline forever. So the
+        // panic reaches this caller, and the next caller owns a fresh
+        // walk and finishes the chain. Red before the fix: the next
+        // caller hung until its deadline answered DeadlineExceeded.
+        COLD_BOMB.store(true, Ordering::Relaxed);
+        let deadline = Deadline::new(Instant::now() + Duration::from_secs(30));
+        let first = std::thread::scope(|scope| {
+            let owner = scope.spawn(|| get_by::<Cold<1>>(&store, repo, tip, &deadline));
+            let outcome = owner.join();
+            assert!(
+                outcome.is_err(),
+                "the panicking derive must reach this caller as a panic"
+            );
+            outcome
+        });
+        let _ = first;
+        let deadline = Deadline::new(Instant::now() + Duration::from_secs(30));
+        let value = get_by::<Cold<1>>(&store, repo, tip, &deadline).unwrap();
+        assert_eq!(value, 4);
     }
 
     #[test]
