@@ -7,9 +7,10 @@
 //! ("A server, tier or client MUST ignore fields that it does not
 //! know", docs/protocol-v1.md).
 //!
-//! The golden names the doc version it pins; the pairing test holds
-//! that against the doc's own version line, so a re-pin fails CI until
-//! the same PR changes docs/protocol-v1.md's version.
+//! The golden's header names the doc version it pins;
+//! scripts/check-golden-pairing.sh (the CI lint) holds a change of
+//! this file against docs/protocol-v1.md's version line on the pull
+//! request's own diff.
 //!
 //! Updating on purpose: the bytes ARE the grammar, so an update is a
 //! new protocol version beside v1 with a changes/ fragment naming the
@@ -21,7 +22,6 @@ use prost::Message as _;
 use scion_proto::v1::{GetChangesetRequest, LogEntry, LogRequest, LogResponse};
 
 const GOLDEN: &str = include_str!("protocol_wire_v1.golden");
-const DOC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/protocol-v1.md");
 
 const REPO: &str = "golden";
 const ID: [u8; 32] = [7; 32];
@@ -175,38 +175,4 @@ fn a_message_with_unknown_fields_decodes_unchanged() {
             other => unreachable!("no such golden block: {other}"),
         }
     }
-}
-
-/// The pairing check: the golden names the doc version it pins, and
-/// the doc's own version line must say the same. A re-pin of the
-/// golden without the doc's version line fails here; the doc's version
-/// moving without the golden fails too.
-#[test]
-fn the_golden_and_the_doc_agree_on_the_version() {
-    let pinned = GOLDEN
-        .lines()
-        .find_map(|l| l.strip_prefix("# The doc version this golden pins:"))
-        .expect("the golden names the doc version it pins");
-    let pinned: u32 = pinned
-        .trim()
-        .trim_end_matches('.')
-        .split_whitespace()
-        .last()
-        .unwrap()
-        .parse()
-        .expect("the golden's doc version is a number");
-    let doc = std::fs::read_to_string(DOC).expect("docs/protocol-v1.md is checked in");
-    let doc_version = doc
-        .lines()
-        .find_map(|l| {
-            let at = l.find("describes version ")?;
-            let rest = &l[at + "describes version ".len()..];
-            rest.chars().next()?.to_digit(10)
-        })
-        .expect("docs/protocol-v1.md states its version");
-    assert_eq!(
-        pinned, doc_version,
-        "the wire golden and docs/protocol-v1.md disagree on the version: \
-         a re-pin needs the same PR to move the doc's version line"
-    );
 }

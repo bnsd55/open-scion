@@ -576,35 +576,3 @@ fn a_tree_of_every_kind_round_trips() {
     assert_eq!(plain.encode(), lied.encode());
     assert_eq!(Tree::decode(&lied.encode()).unwrap(), plain);
 }
-
-/// The pairing check: these pins freeze `docs/format-v1.md`'s version,
-/// and the doc's own title line must say the same. A re-pin of this
-/// file without the doc's version line fails here; the doc's version
-/// moving without these pins fails too. The store's additive rule is
-/// the one this file already enforces: an unknown tag is refused, not
-/// ignored (`rejects_bad_tags_flags_and_algos`), as the decoder rules
-/// state.
-const PINNED_DOC_VERSION: u32 = 1;
-
-#[test]
-fn the_pins_and_the_format_doc_agree_on_the_version() {
-    let doc = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/format-v1.md"
-    ))
-    .expect("docs/format-v1.md is checked in");
-    let title = doc
-        .lines()
-        .find(|l| l.starts_with("# Scion object format v"))
-        .expect("docs/format-v1.md's title names its version");
-    let version: u32 = title
-        .trim_start_matches("# Scion object format v")
-        .trim()
-        .parse()
-        .expect("the title's version is a number");
-    assert_eq!(
-        PINNED_DOC_VERSION, version,
-        "the byte pins and docs/format-v1.md disagree on the version: a \
-         re-pin needs the same PR to move the doc's version line"
-    );
-}
