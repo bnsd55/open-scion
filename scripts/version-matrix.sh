@@ -247,6 +247,7 @@ import() {
   local dir=$1 srv=$2
   # D25: the server refuses a missing data directory; create it here.
   mkdir -p "$dir/server"
+  chmod 700 "$dir/server"
   make_repo "$dir"
   "$srv/scion-server" --data "$dir/server" import "$dir/src" \
     >"$dir/import.out" 2>"$dir/import.log" || {

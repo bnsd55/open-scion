@@ -154,6 +154,7 @@ for backend in sqlite postgres; do
       fi
       rm -rf "$WORK/server"
       mkdir -p "$WORK/server"
+      chmod 700 "$WORK/server"
       note "importing for $backend"
       /usr/bin/time -p "$BIN/scion-server" --data "$WORK/server" import \
         --rev main "$WORK/src.git" \
