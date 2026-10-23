@@ -11,6 +11,8 @@ syntax = "proto3";
 
 package scion.v1;
 
+// throwaway: an additive-shaped touch to prove the describe rule
+
 service Scion {
   // Write path.
 
