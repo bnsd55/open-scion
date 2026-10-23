@@ -180,13 +180,16 @@ type Node = BTreeMap<PathElem, Entry>;
 /// The history tree of a changeset, as the ID of its root node.
 pub struct PathHistory;
 
+use crate::derived::DeriveReport;
+
 /// Derives the path history of `cs`, and removes the rows of older
-/// versions. Returns the kind's name for the `derive` command's report.
+/// versions. Returns the kind's name and the counts the `derive`
+/// command's report carries.
 ///
 /// # Errors
 ///
-/// Errors of the `derived` fill, and of the final flush.
-pub fn backfill_path_history(store: &Backend, repo: &str, cs: ChangesetId) -> Result<&'static str> {
+/// Errors of the derived fill, and of the final flush.
+pub fn backfill_path_history(store: &Backend, repo: &str, cs: ChangesetId) -> Result<DeriveReport> {
     crate::derived::backfill::<PathHistory>(store, repo, cs)
 }
 
@@ -1407,7 +1410,7 @@ mod tests {
         // A changeset that no ref points to gets its path history when it is
         // written, because its parent has one.
         let draft = changeset(Some(main[1]), &[("a", Some(blob))]);
-        let draft = write::create_changeset(&store, "r", &draft.encode()).unwrap();
+        let draft = write::create_changeset(&store, "r", &draft.encode(), &later()).unwrap();
         assert!(
             store
                 .read(|c| derived::load::<PathHistory>(c, draft))
@@ -1431,7 +1434,7 @@ mod tests {
             store.blobs().put(i.as_bytes()).unwrap();
         }
         let draft = changeset(Some(old[2]), &[("y", Some(blob))]);
-        let draft = write::create_changeset(&store, "r", &draft.encode()).unwrap();
+        let draft = write::create_changeset(&store, "r", &draft.encode(), &later()).unwrap();
         let stored = |cs| store.read(|c| derived::load::<PathHistory>(c, cs)).unwrap();
         assert!(stored(draft).is_none(), "its parent has none");
         let commits = store.commits();

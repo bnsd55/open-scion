@@ -42,7 +42,14 @@ async fn a_first_boot_serves_probes_and_reads_back() {
     // serves. The token went in a file (the runbook's umask 077 and
     // printf), not in argv.
     assert!(!data.exists(), "the first boot creates the directory");
-    let server = Server::start(&data, &log);
+    let server = Server::start_on("First boot", &data, &log);
+    // The one-server section's command is the same command: the guide's
+    // own serve line, in both sections' words, is this spawn's argv.
+    assert_eq!(
+        Server::guide_argv("One server", &data),
+        Server::guide_argv("First boot", &data),
+        "the one-server command and the first boot's serve line agree"
+    );
     let mode = std::fs::metadata(common::token_file())
         .unwrap()
         .permissions()
@@ -66,7 +73,16 @@ async fn a_first_boot_serves_probes_and_reads_back() {
     git(&git_repo, &["add", "FIRST"]);
     git(&git_repo, &["commit", "-q", "-m", "first\n"]);
     let out = common::spawn_guard::across_spawn(|| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
+        // The server marked this directory's metadata Postgres; the
+        // import needs the same URL the server got (common's rule), or
+        // the open refuses it.
+        let mut import = std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"));
+        if scion_server::Backend::test_is_postgres() {
+            import
+                .arg("--postgres-url")
+                .arg(common::postgres_url(&data));
+        }
+        import
             // `--repo` names the harness's repo (the runbook's
             // default is `main`).
             .args([

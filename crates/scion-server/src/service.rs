@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use prost::Message as _;
@@ -145,14 +146,43 @@ fn spawn_free_space_poll(
     });
 }
 
+/// Set when the server's first stale-land sweep has finished. A test
+/// hook: the land round-trip guard waits for it before it resets the
+/// statement counter, so the sweep's own statements cannot fall inside
+/// the counted window - the only database-speaking background task the
+/// server runs is this sweep, and after its first pass the next one is
+/// [`SWEEP_PERIOD`] away.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) static TEST_FIRST_SWEEP_DONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The test seam of the land job's claim: after the job's `LAND_STARTED`
+/// swap wins, it records the land's request key here. A test that aborts
+/// a land's call waits for its key, so the abort never lands in the
+/// permit-to-swap window, where the handler's drop wins the answer and
+/// the job records nothing.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) static TEST_LAND_CLAIMED: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// Runs the stale-land sweep at once, then once per [`SWEEP_PERIOD`], until
 /// `stop` resolves. The first sweep settles what a restart left pending
 /// before the first client asks.
-async fn sweeps(worker: Worker, lands: Arc<Lands>, stale_secs: i64, mut stop: watch::Receiver<()>) {
+async fn sweeps(
+    worker: Worker,
+    lands: Arc<Lands>,
+    stale_secs: i64,
+    audit: crate::audit::Audit,
+    mut stop: watch::Receiver<()>,
+) {
     loop {
         let (lands, store) = (Arc::clone(&lands), worker.store());
+        let audit = audit.clone();
         let rejected =
-            tokio::task::spawn_blocking(move || lands.sweep_stale(&store, stale_secs)).await;
+            tokio::task::spawn_blocking(move || lands.sweep_stale(&store, stale_secs, &audit))
+                .await;
+        #[cfg(any(test, feature = "test-hooks"))]
+        TEST_FIRST_SWEEP_DONE.store(true, std::sync::atomic::Ordering::Release);
         match rejected {
             Ok(Ok(0)) => {}
             Ok(Ok(n)) => tracing::info!(rejected = n, "rejected stale pending lands"),
@@ -296,6 +326,7 @@ pub async fn serve(
         worker.clone(),
         Arc::clone(&lands),
         land_stale_secs,
+        audit.clone(),
         stop_rx,
     ));
     // Outside the access rules, so a refused call counts too. The layer
@@ -378,6 +409,66 @@ pub struct ScionService {
     audit: crate::audit::Audit,
 }
 
+/// One state per land call's answer: the intent is recorded, and
+/// exactly one of the handler's drop and the store job owns the result
+/// line. The job moves it to [`LAND_STARTED`] as its first statement;
+/// the handler's drop moves it to [`LAND_ABANDONED`] and answers only
+/// if its swap won. [`LAND_VOID`] retires the debt when the intent
+/// itself was never made durable: no intent, no answer owed.
+const LAND_INTENT: u8 = 0;
+const LAND_STARTED: u8 = 1;
+const LAND_ABANDONED: u8 = 2;
+const LAND_VOID: u8 = 3;
+
+/// The result line a land call owes its intent. Held by the handler
+/// from before the intent is recorded to the call's end, returned or
+/// dropped: its drop answers with `cancelled` only when the job never
+/// claimed the call, and it hands the line to the audit's writer off
+/// this thread, because a `Drop` must not fsync.
+struct LandAnswer {
+    state: Arc<AtomicU8>,
+    audit: crate::audit::Audit,
+    request_id: String,
+    principal: String,
+    repo: String,
+    target_ref: String,
+}
+
+impl Drop for LandAnswer {
+    fn drop(&mut self) {
+        if self.state.swap(LAND_ABANDONED, Ordering::AcqRel) != LAND_INTENT {
+            // The job claimed the call: its own lines answer the intent.
+            return;
+        }
+        let line = ScionService::land_failed_line(
+            &self.request_id,
+            &self.principal,
+            &self.repo,
+            &self.target_ref,
+            "cancelled",
+        );
+        let audit = self.audit.clone();
+        let write = move || {
+            if let Err(why) = audit.record_blocking(&line) {
+                tracing::error!(
+                    reason = %why,
+                    "a cancelled land's audit line was not made durable"
+                );
+            }
+        };
+        // Off this thread: a Drop runs on a runtime worker, and a
+        // blocking append there would stall it.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(write);
+            }
+            Err(_) => {
+                std::thread::spawn(write);
+            }
+        }
+    }
+}
+
 impl ScionService {
     /// Sends `data` in parts of up to `CHUNK_BYTES`, as `ReadFile` sends a
     /// file. Holds the whole bytes, so the share is their size.
@@ -456,6 +547,68 @@ impl ScionService {
         })
     }
 
+    /// The audit's answer the land job owes its intent: the outcome's
+    /// own lines when the land ran, else the one failed line. The why
+    /// is the code label of the one Status the job built, the one the
+    /// reply carries too, so one error logs once. The checks before
+    /// the land refuse a call after the guard already said STARTED, so
+    /// the job owes the intent its answer there too.
+    fn audit_land_outcome(
+        audit: &crate::audit::Audit,
+        request_id: &str,
+        principal: &str,
+        repo: &str,
+        target_ref: &str,
+        outcome: &Result<land::LandOutcome, Status>,
+    ) {
+        match outcome {
+            Ok(outcome) => {
+                for line in
+                    Self::land_result_lines(request_id, principal, repo, target_ref, outcome)
+                {
+                    Self::audit_result_blocking(audit, &line);
+                }
+            }
+            Err(status) => {
+                Self::audit_result_blocking(
+                    audit,
+                    &Self::land_failed_line(
+                        request_id,
+                        principal,
+                        repo,
+                        target_ref,
+                        code_label(status.code()),
+                    ),
+                );
+            }
+        }
+    }
+
+    /// The failed line a land owes its intent when the call ends in an
+    /// error: the why is the code label the caller read.
+    fn land_failed_line(
+        request_id: &str,
+        principal: &str,
+        repo: &str,
+        target_ref: &str,
+        why: &str,
+    ) -> crate::audit::Event {
+        crate::audit::Event::new(
+            "land",
+            "failed",
+            json_fields(
+                request_id,
+                principal,
+                &serde_json::json!({
+                    "rpc": "Land",
+                    "repo": repo,
+                    "ref": target_ref,
+                    "why": why,
+                }),
+            ),
+        )
+    }
+
     /// The audit's result lines a state change leaves, written by the
     /// store job that made the change, after it and outside any write
     /// transaction: a call cut between the intent and the result (a
@@ -469,11 +622,11 @@ impl ScionService {
         }
     }
 
-    /// The audit lines of a land that ran: the land's result line, and
-    /// — when this call moved the ref — the move's own line. A replay
-    /// of a landed request reports the first move's outcome and moved
-    /// nothing itself: the move's line exists from the call that made
-    /// it.
+    /// The audit's result lines a land that ran leaves: the land's
+    /// result line, and — when this call moved the ref — the move's
+    /// own line. A replay of a landed request reports the first move's
+    /// outcome and moved nothing itself: the move's line exists from
+    /// the call that made it.
     fn land_result_lines(
         request_id: &str,
         principal: &str,
@@ -639,7 +792,11 @@ pub(crate) fn check_whole_reader(
 }
 
 /// The shared fields of an audit line: who, which call, on which RPC.
-fn json_fields(request_id: &str, principal: &str, fields: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn json_fields(
+    request_id: &str,
+    principal: &str,
+    fields: &serde_json::Value,
+) -> serde_json::Value {
     let mut all = serde_json::json!({
         "request_id": request_id,
         "principal": principal,
@@ -1345,6 +1502,13 @@ impl Scion for ScionService {
         &self,
         request: Request<CreateChangesetRequest>,
     ) -> Result<Response<CreateChangesetResponse>, Status> {
+        // The job checks it in its blob loop: a request timeout, or a
+        // client that cancels, drops this call but not a job that is
+        // running. The guard ends the deadline when this call ends or is
+        // dropped. The blob check re-hashes every distinct blob, so a big
+        // changeset would otherwise outlive the call that asked for it.
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
+        let _call = deadline.guard();
         let caller = caller(&request)?;
         let request_id = request_id_of(&request);
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
@@ -1362,6 +1526,7 @@ impl Scion for ScionService {
         let repo_for_write = repo.clone();
         let job_repo = repo.clone();
         let audit = self.audit.clone();
+        let job_deadline = deadline.clone();
         let outcome = self
             .worker
             .run(move |store| {
@@ -1371,8 +1536,10 @@ impl Scion for ScionService {
                     // every blob back.
                     let (cs, _) = write::decode(&changeset)?;
                     access.check_write(&caller, &repo_for_write, cs.changes().keys())?;
-                    Ok(write::create_changeset(&store, &repo_for_write, &changeset)
-                        .map_err(Status::from))
+                    Ok(
+                        write::create_changeset(&store, &repo_for_write, &changeset, &job_deadline)
+                            .map_err(Status::from),
+                    )
                 })();
                 // The job that changed the state writes the state change's
                 // own line, after the commit and outside the write
@@ -1445,7 +1612,28 @@ impl Scion for ScionService {
         check_whole_reader(&self.access, &caller, &req.repo)?;
         check_name("target_ref", &req.target_ref)?;
         check_name("request_key", &req.request_key)?;
+        // The changeset is parsed before anything is recorded: a bad ID
+        // is refused with `invalid_argument`, and the audit owes no
+        // intent for a call that named nothing to land.
+        let changeset = parse_id(&req.changeset_id, "changeset_id")?;
         let principal = caller.0.clone();
+        // The answer the intent will owe: armed before the intent is
+        // recorded, so a call cut while the intent's append is in
+        // flight is still answered by the drop - a gap here would leave
+        // an intent that nothing ever answers. The guard is voided when
+        // the intent itself fails: no intent, no answer owed. The job
+        // claims the answer as its first statement; if this call dies
+        // first, the guard's drop answers `cancelled`. One of the two
+        // answers, never both, never neither.
+        let answer = Arc::new(AtomicU8::new(LAND_INTENT));
+        let _answering = LandAnswer {
+            state: Arc::clone(&answer),
+            audit: self.audit.clone(),
+            request_id: request_id.clone(),
+            principal: principal.clone(),
+            repo: req.repo.clone(),
+            target_ref: req.target_ref.clone(),
+        };
         self.audit_intent(
             &request_id,
             principal.as_str(),
@@ -1457,9 +1645,12 @@ impl Scion for ScionService {
                 "request_key": req.request_key,
             }),
         )
-        .await?;
+        .await
+        // The intent was not made durable, so no result line is owed:
+        // the drop must answer nothing.
+        .inspect_err(|_| answer.store(LAND_VOID, Ordering::Release))?;
         let req = land::LandRequest {
-            changeset: parse_id(&req.changeset_id, "changeset_id")?,
+            changeset,
             repo: req.repo,
             target_ref: req.target_ref,
             request_key: req.request_key,
@@ -1480,19 +1671,36 @@ impl Scion for ScionService {
         let ran = self
             .worker
             .run(move |store| {
+                // The job's first statement claims the call's answer. If
+                // the handler's drop won the race, the call is gone and
+                // its drop has answered `cancelled`: run nothing, answer
+                // nothing more.
+                if answer.swap(LAND_STARTED, Ordering::AcqRel) == LAND_ABANDONED {
+                    return Err(crate::error::Error::Cancelled(
+                        "the call went before the land started".to_owned(),
+                    ));
+                }
+                // The claim is a fact a test may wait for: the permit the
+                // worker held said only that the job runs, not that it
+                // claimed the call's answer.
+                #[cfg(any(test, feature = "test-hooks"))]
+                TEST_LAND_CLAIMED
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(req.request_key.clone());
                 // A rebase keeps the changes, so these are the paths that the
                 // land changes, on any ref of the repo. Checked on every call,
-                // before the land records anything, also on a retry.
-                // A rebase keeps the changes, so these are the paths that the
-                // land changes, on any ref of the repo. Checked on every call,
-                // before the land records anything, also on a retry. The
-                // outer Result is the checks and the worker's own failures;
-                // the inner one is the land's own verdict, whose code the
-                // reply names.
-                let outcome = (|| {
-                    let cs = read::get_changeset(&store, &req.repo, req.changeset)?;
-                    access.check_write(&caller, &req.repo, cs.changes().keys())?;
-                    Ok(lands.land(&store, &caller, &req).map_err(Status::from))
+                // before the land records anything, also on a retry. Every
+                // refusal becomes its one Status here: the audit's label
+                // and the reply read the same value, so one error logs
+                // once.
+                let outcome: Result<land::LandOutcome, Status> = (|| {
+                    let cs = read::get_changeset(&store, &req.repo, req.changeset)
+                        .map_err(Status::from)?;
+                    access
+                        .check_write(&caller, &req.repo, cs.changes().keys())
+                        .map_err(Status::from)?;
+                    lands.land(&store, &caller, &req).map_err(Status::from)
                 })();
                 // The job that changed the state writes the state change's
                 // own lines, after the commit and outside the write
@@ -1500,40 +1708,15 @@ impl Scion for ScionService {
                 // that asked for the land living on. The worker's own
                 // failures (a panic, a shutdown) built no land outcome,
                 // and the worker logged them.
-                match &outcome {
-                    Ok(Ok(outcome)) => {
-                        for line in Self::land_result_lines(
-                            &job_request_id,
-                            &job_principal,
-                            &job_repo,
-                            &job_ref,
-                            outcome,
-                        ) {
-                            Self::audit_result_blocking(&audit, &line);
-                        }
-                    }
-                    Ok(Err(status)) => {
-                        Self::audit_result_blocking(
-                            &audit,
-                            &crate::audit::Event::new(
-                                "land",
-                                "failed",
-                                json_fields(
-                                    &job_request_id,
-                                    &job_principal,
-                                    &serde_json::json!({
-                                        "rpc": "Land",
-                                        "repo": job_repo,
-                                        "ref": job_ref,
-                                        "why": code_label(status.code()),
-                                    }),
-                                ),
-                            ),
-                        );
-                    }
-                    Err(_) => {}
-                }
-                outcome
+                Self::audit_land_outcome(
+                    &audit,
+                    &job_request_id,
+                    &job_principal,
+                    &job_repo,
+                    &job_ref,
+                    &outcome,
+                );
+                Ok(outcome)
             })
             .await;
         match ran {
@@ -2459,10 +2642,10 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_land_whose_call_is_dropped_stops_and_stays_pending() {
-        // main goes root ─ B. The land's base is root, below the floor of a
-        // new path index at B, so its plan walks back.
+    /// The store of the dropped-call tests: repo `r`, `main` at B, and a
+    /// changeset on root, below the floor of a new path index at B, so
+    /// the land's plan walks back.
+    fn dropped_call_fixture() -> (tempfile::TempDir, Backend, ChangesetId, ChangesetId) {
         let dir = tempfile::tempdir().unwrap();
         let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let blob = store.blobs().put(b"x").unwrap();
@@ -2493,6 +2676,50 @@ mod tests {
                 Ok((b, c.insert_changeset(repo, &put(vec![root], "c"))?))
             })
             .unwrap();
+        (dir, store, b, cs)
+    }
+
+    /// Waits until a land job claimed a call whose request key is `key`:
+    /// the claim, not the worker permit, is what an abort must follow.
+    async fn wait_land_claimed(key: &str, started: Instant) {
+        loop {
+            let claimed = TEST_LAND_CLAIMED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|k| k == key);
+            if claimed {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the job claimed the call"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Waits until the audit file holds a line with `outcome` and
+    /// `marker`: the audit's writer answers a record only once the line
+    /// is durable, so the file is the test's signal.
+    async fn wait_audit_line(path: &std::path::Path, outcome: &str, marker: &str, what: &str) {
+        let started = Instant::now();
+        loop {
+            let text = std::fs::read_to_string(path).unwrap();
+            let line = text.lines().any(|line| {
+                line.contains(&format!("\"outcome\":\"{outcome}\"")) && line.contains(marker)
+            });
+            if line {
+                return;
+            }
+            assert!(started.elapsed() < Duration::from_secs(10), "{what}");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_land_whose_call_is_dropped_stops_and_stays_pending() {
+        let (_dir, store, b, cs) = dropped_call_fixture();
         let service = Arc::new(test_service(store.clone()));
         let idle = || service.worker.permits.available_permits() == MAX_BLOCKING;
 
@@ -2510,11 +2737,17 @@ mod tests {
             }
         });
         held_rx.recv().unwrap();
+        // Only this test's land uses this key, so clearing here leaves
+        // nothing for the wait below to read but this call's claim.
+        TEST_LAND_CLAIMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         let request = as_default(scion_proto::v1::LandRequest {
             repo: "r".into(),
             changeset_id: cs.as_bytes().to_vec(),
             target_ref: "main".into(),
-            request_key: "k".into(),
+            request_key: "claim-wait".into(),
         });
         let call = tokio::spawn({
             let service = Arc::clone(&service);
@@ -2526,6 +2759,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
+        // Abort only once the job claimed the call's answer: taking a
+        // permit says only that the job runs, not that it claimed. An
+        // abort in the window between the two wins the handler's drop,
+        // the job answers nothing, and the land records no row at all.
+        wait_land_claimed("claim-wait", started).await;
+
         // The client goes away while the job runs. The job stops at its next
         // check and leaves the land pending.
         call.abort();
@@ -2536,7 +2775,7 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(10), "the job ends");
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        let sql = "SELECT state FROM lands WHERE request_key = 'k'";
+        let sql = "SELECT state FROM lands WHERE request_key = 'claim-wait'";
         let state: String = store
             .read(|c| {
                 c.sqlite()
@@ -2551,6 +2790,293 @@ mod tests {
             c.get_ref(repo, "main")
         });
         assert_eq!(main.unwrap().unwrap().target, b, "main did not move");
+    }
+
+    /// Parks one job on every worker permit, so the caller holds the
+    /// whole worker: a land call started while the worker is full sits
+    /// after its durable intent, before its claim. Returns the gates to
+    /// drop to free the permits, and the parked tasks to join.
+    async fn park_the_worker(
+        service: &Arc<ScionService>,
+    ) -> (
+        Vec<std::sync::mpsc::Sender<()>>,
+        Vec<tokio::task::JoinHandle<()>>,
+    ) {
+        let mut gates = Vec::new();
+        let mut parked = Vec::new();
+        for _ in 0..MAX_BLOCKING {
+            let (free_tx, free_rx) = std::sync::mpsc::channel::<()>();
+            gates.push(free_tx);
+            parked.push(tokio::spawn({
+                let service = Arc::clone(service);
+                async move {
+                    let _ = service
+                        .worker
+                        .run(move |_store| {
+                            let _ = free_rx.recv();
+                            Ok(())
+                        })
+                        .await;
+                }
+            }));
+        }
+        let started = Instant::now();
+        while service.worker.permits.available_permits() > 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the worker is full"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        (gates, parked)
+    }
+
+    /// A call aborted while its job could not claim it: the intent is
+    /// durable, the job never claimed, the drop answers it `cancelled`,
+    /// and no land row is recorded. This is the window the test above
+    /// once aborted in by accident, when it aborted on the permit.
+    #[tokio::test]
+    async fn a_call_aborted_before_its_job_claims_it_answers_cancelled_and_records_nothing() {
+        let (dir, store, b, cs) = dropped_call_fixture();
+        let audit_path = dir.path().join("audit.log");
+        let service = Arc::new(ScionService::new(
+            Worker::new(store.clone()),
+            Arc::new(Access::single("t")),
+            Arc::default(),
+            Quotas::off(),
+            Arc::default(),
+            crate::audit::Audit::open(&audit_path).unwrap(),
+        ));
+        let idle = || service.worker.permits.available_permits() == MAX_BLOCKING;
+
+        // Park a job on every permit, so the land's job waits for one:
+        // the call sits after its durable intent, before its claim.
+        let (gates, parked) = park_the_worker(&service).await;
+
+        let request = as_default(scion_proto::v1::LandRequest {
+            repo: "r".into(),
+            changeset_id: cs.as_bytes().to_vec(),
+            target_ref: "main".into(),
+            request_key: "k".into(),
+        });
+        let call = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.land(request).await }
+        });
+        // The intent is durable when the handler writes it, and no permit
+        // was free, so the job cannot have claimed: this is the window
+        // between the two, held open on purpose.
+        wait_audit_line(
+            &audit_path,
+            "intent",
+            "\"request_key\":\"k\"",
+            "the intent lands",
+        )
+        .await;
+
+        // The abort wins the answer: the drop records one cancelled line,
+        // and the job, once it runs, sees the abandonment and records
+        // nothing.
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        wait_audit_line(
+            &audit_path,
+            "failed",
+            "\"why\":\"cancelled\"",
+            "the drop answers the intent",
+        )
+        .await;
+        // Free the permits: the queued job claims, sees the abandonment,
+        // records nothing.
+        drop(gates);
+        for handle in parked {
+            handle.await.unwrap();
+        }
+        let started = Instant::now();
+        while !idle() {
+            assert!(started.elapsed() < Duration::from_secs(10), "the job ends");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        let sql = "SELECT state FROM lands WHERE request_key = 'k'";
+        let row = store
+            .read(|c| {
+                c.sqlite()
+                    .unwrap()
+                    .query_row(sql, [], |row| row.get::<_, String>(0))
+                    .map_err(crate::error::from_sqlite)
+            })
+            .unwrap_err();
+        assert!(
+            format!("{row:?}").contains("QueryReturnedNoRows"),
+            "no land was recorded: {row:?}"
+        );
+        let text = std::fs::read_to_string(&audit_path).unwrap();
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.contains("\"outcome\":\"intent\""))
+                .count(),
+            1,
+            "one intent: {text}"
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.contains("\"outcome\":\"failed\""))
+                .count(),
+            1,
+            "the drop's cancelled answer: {text}"
+        );
+        let main = store.read(|c| {
+            let repo = c.repo_id("r")?;
+            c.get_ref(repo, "main")
+        });
+        assert_eq!(main.unwrap().unwrap().target, b, "main did not move");
+    }
+
+    /// A call cut while its `CreateChangeset` hashed blobs: the job stops
+    /// at its next blob, the dead call's answer is the abort, the audit
+    /// gets its one failed line, and nothing is written.
+    #[tokio::test]
+    async fn a_create_cut_mid_check_stops_at_its_next_blob_and_records_nothing() {
+        let (dir, store, repo_id, id, bytes, one) = create_cut_fixture();
+
+        let audit_path = dir.path().join("audit.log");
+        let service = Arc::new(ScionService::new(
+            Worker::new(store.clone()),
+            Arc::new(Access::single("t")),
+            Arc::default(),
+            Quotas::off(),
+            Arc::default(),
+            crate::audit::Audit::open(&audit_path).unwrap(),
+        ));
+
+        // The check parks after the first blob's keep; the call is cut
+        // while it waits, and the park then lets the job reach the next
+        // blob, whose check stops it.
+        let hooks = dir.path().join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        write::PARK_CHECK.arm(&hooks);
+        std::fs::write(hooks.join(format!("park-{one}")), b"").unwrap();
+        let call = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                service
+                    .create_changeset(as_default(scion_proto::v1::CreateChangesetRequest {
+                        repo: "r".into(),
+                        changeset: bytes,
+                    }))
+                    .await
+            }
+        });
+        let parked = hooks.join(format!("parked-{one}"));
+        let started = Instant::now();
+        while !parked.exists() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the check never parked"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        call.abort();
+        // The cut ends the deadline when the aborted task's future drops
+        // the call's guard, not when `abort` returns; joining the task
+        // puts the drop before the park's lift, so the job's next check
+        // reads the cut, never the instant before it.
+        assert!(call.await.unwrap_err().is_cancelled());
+        std::fs::remove_file(hooks.join(format!("park-{one}"))).unwrap();
+        write::PARK_CHECK.lift();
+
+        wait_audit_line(
+            &audit_path,
+            "failed",
+            "\"why\":\"cancelled\"",
+            "the job answers the cut call's intent",
+        )
+        .await;
+        let text = std::fs::read_to_string(&audit_path).unwrap();
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.contains("\"outcome\":\"intent\""))
+                .count(),
+            1,
+            "one intent: {text}"
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.contains("\"outcome\":\"failed\""))
+                .count(),
+            1,
+            "one failed line: {text}"
+        );
+        let there = store.read(|c| c.has_changeset(repo_id, id));
+        assert!(!there.unwrap(), "nothing was written");
+    }
+
+    /// A store whose repo `r` holds two stored blobs, a root on `main`,
+    /// and the encoded `CreateChangeset` request that puts both blobs on
+    /// top of the root: the blob check's raw material, with the id of the
+    /// changeset it would write and its first put's blob.
+    fn create_cut_fixture() -> (
+        tempfile::TempDir,
+        Backend,
+        crate::meta::RepoId,
+        ChangesetId,
+        Vec<u8>,
+        scion_core::BlobId,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let one = store.blobs().put(b"one\n").unwrap();
+        let two = store.blobs().put(b"two\n").unwrap();
+        let state = |blob| {
+            Some(FileState::Regular {
+                content: blob,
+                executable: false,
+            })
+        };
+        // The parent the changeset hangs off, through the seam, as the
+        // dropped-call fixture does.
+        let root = Changeset::new(
+            vec![],
+            IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 0, 0)
+                .expect("changeset fits the format"),
+            None,
+            b"root".to_vec(),
+            [
+                (RepoPath::new("seed").unwrap(), state(one)),
+                (RepoPath::new("seed2").unwrap(), state(two)),
+            ]
+            .into(),
+        )
+        .expect("changeset fits the format");
+        let (root, repo_id) = store
+            .write(|c| {
+                let repo = c.create_repo("r")?;
+                // The puts' blobs must be the repo's, as an upload makes
+                // them: otherwise the member check refuses before the
+                // blob check ever runs.
+                c.add_repo_blobs(repo, &[one, two])?;
+                let root = c.insert_changeset(repo, &root)?;
+                assert!(c.cas_ref(repo, "main", None, root)?);
+                Ok((root, repo))
+            })
+            .unwrap();
+        let cs = Changeset::new(
+            vec![root],
+            IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 0, 0)
+                .expect("changeset fits the format"),
+            None,
+            b"two puts".to_vec(),
+            [
+                (RepoPath::new("a").unwrap(), state(one)),
+                (RepoPath::new("b").unwrap(), state(two)),
+            ]
+            .into(),
+        )
+        .expect("changeset fits the format");
+        let bytes = cs.encode();
+        let (_, id) = write::decode(&bytes).unwrap();
+        (dir, store, repo_id, id, bytes, one)
     }
 
     /// A service whose land counters the test reads: the service and its
@@ -2635,7 +3161,8 @@ mod tests {
         let (_dir, store, cs) = landed_store();
         if Backend::test_is_postgres() {
             // The page cap is a data-directory hook; the Postgres disk
-            // full is the SQLSTATE 53100 arm, counted by the same code.
+            // full is the SQLSTATE 53100 arm of the pg mapping, a unit
+            // test of pg.rs, and it feeds the same counter code.
             return;
         }
         let store = store

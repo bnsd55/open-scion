@@ -8,9 +8,15 @@ hand lines to a bounded channel, the writer drains the queue, writes
 and fsyncs once per drain, and wakes each caller when its own lines
 are durable. A state change records two lines: an `intent` line
 fsynced before the change, and a `result` line after it, joined by
-request ID; a read records one. If the audit append fails, the change
-is refused and readiness reports not-ready. Refused authentication is
-aggregated per peer per interval into one counted line, capped.
+request ID; a read records one. Every intent gets its result: a call
+that dies before its job starts is answered `cancelled` by the call's
+drop, and a land the stale-land sweep rejects is answered `stale` by
+the sweep. One case can leave a result missing: a job that dies after
+it claimed the call but before it recorded anything — the server log
+carries what the audit line cannot. If the audit append fails, the
+change is refused and readiness reports not-ready. Refused
+authentication is aggregated per peer per interval into one counted
+line, capped.
 
 The write, land and ref events carry what an operator needs and no
 contents: the RPC, the repo, the ref, the byte count of an upload,
@@ -28,8 +34,11 @@ that made the move. A replayed land (the same request key after it
 landed) moved nothing, so its land line names no old and no ref line
 appears for it; an auditor finds the head the move replaced in the
 land line of the call that made the move, under the same land_id.
-The ref lines of a ref, in file order, are the ref's true history:
-each old is the previous line's new.
+The ref lines of a ref carry the ref's true history: each old is the
+head its move's CAS replaced, so linking old to new rebuilds the
+history. The lines of concurrent changes can appear in a different
+order than the changes themselves (each job records its result after
+its change), so the history is linked, not read in line order.
 
 Blob and tree digests are never logged (a digest is a dictionary key
 to contents), and neither are token bytes or token hashes. Rotation

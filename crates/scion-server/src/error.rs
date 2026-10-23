@@ -269,22 +269,28 @@ fn causes(e: &dyn std::error::Error) -> String {
     text
 }
 
-impl From<Error> for Status {
-    fn from(e: Error) -> Self {
-        match e {
-            Error::NotFound(_) => Status::not_found(e.to_string()),
-            Error::InvalidArgument(_) | Error::Apply(_) => Status::invalid_argument(e.to_string()),
-            Error::PermissionDenied(_) => Status::permission_denied(e.to_string()),
-            Error::Aborted(_) => Status::aborted(e.to_string()),
+impl Error {
+    /// The gRPC status this error answers with, by its code. One
+    /// mapping, two readers: the reply's code and the audit line's
+    /// `why` label read the same source, so the audit cannot name a
+    /// code the caller did not see.
+    pub(crate) fn status(&self) -> Status {
+        match self {
+            Error::NotFound(_) => Status::not_found(self.to_string()),
+            Error::InvalidArgument(_) | Error::Apply(_) => {
+                Status::invalid_argument(self.to_string())
+            }
+            Error::PermissionDenied(_) => Status::permission_denied(self.to_string()),
+            Error::Aborted(_) => Status::aborted(self.to_string()),
             // The call went; the job that served it stopped at its next
             // check. Nobody reads the reply, so the message is for the log.
-            Error::Cancelled(_) => Status::cancelled(e.to_string()),
-            Error::DeadlineExceeded(_) => Status::deadline_exceeded(e.to_string()),
-            Error::FailedPrecondition(_) => Status::failed_precondition(e.to_string()),
-            Error::ResourceExhausted(_) => Status::resource_exhausted(e.to_string()),
+            Error::Cancelled(_) => Status::cancelled(self.to_string()),
+            Error::DeadlineExceeded(_) => Status::deadline_exceeded(self.to_string()),
+            Error::FailedPrecondition(_) => Status::failed_precondition(self.to_string()),
+            Error::ResourceExhausted(_) => Status::resource_exhausted(self.to_string()),
             // The pool of read connections is drained: a retry after it
             // refills may succeed.
-            Error::Unavailable(_) => Status::unavailable(e.to_string()),
+            Error::Unavailable(_) => Status::unavailable(self.to_string()),
             // The engine's class decides, wherever the metadata lives:
             // on SQLite or on Postgres, the caller reads the same code
             // for the same shortage.
@@ -295,7 +301,7 @@ impl From<Error> for Status {
                     // No repo on this line: the database is shared by
                     // repos. The call whose work failed logs the repo and
                     // the caller.
-                    tracing::warn!(error = %causes(&storage), "the database stayed busy");
+                    tracing::warn!(error = %causes(storage), "the database stayed busy");
                     Status::unavailable("the database is busy; retry")
                 }
                 // The disk is full, or the quota spent: the server's own
@@ -303,12 +309,12 @@ impl From<Error> for Status {
                 // so it names no server path; the path and the operation
                 // are in the log line of the write that failed.
                 StorageClass::DiskFull => {
-                    tracing::error!(error = %causes(&storage), "the server is out of disk space");
+                    tracing::error!(error = %causes(storage), "the server is out of disk space");
                     Status::resource_exhausted("the server is out of disk space; retry later")
                 }
                 // Details stay in the server log, not in the reply.
                 StorageClass::Internal => {
-                    tracing::error!(error = %causes(&storage), "internal error");
+                    tracing::error!(error = %causes(storage), "internal error");
                     Status::internal("internal error")
                 }
             },
@@ -340,10 +346,16 @@ impl From<Error> for Status {
                 // Details stay in the server log, not in the reply. The
                 // log line carries the whole source chain, so a wrapped
                 // cause reaches the log even though the reply does not.
-                tracing::error!(error = %causes(&e), "internal error");
+                tracing::error!(error = %causes(self), "internal error");
                 Status::internal("internal error")
             }
         }
+    }
+}
+
+impl From<Error> for Status {
+    fn from(e: Error) -> Self {
+        e.status()
     }
 }
 

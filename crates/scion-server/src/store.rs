@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 use std::time::{Duration, SystemTime};
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
@@ -61,7 +62,8 @@ pub(crate) mod test_hooks;
 use test_hooks::{DurabilityLog, DurabilityStep, WritePark};
 
 /// The schema version this build makes and reads.
-pub(crate) const SCHEMA_VERSION: u32 = 9;
+#[allow(unreachable_pub)]
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Schema migrations in order. Migration `n`, from 1, moves the database from
 /// version `n - 1` to version `n`. A released migration never changes.
@@ -127,6 +129,9 @@ struct Inner {
     readers: Readers,
     /// The write connection, for every commit and [`Store::read_unflushed`].
     db: Mutex<Connection>,
+    /// The schema versions this open moved, when it migrated. Version 0's
+    /// first open creates the schema, and reports none.
+    migrated: Option<(u32, u32)>,
     /// Commits that a read may see. It grows under the `db` lock, right
     /// before each COMMIT runs.
     committing: AtomicU64,
@@ -169,6 +174,12 @@ struct Inner {
 }
 
 impl Store {
+    /// The schema versions this open moved, when it migrated: the
+    /// process that opened records the move in its audit log.
+    pub(crate) fn migrated(&self) -> Option<(u32, u32)> {
+        self.inner.migrated
+    }
+
     /// Gives the blob folder and the derive walks the server's metrics
     /// registry, once, before the server serves. Import, fsck and gc
     /// pass none, and nothing records.
@@ -349,7 +360,7 @@ impl Store {
                 dir.display()
             )));
         }
-        migrate(&db, SCHEMA_VERSION)?;
+        let migrated = migrate(&db, SCHEMA_VERSION)?;
         drop(opening);
         // After the migrations, so no read sees an older schema.
         let readers = Readers::open(&path)?;
@@ -357,6 +368,7 @@ impl Store {
             inner: Arc::new(Inner {
                 readers,
                 db: Mutex::new(db),
+                migrated,
                 committing: AtomicU64::new(0),
                 committed: AtomicU64::new(0),
                 flushed: AtomicU64::new(0),
@@ -472,6 +484,35 @@ impl Store {
         (result, self.inner.committing.load(Ordering::Acquire))
     }
 
+    /// Runs `f` on one reader connection inside one explicit read
+    /// transaction, so every statement of `f` sees one snapshot. Plain
+    /// [`Store::read`] runs each statement autocommit, and a commit
+    /// between them changes what the later ones see. The cost is the
+    /// snapshot: the log cannot restart while `f` runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns what `f` returns, or an error from the transaction's
+    /// begin.
+    pub(crate) fn read_snapshot<T>(
+        &self,
+        f: impl for<'x> FnOnce(&'x mut SqliteTx<'x>) -> Result<T>,
+    ) -> Result<T> {
+        let reader = self.inner.readers.take();
+        let result = reader
+            .unchecked_transaction()
+            .map_err(from_sqlite)
+            .and_then(|tx| {
+                // A read transaction: nothing to keep, and the drop rolls
+                // it back. The drop must not hide what `f` returned.
+                let out = f(&mut SqliteTx(&reader));
+                drop(tx);
+                out
+            });
+        self.wait_durable(self.inner.committing.load(Ordering::Acquire))?;
+        result
+    }
+
     /// Returns once every commit that a read with count `seen` could see is
     /// durable ([`Store::read_counted`]). Call it after that read.
     ///
@@ -583,7 +624,9 @@ impl Store {
     /// cache covers every commit before it, and the log recovered after a
     /// crash is a prefix of the commits (the write-ahead log's checksums are
     /// chained). So a land that builds on a head that is not durable yet
-    /// replies only after a flush that covers that head too.
+    /// replies only after a flush that covers that head too, and every land
+    /// reply — an error reply that says the land stays pending included —
+    /// waits for a flush that covers the row it recorded.
     ///
     /// # Errors
     ///
@@ -772,16 +815,34 @@ fn user_version(db: &mut SqliteTx<'_>) -> Result<u32> {
 
 /// Runs the migrations from the database's version up to `target`. Only
 /// tests stop below [`SCHEMA_VERSION`], to make an older database.
-pub(crate) fn migrate(db: &Connection, target: u32) -> Result<()> {
+/// Returns the `(from, to)` versions when it migrated, and `None` when
+/// the database was at `target` already. A fresh database's first open
+/// (version 0) creates the schema, and reports no migration: nothing is
+/// there for a migration to move.
+///
+/// # Errors
+///
+/// What the version read and the migrations' SQL return.
+#[allow(unreachable_pub)]
+pub fn migrate(db: &Connection, target: u32) -> Result<Option<(u32, u32)>> {
     let version = user_version(&mut SqliteTx(db))?;
     if version > SCHEMA_VERSION {
         return Err(Error::Corrupt(format!(
             "database schema version {version} is newer than this build ({SCHEMA_VERSION})"
         )));
     }
+    if version == target {
+        return Ok(None);
+    }
+    tracing::info!(
+        from_version = version,
+        to_version = target,
+        "migrating the metadata schema"
+    );
     // Each migration runs in its own transaction, with the version it sets.
     // A crash rolls it back, and the next open runs it again from its start.
     for (to, sql) in (1..=target).zip(MIGRATIONS).skip(version as usize) {
+        let step = Instant::now();
         let tx = db.unchecked_transaction().map_err(from_sqlite)?;
         tx.execute_batch(sql).map_err(from_sqlite)?;
         if to == 4 {
@@ -791,8 +852,26 @@ pub(crate) fn migrate(db: &Connection, target: u32) -> Result<()> {
         tx.pragma_update(None, "user_version", to)
             .map_err(from_sqlite)?;
         tx.commit().map_err(from_sqlite)?;
+        tracing::info!(
+            from_version = to - 1,
+            to_version = to,
+            elapsed_ms = u64::try_from(step.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "the metadata schema migrated one step"
+        );
     }
-    Ok(())
+    tracing::info!(
+        from_version = version,
+        to_version = target,
+        "the metadata migration is done"
+    );
+    // Version 0 was no schema at all: the first open creates one, and a
+    // creation moves nothing.
+    let migrated = if version == 0 {
+        None
+    } else {
+        Some((version, target))
+    };
+    Ok(migrated)
 }
 
 /// What is stored under a blob ID.

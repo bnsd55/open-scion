@@ -115,7 +115,7 @@ drain still waits for.
 #### One server, and no automatic failover
 
 There is no automatic failover. One active server holds the store: a
-second server on the same data directory (or the same Postgres database)
+second server on the same data directory (or the same Postgres schema)
 refuses to start, and a running server whose lock the database gave to
 another process is fenced — it answers `FailedPrecondition` to every call
 and exits. That is the guard against two servers taking one store, not a
@@ -131,9 +131,10 @@ is down, the tiers and daemons in front of it serve what they have cached
 and refuse the rest. If the directory itself is lost, the recovery is a
 restore from backup (section 3).
 
-Proof: crates/scion-server/tests/backend_refusals.rs::a_lost_server_lock_fences_the_backend
-Proof: crates/scion-server/tests/backend_refusals.rs::an_unreachable_database_is_not_a_takeover
+Proof: crates/scion-server/tests/backend_refusals.rs::a_lost_server_lock_fences_the_backend (behaviour, no command: the section's serve command is not in the test's path - the test works at the database's own session lock, and the fence it proves is what the runbook's one-server rule protects)
+Proof: crates/scion-server/tests/backend_refusals.rs::an_unreachable_database_is_not_a_takeover (behaviour, no command: the section's steps are actions on the database and its container, not scion commands; the test holds the behaviour the runbook promises - a stopped database is not a takeover)
 Proof: crates/scion-server/tests/crash.rs::every_reply_survives_a_kill_of_the_server
+Proof: crates/scion-server/tests/first_boot.rs::a_first_boot_serves_probes_and_reads_back
 
 #### Stopping it for real: a unit file
 
@@ -263,9 +264,10 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
   transaction per migration, under a database lock with the same 5 s clock:
   an open that waits longer answers busy, and the caller retries. A
   database of a newer build is refused: run that build's server.
-- One server process serves one database: a second `serve` on the same
-  `--postgres-url` fails at its open with "another server holds this
-  database". An import does not take that lock and runs beside a server.
+- One server process serves one store - a data directory, or a Postgres
+  schema: a second `serve` on the same `--postgres-url` (and schema)
+  fails at its open with "another server holds this store". An import
+  does not take that lock and runs beside a server.
 - The server opens one write connection and a pool of 8 read
   connections, plus the short-lived connections of a migration or an
   import. Size the database's `max_connections` for all of it: the
@@ -274,8 +276,9 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
   refuses the server's next connection, and every call that needs one
   answers `unavailable` until one is free.
 - The one-server rule and the write queue are Postgres advisory locks,
-  visible as `pg_locks` rows of kind `advisory`: the one-server lock
-  and the migration lock are fixed keys of the database, and every
+  visible as `pg_locks` rows of kind `advisory`: the one-server lock is
+  a key of the schema `current_schema()` names, the migration lock is a
+  fixed key of the database, and every
   write transaction also takes the schema's collector key
   (`pg_advisory_xact_lock(hashtext(current_schema() || ':gc'))`),
   which orders it against the collector's sweeps and gives up on that
@@ -297,7 +300,11 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
   the database against a directory that names another store is refused
   with both UUIDs, so a restore that mixes a database with the wrong
   directory fails at the start instead of serving metadata whose blobs
-  are not on this disk.
+  are not on this disk. A directory whose marker names a store also
+  refuses a database that holds no store at all - the usual cause is a
+  `--postgres-url` whose search_path names a schema no store ever
+  served - so the mistake fails at the start, not as "repo not found"
+  on every later call.
 - One server process serves one database, and it stays that way: if the
   server's connection drops and the lock is lost to another process, the
   server is fenced. Every read and write fails with the loss named, the
@@ -307,6 +314,21 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
   session checks itself once a minute, so a loss is seen even while no
   client calls: the check runs on the server's own session, through the
   same queue as every statement, never on a second connection.
+- A start after an unclean kill can refuse its open with "another
+  server holds this database": the dead server's session is still in
+  the database, and the one-server lock dies only when Postgres ends
+  that session. On the same host that is at once - the kernel closes a
+  dead process's sockets - so the service manager's restart
+  (`Restart=on-failure`) is the whole recovery: the first start exits,
+  the next takes the lock. A server whose host vanished without a
+  packet is another matter: Postgres learns of that death only through
+  TCP keepalives, whose clock is the database's `tcp_keepalives_idle`
+  (unset, it falls back to the system default, often 2 hours), so end
+  the dead session by hand (`pg_terminate_backend`) or lower that
+  clock where a lost host must free the lock sooner. The server's own
+  connections carry the tighter bounds (`keepalives_idle` 30 s, a 30 s
+  TCP user timeout), so the reverse - this server noticing a dead
+  database - is bounded by the server, not the database.
 - The SQLite store has none of this: one file is opened by one process at
   the kernel level, so there is no lock to lose and no fence. The notes
   above that name the one-server lock and the fence are Postgres only.
@@ -353,10 +375,37 @@ The server records an audit log: an append-only JSON-lines file of
 refused authentication (counted per peer), writes, ref changes, lands
 and administrative changes, with no tokens and no contents. It lives at
 `audit.log` in the data directory; `--audit-file` puts it elsewhere.
+The CLI's state-changing subcommands record their own admin lines in
+the same file: one intent before a change, and one result after it.
+Every state-changing command is covered: gc, import, restore, derive,
+ticket-key generation, and the schema migration an open performs. The
+restore's lines land in the restored store's own
+audit file, so its history opens with the restore that made it. The
+collector is the runbook's cure for a full disk, so a gc whose intent
+cannot go in because the disk is full runs anyway, and records its
+intent, marked `deferred: disk_full`, after it freed the space. The
+migration's line has no intent before it: it ran inside the store's
+open, before the audit could exist, so its record, marked with the
+versions it moved, goes in as soon as the audit exists.
 There is no way to turn it off: a server that cannot record refuses the
 changes it cannot account for, and flips readiness until a restart. The
 file is mode 0600, never a symlink, in a directory only the server's
 user may write.
+
+The lines of concurrent changes can appear in a different order than the
+changes themselves: each job records its result after its change. Each
+ref line names its old and new head, so a ref's history is rebuilt by
+linking old to new, not by line order.
+
+Every intent line gets one result line: the store job that claimed the
+change writes it, and a call that dies before its job starts has its
+drop answer `cancelled`; a land the sweep rejects at the next start is
+answered by the sweep (`why: stale`) — that line carries a fresh
+request id of its own, because the sweep does not know the intent's:
+the auditor joins it to the intent on the request key and the land id.
+One change is left where the result can be missing: a job that dies
+after it claimed the call but before it recorded anything - the server
+log then carries what the audit line cannot.
 
 ### Folder read rules
 
@@ -439,7 +488,7 @@ serves cannot verify it. The swap on live clients is the recorded drill
 (docs/drills/, template there), not a CI test: no test can hold the
 clients' files of a running fleet.
 
-Proof: crates/scn/tests/tls.rs::a_rotated_server_certificate_needs_no_client_change
+Proof: crates/scn/tests/tls.rs::a_rotated_server_certificate_needs_no_client_change (behaviour, no command: the section's steps are openssl and flag changes, not scion commands; the test holds the behaviour - an old certificate keeps working until the rotation lands, and a rotated one needs no client change)
 
 ### In containers
 
@@ -515,7 +564,7 @@ Rotation, step by step:
 
 A daemon checks no ticket and forwards it, so it needs no key at any step.
 
-Proof: crates/scn/tests/rotation.rs::ticket_key_rotation_while_a_checkout_reads
+Proof: crates/scn/tests/rotation.rs::ticket_key_rotation_while_a_checkout_reads (behaviour, no command: the section's steps are server restarts and cache-key copies, not one command a test can run; the test holds the behaviour - tickets of either key verify while both are given, and a checkout that reads through the rotation never fails)
 
 ## 3. Backup and restore
 
@@ -539,10 +588,10 @@ What an acknowledged write has survived, before you need a backup:
 - What the above does **not** survive: the loss of the drive itself, or
   the loss of the machine. That is what the backup below is for.
 
-Proof: crates/scion-server/tests/power.rs::every_reply_survives_a_power_cut
-Proof: crates/scion-server/tests/dm_log_writes.rs::an_acknowledged_blob_survives_a_cut_at_the_last_barrier_before_its_reply
-Proof: crates/scion-server/tests/crash.rs::every_reply_survives_a_kill_of_the_server
-Proof: crates/scion-server/tests/storage.rs::a_retry_after_a_failed_dir_fsync_makes_the_kept_file_durable
+Proof: crates/scion-server/tests/power.rs::every_reply_survives_a_power_cut (behaviour, no command: the proof is the power cut the LazyFS device delivers at the disk boundary, which no shell command reproduces)
+Proof: crates/scion-server/tests/dm_log_writes.rs::an_acknowledged_blob_survives_a_cut_at_the_last_barrier_before_its_reply (behaviour, no command: the proof is a cut at the device's last barrier before the reply, delivered by the dm-log device, which no shell command reproduces)
+Proof: crates/scion-server/tests/crash.rs::every_reply_survives_a_kill_of_the_server (behaviour, no command: the proof is the kill's own timing - a reply answered and the process killed mid-flight - which no guide command reproduces)
+Proof: crates/scion-server/tests/storage.rs::a_retry_after_a_failed_dir_fsync_makes_the_kept_file_durable (behaviour, no command: the proof injects the fsync failure at the directory boundary, which a shell cannot order; the retry it forces is the runbook's promise)
 
 The Postgres metadata half of the first two rules is Postgres's own
 contract (`synchronous_commit = on`), which the server checks at every
@@ -660,7 +709,9 @@ Proof: crates/scion-server/tests/backup.rs::a_backup_taken_while_serving_restore
 The schema version lives in the database. On open, a server migrates an
 older schema forward, one migration per released version, each in one
 transaction, with its progress in the log (a migration can take a while:
-schema 4 walks every repo's changesets). Two rules:
+schema 4 walks every repo's changesets; on Postgres, schema 5 renumbers
+the changeset parents from one to zero, the numbering SQLite always
+wrote). Two rules:
 
 - A database with a **newer** schema than the binary refuses to open:
   `corrupt data: database schema version 7 is newer than this build (6)`.
@@ -688,7 +739,8 @@ is the rule that names the case:
 After the fix, the server starts and serves; `fsck` says the store is
 whole.
 
-Proof: crates/scion-server/tests/crash.rs::a_newer_schema_refuses_the_open_and_a_restore_serves
+Proof: crates/scion-server/tests/crash.rs::a_newer_schema_refuses_the_open_and_a_restore_serves (behaviour, no command: the section states the two failure rules in prose; the proof is the refusal and the restore those rules name)
+
 
 An import reads git revision `--rev` (default `HEAD`) into scion repo
 `--repo` (default `main`), and points scion ref `--ref` (default `main`)
@@ -709,7 +761,23 @@ backfills a whole history in steps when you want it done before the first
 query (it opens the directory as the server, so with the server stopped, and
 it is safe to repeat).
 
-Proof: crates/scion-server/tests/crash.rs::a_kill_during_a_schema_upgrade_leaves_the_old_schema_or_the_new_one
+Proof: crates/scion-server/tests/crash.rs::a_kill_during_a_schema_upgrade_leaves_the_old_schema_or_the_new_one (behaviour, no command: the section's upgrade steps are prose; the proof is the kill's own timing inside the migration)
+
+### Rollback
+
+The rollback depends on what changed: if the schema did not change, run
+the old binary on the data as it is; if it did, restore the pre-upgrade
+backup (section 3) and run the old binary on the copy. After a
+migration, rollback means restoring the backup taken before the
+upgrade: the old binary refuses the new schema - that refusal is the
+stop, and the backup is the recovery. Never edit `user_version` by
+hand - the version is the migration's bookmark, and a hand-moved one
+leaves the database half-migrated in a way no migration can finish.
+The run-the-old-binary arm is the version matrix's drill, #431: the
+pre-upgrade backup restores and serves under the N-1 binary. The
+restore arm is the failed-migration section's Proof: the test forges a
+newer database, sees the refusal, restores the pre-upgrade backup, and
+serves.
 
 ## 5. Routines
 
@@ -725,7 +793,7 @@ The routines are these:
   into a fresh directory, and fsck clean on the restored copy before
   the server starts.
 
-  Proof: crates/scion-server/tests/storage.rs::a_failing_disk_runbook_fscks_restores_and_serves
+  Proof: crates/scion-server/tests/storage.rs::a_failing_disk_runbook_fscks_restores_and_serves (behaviour, no command: the section's only command block is the collector's; the fsck-restore proof holds the stop-and-restore behaviour the guide states in prose)
 - `tmp/` needs no attention: every open removes the staging folders of dead
   processes, and a lone open also removes files a build older than the
   schema left there.
@@ -802,7 +870,7 @@ failed out-of-space left no torn file, and when space is back, writes
 resume with no restart. A blob whose upload was refused must be uploaded
 again by the client; the server never kept half of it.
 
-Proof: crates/scion-server/tests/disk_full.rs::a_disk_full_runbook_gcs_then_writes_resume
+Proof: crates/scion-server/tests/disk_full.rs::a_disk_full_runbook_gcs_then_writes_resume (behaviour, no command: the section's steps point at the gc routine and fsck, which the storage tests run their own way; conversion to the helper is pending)
 
 ### A failing disk
 
@@ -820,7 +888,7 @@ first internal error from a read:
    later succeeds means the disk recovered, not that the damage was
    never there: run fsck anyway.
 
-Proof: crates/scion-server/tests/storage.rs::a_failing_disk_runbook_fscks_restores_and_serves
+Proof: crates/scion-server/tests/storage.rs::a_failing_disk_runbook_fscks_restores_and_serves (behaviour, no command: the section's steps are stop, fsck, restore, and start, which the storage test holds as behaviour; conversion to the helper is pending)
 
 ### A Postgres restart
 
@@ -846,7 +914,7 @@ The one thing not to do: do not restart the server while the database
 is down. A start against an unreachable database fails, and a restart
 throws away the sessions that would reconnect on their own.
 
-Proof: crates/scion-server/tests/backend_refusals.rs::an_unreachable_database_is_not_a_takeover
+Proof: crates/scion-server/tests/backend_refusals.rs::an_unreachable_database_is_not_a_takeover (behaviour, no command: the section's steps are actions on the database container, not scion commands; the test holds the behaviour the runbook promises)
 
 ## 6. What to watch
 
@@ -1074,7 +1142,7 @@ Tell the causes apart:
 Escalate when the close notice repeats for one peer and the client is
 not yours to fix: the client's owner stops the waste, not the server.
 
-Proof: crates/scion-server/tests/log_stream.rs::a_stalled_log_reply_is_counted_and_closes_the_connection
+Proof: crates/scion-server/tests/log_stream.rs::a_stalled_log_reply_is_counted_and_closes_the_connection (behaviour, no command: the section's commands read a live server's metrics; the test holds the stall, the count, and the close on a paused clock, where a shell client would deadlock)
 
 ### Tier miss rate
 
@@ -1178,9 +1246,14 @@ wire for two seconds, kills the server with SIGKILL mid-land, and then
 measures from the restart's command until readiness answers `SERVING`
 and the first read resolves a ref. It prints the seconds and fails past
 a 60 s bound. The kill is the runbook's crash: no flush, no drain -
-whatever the write-ahead log holds is what recovery starts from. The
+whatever the write-ahead log holds is what recovery starts from. On
+the fixed runner that recovery took 0.1 s (run 39623531102: readiness
+answered `SERVING` and the first read resolved within a tenth of a
+second of the restart's command, with 5 pending lands left by the
+kill; the store built in 0.7 s). One sample at one size; a second size
+is the next step when the number starts steering a decision. The
 current numbers live in the workflow's run log on `main`, and a run
 that drifts far from them is a regression to look at, not a promise to
 restate here.
 
-Proof: crates/scion-server/tests/recovery_bench.rs::a_restart_after_a_kill_recovers_in_a_stated_time
+Proof: crates/scion-server/tests/recovery_bench.rs::a_restart_after_a_kill_recovers_in_a_stated_time (measured, no command: the section's number is what the recovery-bench workflow measures - a kill, a restart, and the seconds to serving - which no shell command of the guide reproduces)

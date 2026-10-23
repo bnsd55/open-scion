@@ -93,8 +93,32 @@ impl Deadline {
 #[must_use = "the deadline ends when the guard drops"]
 pub struct CallGuard(Arc<AtomicBool>);
 
+/// The test-only delay of a guard's drop, read once per process from
+/// `SCION_TEST_GUARD_DROP_MS`. The abort of a call ends its deadline when
+/// the aborted task's future drops the guard, not when `abort` returns;
+/// armed, the drop takes this long, so a counting loop can hold the
+/// window between an abort and the job's next check open.
+#[cfg(any(test, feature = "test-hooks"))]
+fn test_guard_drop_delay() -> Duration {
+    static DELAY: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        std::env::var("SCION_TEST_GUARD_DROP_MS")
+            .ok()
+            .and_then(|ms| ms.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or_default()
+    })
+}
+
 impl Drop for CallGuard {
     fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            let delay = test_guard_drop_delay();
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+        }
         self.0.store(true, Ordering::Relaxed);
     }
 }
