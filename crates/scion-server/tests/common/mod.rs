@@ -27,6 +27,7 @@ use scion_proto::v1::{
 use scion_server::Backend;
 use scion_server::test_support::backend::BackendExt;
 use scion_server::test_support::backend::from_store;
+use scion_server::test_support::meta::Meta as _;
 use scion_server::test_support::meta::MetaTx as _;
 use scion_server::test_support::store::BlobStatus;
 use scion_server::test_support::{store::Store, tree};
@@ -110,7 +111,11 @@ impl Server {
 
 impl Server {
     /// Starts a server on `data` and waits until it listens. It appends its
-    /// log to `log`.
+    /// log to `log`. In Postgres mode (`SCION_TEST_BACKEND=postgres`) it
+    /// proves the backend it was asked for before it returns: the data
+    /// directory carries the Postgres marker and no SQLite database, so a
+    /// run whose spawn lost its `--postgres-url` fails here, not vacuously
+    /// as a second SQLite run.
     pub(crate) fn start(data: &Path, log: &Path) -> Self {
         let mut server = Self::spawn(data, log);
         let start = Instant::now();
@@ -121,6 +126,18 @@ impl Server {
             }
             assert!(start.elapsed() < Duration::from_secs(60), "no listen");
             std::thread::sleep(Duration::from_millis(10));
+        }
+        if Backend::test_is_postgres() {
+            let marker = fs::read_to_string(data.join("backend")).unwrap_or_default();
+            assert_eq!(
+                marker.lines().next(),
+                Some("postgres"),
+                "the server is not Postgres-backed: marker {marker:?}"
+            );
+            assert!(
+                !data.join("scion.db").exists(),
+                "a Postgres-backed server must not keep a SQLite database"
+            );
         }
         server
     }
@@ -139,8 +156,165 @@ impl Server {
         TcpStream::connect(addr).is_ok()
     }
 
-    /// Starts a server on `data`, and does not wait for it.
+    /// Starts a server on `data` the guide's own way, and waits until it
+    /// listens. The serve argv comes from the first fenced `sh` block
+    /// under `heading` of docs/operations.md, with the test's data
+    /// directory, token file, and port in place of the documented ones:
+    /// what the server runs is the runbook's line, not a retyped copy.
+    /// The block's token redirect (its umask and printf) is the
+    /// harness's own 0600 token write below.
+    pub(crate) fn start_on(heading: &'static str, data: &Path, log: &Path) -> Self {
+        let mut server = Self::spawn_on(heading, data, log);
+        let start = Instant::now();
+        while !server.listens(log) {
+            if let Some(status) = server.child.try_wait().unwrap() {
+                let log = fs::read_to_string(log).unwrap_or_default();
+                panic!("the server exited with {status}:\n{log}");
+            }
+            assert!(start.elapsed() < Duration::from_secs(60), "no listen");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        server
+    }
+
+    /// The serve argv the guide's block under `heading` prints, with the
+    /// test's values in place of the documented ones. A section whose
+    /// block names no token file or port gets the documented forms
+    /// appended, since a test must not share a port and must not hold
+    /// the token in argv.
+    pub(crate) fn guide_argv(heading: &'static str, data: &Path) -> Vec<String> {
+        use scion_server::test_support::docs::runbook_block;
+        let binary = env!("CARGO_BIN_EXE_scion-server");
+        let raw = runbook_block(heading, &[]);
+        let token = token_file().to_str().unwrap().to_owned();
+        let dir = data.to_str().unwrap().to_owned();
+        let mut subs = vec![("./scion-server", binary), ("/srv/scion", dir.as_str())];
+        if raw.contains("/srv/scion-token") {
+            subs.push(("/srv/scion-token", token.as_str()));
+        }
+        if raw.contains("127.0.0.1:7878") {
+            subs.push(("127.0.0.1:7878", "127.0.0.1:0"));
+        }
+        let block = runbook_block(heading, &subs);
+        let line = block
+            .lines()
+            .find(|l| l.split_whitespace().any(|p| p == "serve"))
+            .expect("the guide's block serves");
+        // The block may lead with env assignments (SCION_TOKEN=<TOKEN>):
+        // they are the documented auth shape, and the harness's
+        // --token-file below is the same auth in the form the runbook
+        // itself prefers for a long-running process.
+        let mut argv: Vec<String> = line
+            .split_whitespace()
+            .skip_while(|p| p.contains('=') && !p.starts_with("--"))
+            .map(str::to_owned)
+            .collect();
+        if !argv.iter().any(|p| p == "--token-file") {
+            argv.push("--token-file".to_owned());
+            argv.push(token);
+        }
+        if !argv.iter().any(|p| p == "--listen") {
+            argv.push("--listen".to_owned());
+            argv.push("127.0.0.1:0".to_owned());
+        }
+        argv
+    }
+
+    /// Starts a server on `data`, and does not wait for it: the
+    /// one-server command of the guide, the shape every default spawn
+    /// takes.
     pub(crate) fn spawn(data: &Path, log: &Path) -> Self {
+        Self::spawn_on("One server", data, log)
+    }
+
+    pub(crate) fn spawn_on(heading: &'static str, data: &Path, log: &Path) -> Self {
+        let postgres_url = if Backend::test_is_postgres() {
+            Some(postgres_url(data))
+        } else {
+            None
+        };
+        Self::spawn_with_url(heading, data, postgres_url.as_deref(), log)
+    }
+
+    /// Starts a server on `data` whose Postgres metadata is the one the
+    /// opens of `schema_source` filled: the power suite reopens a store
+    /// from the backing directory, whose path names another schema, and
+    /// the store it must serve is the one the first open filled. The
+    /// schema follows the store, not the path; SQLite ignores the
+    /// source, because the metadata is the directory either way. It
+    /// waits until the server listens, and proves the backend it was
+    /// asked for before it returns: the data directory carries the
+    /// Postgres marker and no SQLite database, so a run whose spawn lost
+    /// its `--postgres-url` fails here, not vacuously as a second
+    /// SQLite run.
+    pub(crate) fn start_reopened(data: &Path, schema_source: &Path, log: &Path) -> Self {
+        let mut server = Self::spawn_reopened("One server", data, schema_source, log);
+        let start = Instant::now();
+        while !server.listens(log) {
+            if let Some(status) = server.child.try_wait().unwrap() {
+                let log = fs::read_to_string(log).unwrap_or_default();
+                panic!("the server exited with {status}:\n{log}");
+            }
+            assert!(start.elapsed() < Duration::from_secs(60), "no listen");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if Backend::test_is_postgres() {
+            let marker = fs::read_to_string(data.join("backend")).unwrap_or_default();
+            assert_eq!(
+                marker.lines().next(),
+                Some("postgres"),
+                "the server is not Postgres-backed: marker {marker:?}"
+            );
+            assert!(
+                !data.join("scion.db").exists(),
+                "a Postgres-backed server must not keep a SQLite database"
+            );
+        }
+        server
+    }
+
+    /// Starts a server on `data` the guide's own command, and does
+    /// not wait for it. The Postgres schema is the one `schema_source`'s
+    /// opens took, not the one `data`'s path names: the schema follows
+    /// the store, not the path.
+    pub(crate) fn spawn_reopened(
+        heading: &'static str,
+        data: &Path,
+        schema_source: &Path,
+        log: &Path,
+    ) -> Self {
+        let postgres_url = if Backend::test_is_postgres() {
+            Some(postgres_url(schema_source))
+        } else {
+            None
+        };
+        Self::spawn_with_url(heading, data, postgres_url.as_deref(), log)
+    }
+
+    /// The harness's data-directory make: private, whatever the umask.
+    #[cfg(unix)]
+    fn make_private_dir(data: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::create_dir_all(data).unwrap();
+        fs::set_permissions(data, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn spawn_with_url(
+        heading: &'static str,
+        data: &Path,
+        postgres_url: Option<&str>,
+        log: &Path,
+    ) -> Self {
+        // D25: the binary refuses a missing data directory; the harness
+        // is for servers that serve, so it makes the directory the way
+        // the runbook's operator does: private.
+        if !data.exists() {
+            #[cfg(unix)]
+            Self::make_private_dir(data);
+            #[cfg(not(unix))]
+            fs::create_dir_all(data).unwrap();
+        }
+        let argv = Self::guide_argv(heading, data);
         let log_file = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -169,19 +343,34 @@ impl Server {
                 .unwrap();
         }
         fs::rename(tmp, token_file).unwrap();
+        // The Postgres mode of the fault suites: metadata from the test
+        // database, one schema per data directory, the same name
+        // `Backend::open_test` gives it. The URL carries the schema as a
+        // libpq `options` parameter, which the open merges with its own
+        // options, so the tables and rows of this directory land in it.
         // The child shares a flock until it execs (see `spawn_guard`): the
         // read side keeps this spawn out of a lock-release window of
         // another test.
+        let serve_args = match argv.first() {
+            Some(p) if p == env!("CARGO_BIN_EXE_scion-server") => &argv[1..],
+            _ => &argv[..],
+        };
         let child = spawn_guard::across_spawn(|| {
-            Command::new(env!("CARGO_BIN_EXE_scion-server"))
-                .arg("--data")
-                .arg(data)
-                .args(["serve", "--token-file"])
-                .arg(token_file)
-                .args(["--listen", "127.0.0.1:0"])
-                // Plain log lines, so the address parses without escape
-                // codes.
-                .env("NO_COLOR", "1")
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_scion-server"));
+            // The Postgres mode of the fault suites: metadata from the test
+            // database, one schema per data directory, the same name
+            // `Backend::open_test` gives it. The URL carries the schema as a
+            // libpq `options` parameter, which the open merges with its own
+            // options, so the tables and rows of this directory land in it.
+            // It goes before the `serve` subcommand: the flag belongs to
+            // the program, not to the subcommand.
+            if let Some(url) = &postgres_url {
+                cmd.arg("--postgres-url").arg(url);
+            }
+            cmd.args(serve_args);
+            // Plain log lines, so the address parses without escape
+            // codes.
+            cmd.env("NO_COLOR", "1")
                 // The write park of the two-process race test: inert
                 // unless a test creates a park file for a blob.
                 .env("SCION_TEST_PARK_WRITES", "1")
@@ -199,6 +388,71 @@ impl Server {
     }
 }
 
+/// The `--postgres-url` of a server on `data`: the test database, with the
+/// data directory's own schema as the search path, which this creates
+/// first. The name is the one `Backend::open_test` gives the same
+/// directory, so a pre-seeded store and the server that serves it share
+/// one schema.
+pub(crate) fn postgres_url(data: &Path) -> String {
+    // The connect is one blocking call at setup; some callers run inside
+    // an async runtime, and `postgres` blocks its own thread, so the call
+    // runs on a thread of its own to stay out of the runtime's way.
+    let data = data.to_path_buf();
+    std::thread::spawn(move || {
+        let url = std::env::var("SCION_TEST_POSTGRES_URL")
+            .expect("SCION_TEST_POSTGRES_URL must name the test database");
+        let schema = Backend::test_schema(&data).expect("postgres mode names a schema");
+        let mut client =
+            postgres::Client::connect(&url, postgres::NoTls).expect("the test database connects");
+        client
+            .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+            .unwrap();
+        let sep = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{sep}options=--search_path%3D{schema}")
+    })
+    .join()
+    .unwrap()
+}
+
+/// The store of a data directory for a process beside the server: SQLite
+/// in the SQLite runs, and the Postgres test backend in the Postgres ones,
+/// which keeps the metadata in the database and no SQLite file in the
+/// directory.
+pub(crate) fn open_store(data: &Path) -> Backend {
+    if Backend::test_is_postgres() {
+        Backend::open_test(data).unwrap()
+    } else {
+        from_store(Store::open(data).unwrap())
+    }
+}
+
+/// [`open_store`], as a process that does not land: the checker and racer
+/// helpers that only verify blob files open this, and a Postgres open of
+/// it keeps the metadata in the database instead of making a stray
+/// SQLite file in a Postgres-backed directory.
+pub(crate) fn open_store_shared(data: &Path) -> Backend {
+    if Backend::test_is_postgres() {
+        Backend::open_test_shared(data).unwrap()
+    } else {
+        from_store(Store::open_shared(data).unwrap())
+    }
+}
+
+/// [`open_store_shared`], for a store the suite reopens from another
+/// path than the one its first open used: the power suite reopens from
+/// the backing directory, whose path would name a fresh, empty schema,
+/// while the metadata lives in the database the first open filled. The
+/// schema follows the store, not the path; SQLite ignores the source,
+/// because the metadata is the directory either way.
+pub(crate) fn open_store_shared_reopened(data: &Path, schema_source: &Path) -> Backend {
+    if Backend::test_is_postgres() {
+        let schema = Backend::test_schema(schema_source).expect("postgres mode names a schema");
+        Backend::open_test_shared_in_schema(data, &schema).unwrap()
+    } else {
+        from_store(Store::open_shared(data).unwrap())
+    }
+}
+
 /// The address of the newest `serving` line in the log, if there is one.
 pub(crate) fn bound_addr(log: &Path) -> Option<SocketAddr> {
     let text = fs::read_to_string(log).unwrap_or_default();
@@ -213,6 +467,69 @@ impl Drop for Server {
         // status, so no zombie outlives the test that started it.
         self.child.kill().ok();
         self.child.wait().ok();
+    }
+}
+
+/// Starts a server on `data` right after a kill. The killed server's
+/// store lock outlives the SIGKILL by a moment: on Postgres the
+/// advisory lock dies with the killed server's session, when the
+/// database gets around to ending that backend, and on SQLite the
+/// flock tears down when the kernel reaps the process. The wait takes
+/// the real condition, bounded at 10 s, and retries ONLY the holder
+/// refusal, one line per try with the elapsed time; any other exit
+/// fails at once. Returns the server and the number of holder refusals
+/// it retried: a test that must prove the wait happened asserts on the
+/// count.
+pub(crate) fn start_after_kill(data: &Path, log: &Path) -> (Server, u64) {
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(10);
+    let mut retried = 0_u64;
+    loop {
+        let mark = usize::try_from(fs::metadata(log).map_or(0, |m| m.len()))
+            .expect("the log's length fits usize");
+        let mut server = Server::spawn(data, log);
+        let mut listening = false;
+        loop {
+            if server.listens(log) {
+                listening = true;
+                break;
+            }
+            if let Some(status) = server.try_wait() {
+                let text = fs::read_to_string(log).unwrap_or_default();
+                let fresh = &text[mark..];
+                // Postgres refuses with the holder message of the
+                // advisory lock; SQLite with the one of the flock.
+                let holder = fresh.contains("another server holds this store")
+                    || fresh.contains("is in use by another server");
+                assert!(
+                    holder,
+                    "the server exited with {status}:
+{fresh}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the server never listened within 10 s:
+{}",
+                fs::read_to_string(log).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if listening {
+            return (server, retried);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the store lock of {} was never released within 10 s",
+            data.display()
+        );
+        retried += 1;
+        eprintln!(
+            "start_after_kill: the killed server's store lock is still held, retrying at {} ms",
+            start.elapsed().as_millis()
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -391,7 +708,7 @@ const WIDE_ENTRIES: usize = 1500;
 
 /// Repo `r` with one root changeset, and refs `main` and `dev` at it. No RPC
 pub(crate) fn create_repo(data: &Path) {
-    let store = Store::open(data).unwrap();
+    let store = open_store(data);
     let readme = store.blobs().put(b"crash suite\n").unwrap();
     let mut files = vec![(
         RepoPath::new("README").unwrap(),
@@ -422,12 +739,8 @@ pub(crate) fn create_repo(data: &Path) {
     store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
-            let (id, _) = tree::store_changeset(
-                c,
-                repo,
-                &root,
-                &mut tree::lens_of(&from_store(store.clone())),
-            )?;
+            let (id, _) =
+                tree::store_changeset(c, repo, &root, &mut tree::lens_of(&store.clone()))?;
             for name in REFS {
                 assert!(c.cas_ref(repo, name, None, id)?);
             }
@@ -486,7 +799,7 @@ pub(crate) const LARGE: usize = 64 << 10;
 /// Builds one op's files: mostly small, some to about 1 MiB, so a kill
 /// can stop a blob write in the middle; some share one path, so lands
 /// conflict. Puts every blob and records it in the ledger.
-async fn build_files(
+pub(crate) async fn build_files(
     scion: &mut Scion,
     name: &str,
     op: u64,
@@ -710,15 +1023,90 @@ pub(crate) fn pending_lands(c: &rusqlite::Connection) -> i64 {
     c.query_row(pending, [], |row| row.get(0)).unwrap()
 }
 
+/// A read of the lands table of a data directory whose server runs in
+/// another process: SQLite's file beside the server, or the server's own
+/// Postgres schema. The table is the server's backend's, so a test that
+/// waits for a pending land sees the same rows on both backends.
+pub(crate) enum LandsReader {
+    Sqlite(rusqlite::Connection),
+    Postgres(Option<postgres::Client>),
+}
+
+impl LandsReader {
+    /// Opens the read. It must not run on a Postgres data directory's
+    /// SQLite path: opening `scion.db` beside a Postgres server would
+    /// create a file the restart refuses, so Postgres reads the schema.
+    pub(crate) fn open(data: &Path) -> Self {
+        if Backend::test_is_postgres() {
+            let url = postgres_url(data);
+            let client = std::thread::spawn(move || {
+                postgres::Client::connect(&url, postgres::NoTls)
+                    .expect("the server's schema connects")
+            })
+            .join()
+            .unwrap();
+            Self::Postgres(Some(client))
+        } else {
+            Self::Sqlite(rusqlite::Connection::open(data.join("scion.db")).unwrap())
+        }
+    }
+
+    /// The total land rows the server's backend holds, and the pending
+    /// ones among them.
+    pub(crate) fn counts(&mut self) -> (i64, i64) {
+        let total = "SELECT count(*) FROM lands";
+        let pending = "SELECT count(*) FROM lands WHERE state = 'pending'";
+        match self {
+            Self::Sqlite(c) => {
+                let rows = c.query_row(total, [], |row| row.get(0)).unwrap();
+                (rows, pending_lands(c))
+            }
+            Self::Postgres(client) => {
+                let c = client.as_mut().expect("the reader's client is open");
+                // The sync client's queries block on the connection's own
+                // runtime, so they cannot run on a tokio worker: they run
+                // on a thread of their own, against the held client.
+                std::thread::scope(|s| {
+                    s.spawn(|| {
+                        let rows: i64 = c.query_one(total, &[]).unwrap().get(0);
+                        let pending: i64 = c.query_one(pending, &[]).unwrap().get(0);
+                        (rows, pending)
+                    })
+                    .join()
+                    .unwrap()
+                })
+            }
+        }
+    }
+}
+
+impl Drop for LandsReader {
+    fn drop(&mut self) {
+        // The sync client's close blocks on the connection's own runtime,
+        // so it cannot drop on a tokio worker: it drops on a thread of
+        // its own.
+        if let Self::Postgres(client) = self
+            && let Some(client) = client.take()
+        {
+            std::thread::spawn(move || drop(client)).join().unwrap();
+        }
+    }
+}
+
 /// The blobs that the changeset and tree rows of the database name, and the
 /// number of pending lands. Rows in `seen` are skipped, and new rows added:
 /// a row never changes.
 pub(crate) fn metadata(store: &Backend, seen: &mut HashSet<Vec<u8>>) -> (BTreeSet<BlobId>, i64) {
     // The rows of the data directory's own database: this helper asserts the
     // storage's internals, which only the SQLite backend holds.
-    let raw = store
-        .sqlite()
-        .expect("the storage's internals are a data-directory thing");
+    let Some(raw) = store.sqlite() else {
+        // SHORTCUT: this ceiling is the empty walk; the Postgres rows are
+        // unread by this test, so the metadata-named cross-check has no
+        // Postgres run (the files on disk still verify, and the RPC-side
+        // ledger checks still run). Upgrade path: a MetaTx listing for
+        // changesets and trees, then drop the branch.
+        return (BTreeSet::new(), 0);
+    };
     raw.read(|c| {
         let mut named = BTreeSet::new();
         for table in ["changesets", "trees"] {
@@ -900,6 +1288,7 @@ pub(crate) fn check_lands(ledger: &Ledger, history: &HashMap<ChangesetId, (&str,
 pub(crate) async fn check(
     url: &str,
     data: &Path,
+    schema_source: &Path,
     ledger: &mut Ledger,
     checked: &mut Checked,
     rng: &mut Rng,
@@ -948,9 +1337,15 @@ pub(crate) async fn check(
     }
 
     // Every blob that the metadata names is intact, and so is every blob
-    // file: a file reaches its name only whole.
-    let store = Store::open_shared(data).unwrap();
-    let (named, pending) = metadata(&from_store(store.clone()), &mut checked.rows);
+    // file: a file reaches its name only whole. The store is the same
+    // backend the server serves: a SQLite open here would create the
+    // data directory's scion.db beside a Postgres server, and the
+    // restart after the cut would refuse the directory. The schema
+    // follows the store, not the path: a reopen from the backing
+    // directory walks another path, whose name would be a fresh, empty
+    // schema.
+    let store = open_store_shared_reopened(data, schema_source);
+    let (named, pending) = metadata(&store, &mut checked.rows);
     assert_eq!(pending, 0, "every land sent was retried");
     let files = blob_files(data);
     for id in named.into_iter().chain(files) {
@@ -981,6 +1376,20 @@ pub(crate) async fn wait_until(what: &str, ready: impl Fn() -> bool) {
         );
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
+}
+
+/// Waits until `ready` holds, for at most 10 s, and says whether it
+/// ever held. For a wait whose miss is not a failure: the caller logs
+/// the skip and moves on, where `wait_until` panics.
+pub(crate) async fn wait_until_or_timeout(_what: &str, ready: impl Fn() -> bool) -> bool {
+    let give_up = Instant::now() + Duration::from_secs(10);
+    while !ready() {
+        if Instant::now() >= give_up {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    true
 }
 
 /// The environment variable `name` as a number, or `default`.

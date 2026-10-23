@@ -1,0 +1,86 @@
+name: land-model
+
+on:
+  schedule:
+    # Nightly, after the fuzz: eight randomized model scripts against the
+    # real server. The CI pull-request job runs one case; this run raises
+    # the odds a rare schedule finds a hole.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  model:
+    name: the land model, 8 random scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-workspace-crates: true
+      - run: cargo test -p open-scion-server --test land_model_proptest
+        env:
+          SCION_LANDMODEL_CASES: "8"
+      - name: upload the shrunk script
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: land-model-regressions
+          path: crates/scion-server/proptest-regressions/
+          if-no-files-found: ignore
+
+  # Postgres pays per-op commits and a full server restart per script,
+  # which is why the per-PR job skips the random case there; the night
+  # carries the full random coverage on Postgres instead: the whole
+  # corpus and eight cases, in its own job with its own budget.
+  model-postgres:
+    name: the land model, 8 random scripts (postgres)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:17.11
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SCION_LANDMODEL_CASES: "8"
+      SCION_TEST_BACKEND: postgres
+      SCION_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/scion
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-workspace-crates: true
+      - run: cargo test -p open-scion-server --test land_model_proptest
+      - name: upload the shrunk script
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: land-model-regressions-postgres
+          path: crates/scion-server/proptest-regressions/
+          if-no-files-found: ignore

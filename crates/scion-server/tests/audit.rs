@@ -908,5 +908,404 @@ async fn a_call_without_a_request_id_gets_one_from_the_server() {
     assert_ne!(first, second, "two calls made in one process differ");
 }
 
+/// One landable changeset on top of `start`, inserted straight into the
+/// store, with its own blob: the land is what these tests drive.
+fn land_changeset(store: &Backend, n: usize, start: ChangesetId) -> ChangesetId {
+    use scion_core::{FileState, IdentityTime, RepoPath};
+    let blob = store
+        .blobs()
+        .put(format!("land {n} bytes\n").as_bytes())
+        .unwrap();
+    let change = scion_core::Changeset::new(
+        vec![start],
+        IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            i32::try_from(n).unwrap(),
+        )
+        .expect("identity fits the format"),
+        None,
+        format!("land {n}\n").into_bytes(),
+        [(
+            RepoPath::new(format!("docs/{n}")).unwrap(),
+            Some(FileState::Regular {
+                content: blob,
+                executable: false,
+            }),
+        )]
+        .into(),
+    )
+    .expect("changeset fits the format");
+    store
+        .write(|c| {
+            let repo = c.repo_id(REPO)?;
+            let id = c.insert_changeset(repo, &change)?;
+            c.add_repo_blob(repo, blob)?;
+            Ok(id)
+        })
+        .unwrap()
+}
+
+/// The land lines of one request id: the intent's own answers.
+fn land_lines<'a>(lines: &'a [serde_json::Value], id: &str) -> Vec<&'a serde_json::Value> {
+    lines
+        .iter()
+        .filter(|line| line["event"] == "land" && line["request_id"] == id)
+        .collect()
+}
+
+/// A land call whose deadline is already gone still leaves one answer to
+/// its intent: the intent is recorded first, and the call's drop answers
+/// `cancelled` when the store job never claimed the call - or the job's
+/// own line answers when it won the race. Never neither, never both.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_land_cut_at_its_deadline_gets_exactly_one_answer() {
+    use scion_proto::v1::LandRequest;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let audit_path = dir.path().join("audit.log");
+    let audit = Audit::open(&audit_path).unwrap();
+    let start = store.resolve_ref(REPO, "main").unwrap();
+    let (stop, url) = serve_with_audit(&store, dir.path(), write_access(), audit).await;
+
+    // How many calls a 1 ns deadline cuts is a race: on a fast runner
+    // every arrived call's land can finish inside the same poll, so a
+    // single round may record no cut while the promise still holds. So
+    // the test runs rounds of 8 until one round cuts at least one call,
+    // 10 rounds at most; every round's calls are held to the promise.
+    let rounds = 10;
+    let mut cut_round = None;
+    let mut arrived_total = 0;
+    'rounds: for round in 0..rounds {
+        for j in 0..8 {
+            let i = round * 8 + j;
+            let cs = land_changeset(&store, i, start);
+            let mut ci = writer(&url, &format!("t-land-{i}")).await;
+            let mut request = Request::new(LandRequest {
+                repo: REPO.into(),
+                changeset_id: cs.as_bytes().to_vec(),
+                target_ref: "main".into(),
+                request_key: format!("k-{i}"),
+            });
+            request.set_timeout(Duration::from_nanos(1));
+            // The deadline is gone: the call answers DeadlineExceeded (or the
+            // land finished inside the same poll), and the audit says which.
+            let _ = ci.land(request).await;
+        }
+        // A 1 ns deadline can expire while the client is still sending, so
+        // a try may never reach the server at all, and how many do is a
+        // race on any runner. A call that did reach the server records its
+        // intent before it answers, but the client's own deadline can fire
+        // while that record is still in flight, so every line can appear a
+        // beat after the call returned. Wait for the file to go quiet - a
+        // longer window than one poll, so a busy runner's lag cannot fake
+        // quiet - then hold every call that DID arrive to the promise: one
+        // intent, one answer, and at least one answer the drop wrote. The
+        // vacuity floor is one arrived call: the count of arrivals is a
+        // timing claim, not a promise.
+        let count = || {
+            let Ok(bytes) = std::fs::read(&audit_path) else {
+                return 0;
+            };
+            String::from_utf8_lossy(&bytes).lines().count()
+        };
+        let mut quiet = 0;
+        for _ in 0..60 {
+            let before = count();
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            quiet = if count() == before { quiet + 1 } else { 0 };
+            if quiet >= 3 && before >= 2 {
+                break;
+            }
+        }
+        let lines = read_lines(&audit_path);
+        let mut cut = 0;
+        let mut arrived = 0;
+        for i in (round * 8)..(round * 8 + 8) {
+            let id = format!("t-land-{i}");
+            let intents = lines
+                .iter()
+                .filter(|line| line["event"] == "land" && line["outcome"] == "intent")
+                .filter(|line| line["request_id"] == id)
+                .count();
+            if intents == 0 {
+                // The call never reached the server: nothing is owed.
+                continue;
+            }
+            arrived += 1;
+            assert_eq!(intents, 1, "one intent for {id}");
+            let answers = land_lines(&lines, &id)
+                .into_iter()
+                .filter(|line| line["outcome"] != "intent")
+                .count();
+            assert_eq!(answers, 1, "exactly one answer to {id}'s intent");
+            // Which side answers is a race with no witness: idle, the drop
+            // answers `cancelled`; on a loaded runner the job claims the
+            // call before the 1 ns cut reaches the guard, and its own line
+            // answers `deadline_exceeded`. The drop's own cancelled path is
+            // pinned without timing by `service.rs`'s
+            // a_call_aborted_before_its_job_claims_it_answers_cancelled_and_records_nothing.
+            if land_lines(&lines, &id).iter().any(|line| {
+                line["outcome"] == "failed"
+                    && (line["why"] == "cancelled" || line["why"] == "deadline_exceeded")
+            }) {
+                cut += 1;
+            }
+        }
+        assert!(arrived >= 1, "no call reached the server: {arrived}");
+        arrived_total += arrived;
+        if cut >= 1 {
+            cut_round = Some(round);
+            break 'rounds;
+        }
+    }
+    let cut_round = cut_round.unwrap_or_else(|| {
+        panic!(
+            "{rounds} rounds of 8 calls at a 1 ns deadline never cut one: \
+             every one of the {arrived_total} arrived calls' lands finished \
+             before the cut, which the timing of a loaded runner allows; \
+             the exactly-one-answer promise held for each of them"
+        )
+    });
+    println!("a land was cut in round {}", cut_round + 1);
+    stop.send(()).unwrap();
+}
+
+/// A call dropped at many points around its job's start - a spread of
+/// short deadlines - never leaves an intent with zero answers or with
+/// two: the drop's cancelled line and the job's own line cannot both
+/// appear, and one of them always does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_land_dropped_around_its_jobs_start_gets_one_answer() {
+    use scion_proto::v1::LandRequest;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let audit_path = dir.path().join("audit.log");
+    let audit = Audit::open(&audit_path).unwrap();
+    let start = store.resolve_ref(REPO, "main").unwrap();
+    let (stop, url) = serve_with_audit(&store, dir.path(), write_access(), audit).await;
+
+    let tries = 100;
+    for i in 0..tries {
+        let cs = land_changeset(&store, i, start);
+        let mut ci = writer(&url, &format!("t-race-{i}")).await;
+        let mut request = Request::new(LandRequest {
+            repo: REPO.into(),
+            changeset_id: cs.as_bytes().to_vec(),
+            target_ref: "main".into(),
+            request_key: format!("k-{i}"),
+        });
+        // A spread of deadlines from 0 to 59 ms: the drop lands before
+        // the intent, inside the intent, before the job's first
+        // statement, and inside the job.
+        let ms = ((i * 37 + 11) % 60) as u64;
+        request.set_timeout(Duration::from_millis(ms));
+        let _ = ci.land(request).await;
+    }
+    // The answer of the last try may still be in flight: wait until
+    // every try is settled - one intent with its one answer, or a call
+    // whose 0 ms deadline expired before the request was sent, which
+    // never reaches the server and owes nothing. A loaded runner makes
+    // an append slow, so give it a minute.
+    for _ in 0..1200 {
+        let lines = read_lines(&audit_path);
+        let all = (0..tries).all(|i| {
+            let lines = land_lines(&lines, &format!("t-race-{i}"));
+            let intents = lines
+                .iter()
+                .filter(|line| line["outcome"] == "intent")
+                .count();
+            let answers = lines
+                .iter()
+                .filter(|line| line["outcome"] != "intent")
+                .count();
+            (intents == 0 && answers == 0) || (intents == 1 && answers == 1)
+        });
+        if all {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let lines = read_lines(&audit_path);
+    for i in 0..tries {
+        let id = format!("t-race-{i}");
+        let intents = lines
+            .iter()
+            .filter(|line| line["event"] == "land" && line["outcome"] == "intent")
+            .filter(|line| line["request_id"] == id)
+            .count();
+        if intents == 0 {
+            // A 0 ms deadline can expire while the client is still
+            // sending: the call never reached the server, so nothing is
+            // owed - and the file must hold nothing for it.
+            assert!(
+                land_lines(&lines, &id).is_empty(),
+                "a call the server never saw left lines: {:?}",
+                land_lines(&lines, &id)
+            );
+            continue;
+        }
+        assert_eq!(intents, 1, "one intent for {id}");
+        let answers = land_lines(&lines, &id)
+            .into_iter()
+            .filter(|line| line["outcome"] != "intent")
+            .count();
+        assert_eq!(
+            answers,
+            1,
+            "exactly one answer to {id}'s intent: {:?}",
+            land_lines(&lines, &id)
+        );
+    }
+    stop.send(()).unwrap();
+}
+
+/// A caller who may read but not write gets its intent answered by
+/// exactly one failed line, whose why is the code the reply carried:
+/// the store job claimed the call (STARTED), so the job, not the dead
+/// handler, owes the line when the checks before the land refuse it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_land_without_write_access_gets_one_failed_line() {
+    use scion_proto::v1::LandRequest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let audit_path = dir.path().join("audit.log");
+    let audit = Audit::open(&audit_path).unwrap();
+    let start = store.resolve_ref(REPO, "main").unwrap();
+    // `access()` grants read only: the write check inside the job fails.
+    let (stop, url) = serve_with_audit(&store, dir.path(), access(), audit).await;
+    let mut ci = writer(&url, "t-deny").await;
+
+    let status = ci
+        .land(LandRequest {
+            repo: REPO.into(),
+            changeset_id: start.as_bytes().to_vec(),
+            target_ref: "main".into(),
+            request_key: "k-deny".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+
+    stop.send(()).unwrap();
+    wait_for_lines(&audit_path, 2).await;
+
+    let lines = read_lines(&audit_path);
+    let intents = land_lines(&lines, "t-deny")
+        .into_iter()
+        .filter(|line| line["outcome"] == "intent")
+        .count();
+    assert_eq!(intents, 1, "one intent for a refused land: {lines:?}");
+    let answers: Vec<_> = land_lines(&lines, "t-deny")
+        .into_iter()
+        .filter(|line| line["outcome"] != "intent")
+        .collect();
+    assert_eq!(answers.len(), 1, "exactly one answer, never two");
+    assert_eq!(
+        answers[0]["outcome"], "failed",
+        "the refused land's answer is the failure"
+    );
+    assert_eq!(
+        answers[0]["why"], "permission_denied",
+        "the why is the code the reply carried"
+    );
+}
+
+/// A land that names a changeset ID the server cannot parse is refused
+/// before anything is recorded: no intent line, no answer, and the
+/// reply is `invalid_argument`. An intent that a refusal never answers
+/// would read as a lost line.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_land_with_a_bad_changeset_id_records_nothing() {
+    use scion_proto::v1::LandRequest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let audit_path = dir.path().join("audit.log");
+    let audit = Audit::open(&audit_path).unwrap();
+    let (stop, url) = serve_with_audit(&store, dir.path(), write_access(), audit).await;
+    let mut ci = writer(&url, "t-bad").await;
+
+    let status = ci
+        .land(LandRequest {
+            repo: REPO.into(),
+            changeset_id: b"not-a-changeset-id".to_vec(),
+            target_ref: "main".into(),
+            request_key: "k-bad".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+
+    // The refusal and its (absent) lines are both before the reply, but
+    // the drop's cancelled line - if the code still wrote one - hands
+    // off to a blocking task. Give it a moment, then hold the file to
+    // its promise: nothing about this call is in it.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let lines = read_lines(&audit_path);
+    assert!(
+        land_lines(&lines, "t-bad").is_empty(),
+        "a refused land records nothing: {:?}",
+        land_lines(&lines, "t-bad")
+    );
+    stop.send(()).unwrap();
+}
+
+/// An intent that was not made durable is answered by nothing: the
+/// guard that writes `cancelled` is armed only after the intent exists,
+/// so the file never holds a result whose intent is missing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_land_whose_intent_fails_leaves_no_answer_line() {
+    use scion_proto::v1::LandRequest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let audit_path = dir.path().join("audit.log");
+    let audit = Audit::open(&audit_path).unwrap();
+    audit.fail_next_appends(1).unwrap();
+    let (stop, url) = serve_with_audit(&store, dir.path(), write_access(), audit).await;
+    let mut ci = writer(&url, "t-intent").await;
+
+    let status = ci
+        .land(LandRequest {
+            repo: REPO.into(),
+            changeset_id: land_changeset(&store, 0, store.resolve_ref(REPO, "main").unwrap())
+                .as_bytes()
+                .to_vec(),
+            target_ref: "main".into(),
+            request_key: "k-intent".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+
+    // The readiness loss latches and the server drains; the call rode
+    // the connection, so poll with a deadline. Whatever the timing, the
+    // file holds no land line: no intent was recorded, so no result is
+    // owed - not even `cancelled`. The drop's line, if the code still
+    // wrote one, hands off to a blocking task, so the wait is real.
+    for _ in 0..100 {
+        let lines = read_lines(&audit_path);
+        if let Some(line) = lines.iter().find(|line| line["event"] == "land") {
+            panic!("a land line exists for an intent that never landed: {line}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let lines = read_lines(&audit_path);
+    assert!(
+        !lines.iter().any(|line| line["event"] == "land"),
+        "no intent, no answer: {lines:?}"
+    );
+
+    let _ = stop.send(());
+}
+
 #[path = "common/mod.rs"]
 mod common;

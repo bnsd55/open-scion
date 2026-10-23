@@ -1,7 +1,3 @@
----
-ms: "the Postgres crash rows: a kill mid-land and a kill mid-upgrade"
----
-
 The crash suite's Postgres arm, as its own file so it never touches
 crash.rs. The real `scion-server` binary serves a Postgres database,
 and the test kills it with SIGKILL - the crash a cut without a FIN or

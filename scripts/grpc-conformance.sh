@@ -69,11 +69,14 @@ git -C "$WORK/git" -c user.name=Ada -c user.email=ada@example.com \
 git -C "$WORK/git" -c user.name=Ada -c user.email=ada@example.com \
   commit -q -m conformance
 
+# D25: the server refuses a missing data directory; create it here, 0700.
+mkdir -p "$WORK/data"
+chmod 700 "$WORK/data"
 NO_COLOR=1 "$BIN" --data "$WORK/data" import "$WORK/git" --repo r --ref main \
   --verify 0 > /dev/null
 
 # The server, with a ticket key, on a port the OS picks.
-NO_COLOR=1 "$BIN" ticket-key --out "$WORK/ticket.key" > "$WORK/ticket.pub"
+NO_COLOR=1 "$BIN" --data "$WORK/data" ticket-key --out "$WORK/ticket.key" > "$WORK/ticket.pub"
 # The token goes through the environment: the argv form warns.
 SCION_TOKEN=t NO_COLOR=1 "$BIN" --data "$WORK/data" serve --listen 127.0.0.1:0 \
   --ticket-key "$WORK/ticket.key" > "$WORK/server.log" 2>&1 &

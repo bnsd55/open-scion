@@ -162,11 +162,12 @@ SOCKDIR=$(cd "$SOCKDIR" && pwd -P)
 SOCK="$SOCKDIR/matrix-$$.sock"
 
 cleanup() {
-  local rc=$1 f
+  local rc=$1 f dir
   rm -rf "$SOCKDIR"
   [ -n "$WORK" ] || return 0
-  for f in "$WORK"/*/*.pid; do
-    if [ -e "$f" ]; then stop "$(dirname "$f")"; fi
+  for f in "$WORK"/*/owned; do
+    [ -d "$f" ] || continue
+    stop "$(dirname "$f")"
   done
   if [ "$rc" -ne 0 ]; then
     # A red run keeps its logs, whichever pair failed: the CI job
@@ -244,6 +245,9 @@ make_repo() {
 # is the server's, so every pair starts from what its own server wrote.
 import() {
   local dir=$1 srv=$2
+  # D25: the server refuses a missing data directory; create it here.
+  mkdir -p "$dir/server"
+  chmod 700 "$dir/server"
   make_repo "$dir"
   "$srv/scion-server" --data "$dir/server" import "$dir/src" \
     >"$dir/import.out" 2>"$dir/import.log" || {
@@ -263,8 +267,19 @@ start() {
   local name=$1 dir=$2 bin=$3 ready=$4 log pid port tries=300
   shift 4
   log="$dir/$name.log"
-  "$bin" "$@" >"$log" 2>&1 &
+  mkdir -p "$dir/owned"
+  # perl puts the job in its own process group, so the group's id is
+  # the recorded pid, and the exit traps stop the group. The direct
+  # process is the binary itself (no time wrapper here), so the
+  # pidfile's comm is the binary's basename.
+  perl -e 'use POSIX qw(setpgid); setpgid(0,0); exec @ARGV or die "exec: $!\n"' -- "$bin" "$@" >"$log" 2>&1 &
   pid=$!
+  {
+    echo "pid=$pid"
+    echo "pgid=$pid"
+    echo "comm=$(basename "$bin")"
+    echo "cmd=$bin $*"
+  } >"$dir/owned/$name"
   echo "$pid" >"$log.pid"
   while :; do
     port=$(sed -n 's/.* serving listen=127\.0\.0\.1:\([0-9]*\).*/\1/p' "$log" | tail -1)
@@ -293,11 +308,32 @@ start() {
 # it. A wedged server here is exactly what the matrix hunts; it must
 # fail loud, not hang cleanup.
 stop_one() {
-  local dir=$1 name=$2 f="$1/$2.log.pid" pid n
+  local dir=$1 name=$2 f="$1/owned/$2" pid pgid comm have n
   [ -e "$f" ] || return 0
-  pid=$(cat "$f")
-  rm -f "$f"
-  kill -TERM "$pid" 2> /dev/null || true
+  pid=$(sed -n 's/^pid=//p' "$f")
+  pgid=$(sed -n 's/^pgid=//p' "$f")
+  comm=$(sed -n 's/^comm=//p' "$f")
+  rm -f "$f" "$1/$2.log.pid"
+  [ -n "$pid" ] || return 0
+  # The group is the identity, not a name: a live group holds the
+  # recorded id, so it is ours whatever program it runs now. Without a
+  # live group, a live pid whose program is not the recorded one is
+  # skipped, with a line: silence here is how a skipped cleanup hides.
+  if [ -n "$pgid" ] && kill -0 "-$pgid" 2> /dev/null; then
+    :
+  elif ! kill -0 "$pid" 2> /dev/null; then
+    return 0
+  else
+    have=$(ps -o comm= -p "$pid" 2> /dev/null)
+    case "$have" in
+      *"$comm") ;;
+      *)
+        note "skipped $name: pid $pid runs '$have', not the recorded '$comm'"
+        return 0
+        ;;
+    esac
+  fi
+  kill -TERM "-$pgid" 2> /dev/null || kill -TERM "$pid" 2> /dev/null || true
   n=0
   while kill -0 "$pid" 2> /dev/null && [ "$n" -lt 100 ]; do
     sleep 0.1
@@ -305,16 +341,16 @@ stop_one() {
   done
   if kill -0 "$pid" 2> /dev/null; then
     note "$name (pid $pid) ignored TERM; sent KILL"
-    kill -KILL "$pid" 2> /dev/null || true
+    kill -KILL "-$pgid" 2> /dev/null || kill -KILL "$pid" 2> /dev/null || true
   fi
 }
 
 # stop DIR: stop every process `start DIR` started.
 stop() {
   local dir=$1 f
-  for f in "$dir"/*.log.pid; do
+  for f in "$dir"/owned/*; do
     [ -e "$f" ] || return 0
-    stop_one "$dir" "$(basename "$f" .log.pid)"
+    stop_one "$dir" "$(basename "$f")"
   done
 }
 
@@ -484,7 +520,7 @@ pair_5() {
   # A key that is not the server's, made by the OTHER build's tool: if
   # the two versions disagreed on the key format, the refusal below
   # would catch it.
-  "$cache/scion-server" ticket-key --out "$dir/wrong.key" \
+  "$cache/scion-server" --data "$dir/server" ticket-key --out "$dir/wrong.key" \
     >"$dir/wrong.pub" || die "pair '$PAIR' ($SIDE): the second ticket-key failed"
   sport=$(start server "$dir" "$srv/scion-server" port --data "$dir/server" serve \
     --listen 127.0.0.1:0 --ticket-key "$dir/ticket.key")

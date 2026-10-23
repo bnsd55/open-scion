@@ -97,8 +97,15 @@ fn every_directory_of_a_new_data_directory_is_private_whatever_the_umask() {
     for umask in ["000", "002", "022"] {
         let top = tmp.path().join(format!("umask-{umask}"));
         let data = top.join("project/data");
-        // An import makes the data directory, the parents it needs, the
-        // database, the blob folders and this process's staging folder.
+        // D25: the operator makes the data directory (0700 under this
+        // umask, chmod'ed so the plain-mkdir shape cannot leak through);
+        // the import still makes everything inside it - the database,
+        // the blob folders and this process's staging folder - private
+        // whatever the umask.
+        fs::create_dir_all(&data).unwrap();
+        for made in [top.join("project"), data.clone()] {
+            fs::set_permissions(made, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         run(server(
             umask,
             &[
@@ -127,15 +134,24 @@ fn serve_starts_with_its_ticket_key_in_a_data_directory_that_it_made() {
     let tmp = private_tempdir();
     let data = tmp.path().join("project/data");
     let key = data.join("ticket.key");
-    // The most open umask: a plain mkdir would give 0777, which no check of
-    // the key's directory accepts.
+    // D25: the operator makes the data directory - 0700 even under the
+    // most open umask, where a plain mkdir would give 0777, which no
+    // check of the key's directory accepts.
+    fs::create_dir_all(&data).unwrap();
+    fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
     run(server(
         "000",
         &["--data".as_ref(), data.as_os_str(), "fsck".as_ref()],
     ));
     run(server(
         "000",
-        &["ticket-key".as_ref(), "--out".as_ref(), key.as_os_str()],
+        &[
+            "--data".as_ref(),
+            data.as_os_str(),
+            "ticket-key".as_ref(),
+            "--out".as_ref(),
+            key.as_os_str(),
+        ],
     ));
     assert_eq!(mode_of(&key), 0o600);
 

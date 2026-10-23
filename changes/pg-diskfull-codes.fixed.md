@@ -1,7 +1,3 @@
----
-ms: "the Postgres disk-full mapping, pinned code by code"
----
-
 A metadata write the database refuses names its SQLSTATE, and the
 store answers by the code. A full disk is one of them and only one:
 53100, which errcode_for_file_access gives every ENOSPC the database

@@ -1,0 +1,17 @@
+# The v1 wire bytes, hand-assembled from docs/protocol-v1.md's proto3
+# grammar, independent of the encoder: one request, one reply, one
+# repeated entry. If a test here fails, the wire changed and every
+# independent client with it.
+# The doc version this golden pins: docs/protocol-v1.md version 1.
+## GetChangesetRequest repo="golden" changeset_id=0707..07
+0a06 676f6c64656e
+1220 0707070707070707070707070707070707070707070707070707070707070707
+## LogRequest repo="golden" changeset_id=0707..07 limit=3 path="a/b"
+0a06 676f6c64656e
+1220 0707070707070707070707070707070707070707070707070707070707070707
+1803
+2203 612f62
+## LogResponse entries=[{id=0707..07, changeset="CS"}] next_changeset_id="c"
+0a26 0a20 0707070707070707070707070707070707070707070707070707070707070707
+1202 4353
+1201 63

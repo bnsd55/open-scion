@@ -71,6 +71,9 @@ pub(crate) mod error;
 // These two are API, not implementation: a server main runs them by hand,
 // and docs/operations.md documents both. Everything else in the list is
 // an implementation detail of the two binaries, however public it looks.
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "test_support/docs.rs"]
+pub(crate) mod docs_hooks;
 pub mod fsck;
 pub mod gc;
 pub(crate) mod graph;
@@ -85,6 +88,8 @@ pub(crate) mod objects;
 mod pg;
 pub(crate) mod quotas;
 pub(crate) mod read;
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) mod seed;
 pub(crate) mod service;
 pub(crate) mod similar;
 pub(crate) mod store;
@@ -226,6 +231,16 @@ pub mod test_support {
                 self.as_sqlite()
             }
         }
+
+        /// The schema versions this build migrates to, so a test pins
+        /// the migration story without naming a literal that the next
+        /// migration turns stale.
+        pub mod schema_version {
+            /// The SQLite store's schema version ([`crate::store`]).
+            pub const SQLITE: u32 = crate::store::SCHEMA_VERSION;
+            /// The Postgres schema's version ([`crate::pg`]).
+            pub const POSTGRES: u32 = crate::pg::PG_SCHEMA_VERSION;
+        }
     }
     /// The error a changeset apply can end in, and the conversion the
     /// tests share with the crate, for the write tests.
@@ -259,6 +274,15 @@ pub mod test_support {
     /// The on-disk store, so tests open and inspect one directly.
     pub mod store {
         pub use crate::store::*;
+        /// The schema version this build ships, and the migration runner,
+        /// for a test that makes a store of an older version.
+        #[allow(unreachable_pub)]
+        pub use crate::store::{SCHEMA_VERSION, migrate};
+    }
+    /// The guide's own commands, so a Proof's test runs the block under
+    /// its runbook's heading instead of retyping it.
+    pub mod docs {
+        pub use crate::docs_hooks::*;
     }
     /// Tree apply and the per-changeset root tree.
     pub mod tree {
@@ -268,6 +292,11 @@ pub mod test_support {
     pub mod write {
         pub use crate::write::*;
     }
+    /// The bulk seed for deep file-less ladders, for the tests that
+    /// measure the queries instead of the seeding.
+    pub mod seed {
+        pub use crate::seed::*;
+    }
 }
 
 // The facade: the API of this crate, one list, kept here so it is one
@@ -276,10 +305,13 @@ pub mod test_support {
 // public the module it sits in looks. The doc(hidden) items are not
 // here, and never were.
 pub use access::Access;
+pub use derived::DeriveReport;
 pub use error::{Error, Git, Result, Storage, StorageClass};
 pub use gc::DEFAULT_GRACE_SECS;
 pub use graph::{CommitGraph, backfill_commit_graph};
 pub use history::{PathHistory, backfill_path_history};
+#[cfg(any(test, feature = "test-hooks"))]
+pub use import::set_import_per_commit_txs;
 pub use import::{ImportOptions, ImportReport, import_git};
 pub use quotas::Quotas;
 pub use scion_proto::runtime::metrics::Metrics;

@@ -92,11 +92,8 @@ fn a_restore_of_a_stated_store_takes_a_stated_time() {
     // serves), then the blob files.
     let backup = tempfile::tempdir().unwrap();
     let snapshot = backup.path().join("scion.db");
-    let live = rusqlite::Connection::open(dir.path().join("scion.db")).unwrap();
-    live.execute(&format!("VACUUM INTO '{}'", snapshot.display()), [])
-        .unwrap();
-    drop(live);
-    copy_tree(&dir.path().join("objects"), &backup.path().join("objects"));
+    // The snapshot and the blob copy are the runbook's own lines.
+    take_the_guides_backup(dir.path(), backup.path(), &snapshot);
 
     // The restore, timed end to end: the metadata and the blob files of
     // the backup into a fresh directory, then `fsck`, then an open and a
@@ -160,6 +157,30 @@ fn a_restore_of_a_stated_store_takes_a_stated_time() {
         restore.as_secs() < RESTORE_BOUND_SECS,
         "the restore took {restore:?}, past the {RESTORE_BOUND_SECS} s bound: something \
          changed in the restore path, not in the machine"
+    );
+}
+
+/// The backup the runbook's own lines take: the metadata snapshot
+/// (`VACUUM INTO`) first, then the blob copy (`cp -R ... objects`), each
+/// with the stated store's directory and the backup folder in place of
+/// the documented ones.
+fn take_the_guides_backup(store_dir: &Path, backup: &Path, snapshot: &Path) {
+    use scion_server::test_support::docs::run_guide_block_with;
+    let _stdout = run_guide_block_with(
+        "The durability point",
+        "VACUUM INTO",
+        &[
+            ("/srv/scion", store_dir.to_str().unwrap()),
+            ("/backups/scion.db", snapshot.to_str().unwrap()),
+        ],
+    );
+    let _stdout = run_guide_block_with(
+        "The durability point",
+        "objects",
+        &[
+            ("/srv/scion", store_dir.to_str().unwrap()),
+            ("/backups/scion-$(date +%F)", backup.to_str().unwrap()),
+        ],
     );
 }
 

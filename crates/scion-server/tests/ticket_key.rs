@@ -8,9 +8,17 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::{Command, Output};
 
-/// Runs `scion-server` with `args`, and gives its output.
-fn run(args: &[&std::ffi::OsStr]) -> Output {
+/// Runs `scion-server` with `args` after the global `--data`, and gives
+/// its output. The data directory is the test's own: the command's
+/// audit log lives there, and the working directory's default ACL on CI
+/// would refuse the default path.
+fn run(data: &Path, args: &[&std::ffi::OsStr]) -> Output {
+    // D25: the binary refuses a missing data directory; a test that
+    // wants the command to run makes the directory itself.
+    fs::create_dir_all(data).unwrap();
     Command::new(env!("CARGO_BIN_EXE_scion-server"))
+        .arg("--data")
+        .arg(data)
         .args(args)
         .env("NO_COLOR", "1")
         .output()
@@ -25,11 +33,15 @@ fn mode_of(path: &Path) -> u32 {
 #[test]
 fn ticket_key_prints_one_line_of_64_hex() {
     let dir = tempfile::tempdir().unwrap();
-    let out = run(&[
-        "ticket-key".as_ref(),
-        "--out".as_ref(),
-        dir.path().join("seed.key").as_os_str(),
-    ]);
+    let data = dir.path().join("data");
+    let out = run(
+        &data,
+        &[
+            "ticket-key".as_ref(),
+            "--out".as_ref(),
+            dir.path().join("seed.key").as_os_str(),
+        ],
+    );
     assert!(out.status.success());
     // stdout carries the command's output and nothing else: callers take
     // the key with $(...). The logs, if any, go to stderr.
@@ -49,9 +61,13 @@ fn ticket_key_prints_one_line_of_64_hex() {
 #[test]
 fn a_ticket_key_file_is_private_and_made_once() {
     let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
     let key = dir.path().join("ticket.key");
 
-    let out = run(&["ticket-key".as_ref(), "--out".as_ref(), key.as_os_str()]);
+    let out = run(
+        &data,
+        &["ticket-key".as_ref(), "--out".as_ref(), key.as_os_str()],
+    );
     assert!(
         out.status.success(),
         "{}",
@@ -64,7 +80,10 @@ fn a_ticket_key_file_is_private_and_made_once() {
 
     // A second run to the same path fails, and keeps the first key: a
     // silent change breaks every tier that was given the old public half.
-    let out = run(&["ticket-key".as_ref(), "--out".as_ref(), key.as_os_str()]);
+    let out = run(
+        &data,
+        &["ticket-key".as_ref(), "--out".as_ref(), key.as_os_str()],
+    );
     assert!(!out.status.success(), "the second run replaced the key");
     assert!(fs::read(&key).unwrap() == seed, "the key changed");
 }
@@ -72,8 +91,12 @@ fn a_ticket_key_file_is_private_and_made_once() {
 #[test]
 fn serve_refuses_a_seed_that_group_or_others_can_read() {
     let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
     let key = dir.path().join("ticket.key");
-    let out = run(&["ticket-key".as_ref(), "--out".as_ref(), key.as_os_str()]);
+    let out = run(
+        &data,
+        &["ticket-key".as_ref(), "--out".as_ref(), key.as_os_str()],
+    );
     assert!(
         out.status.success(),
         "{}",
@@ -83,8 +106,6 @@ fn serve_refuses_a_seed_that_group_or_others_can_read() {
     // 0644: everyone on the machine can read the seed, so serve refuses it.
     fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
     let args: Vec<std::ffi::OsString> = [
-        "--data",
-        dir.path().join("data").to_str().unwrap(),
         "serve",
         "--token",
         "t",
@@ -96,20 +117,27 @@ fn serve_refuses_a_seed_that_group_or_others_can_read() {
     .map(std::ffi::OsString::from)
     .chain(std::iter::once(key.as_os_str().to_owned()))
     .collect();
-    let out = run(&args
-        .iter()
-        .map(std::ffi::OsString::as_os_str)
-        .collect::<Vec<_>>());
+    let out = run(
+        &data,
+        &args
+            .iter()
+            .map(std::ffi::OsString::as_os_str)
+            .collect::<Vec<_>>(),
+    );
     assert!(!out.status.success(), "serve accepted a 0644 seed");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("group or others"), "{err}");
 
-    // Back to 0600, the server starts with the key.
+    // Back to 0600, the server starts with the key. D25: the operator
+    // makes this data directory (0700) before the serve.
     fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+    let data2 = dir.path().join("data2");
+    fs::create_dir_all(&data2).unwrap();
+    fs::set_permissions(&data2, fs::Permissions::from_mode(0o700)).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_scion-server"))
         .args([
             "--data",
-            dir.path().join("data2").to_str().unwrap(),
+            data2.to_str().unwrap(),
             "serve",
             "--token",
             "t",
@@ -165,7 +193,10 @@ fn write_with_mode(path: &Path, text: &str, mode: u32) {
 /// The public key of a fresh seed file: what `ticket-key` prints.
 fn public_key_of(dir: &Path) -> String {
     let key = dir.join("seed.key");
-    let out = run(&["ticket-key".as_ref(), "--out".as_ref(), key.as_os_str()]);
+    let out = run(
+        &dir.join("data"),
+        &["ticket-key".as_ref(), "--out".as_ref(), key.as_os_str()],
+    );
     assert!(
         out.status.success(),
         "{}",
@@ -180,8 +211,6 @@ fn public_key_of(dir: &Path) -> String {
 /// `serve` with the seed and the old public key of `mode`.
 fn serve_with_old(dir: &Path, seed: &Path, old: &Path) -> Output {
     let args: Vec<std::ffi::OsString> = [
-        "--data",
-        dir.join("data").to_str().unwrap(),
         "serve",
         "--token",
         "t",
@@ -195,10 +224,13 @@ fn serve_with_old(dir: &Path, seed: &Path, old: &Path) -> Output {
     .iter()
     .map(std::ffi::OsString::from)
     .collect();
-    run(&args
-        .iter()
-        .map(std::ffi::OsString::as_os_str)
-        .collect::<Vec<_>>())
+    run(
+        &dir.join("data"),
+        &args
+            .iter()
+            .map(std::ffi::OsString::as_os_str)
+            .collect::<Vec<_>>(),
+    )
 }
 
 #[test]

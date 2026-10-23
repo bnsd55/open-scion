@@ -37,12 +37,56 @@ async fn a_first_boot_serves_probes_and_reads_back() {
     let dir = tempfile::tempdir().unwrap();
     let (data, log) = (dir.path().join("data"), dir.path().join("server.log"));
 
-    // Command 1: start the server on a directory that does not exist
-    // yet. The first boot creates it, with its files private, and
-    // serves. The token went in a file (the runbook's umask 077 and
-    // printf), not in argv.
-    assert!(!data.exists(), "the first boot creates the directory");
-    let server = Server::start(&data, &log);
+    // Command 1: the first boot refuses a directory that does not
+    // exist (D25): it creates nothing and says so. The token went in a
+    // file (the runbook's umask 077 and printf), not in argv.
+    assert!(!data.exists(), "the directory does not exist yet");
+    // A 0600 token file of our own: the serve path checks the token
+    // before the data directory, so the refusal this run proves is the
+    // data one, not the token's.
+    let token = dir.path().join("first-boot-token");
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&token)
+            .unwrap()
+            .write_all(b"first-boot\n")
+            .unwrap();
+    }
+    let refused = std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
+        .args(["--data", data.to_str().unwrap(), "serve", "--token-file"])
+        .arg(&token)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("the refused first boot runs");
+    assert!(
+        !refused.status.success(),
+        "a missing data directory is refused"
+    );
+    let why = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        why.contains("does not exist; create it or pass --data"),
+        "the refusal names the directory: {why}"
+    );
+    assert!(!data.exists(), "the refusal created nothing");
+
+    // Command 1b: the operator makes the directory (0700, the store's
+    // own rule), and the first boot serves. The runbook's umask 077
+    // makes the mkdir private.
+    std::fs::create_dir(&data).unwrap();
+    let server = Server::start_on("First boot", &data, &log);
+    // The one-server section's command is the same command: the guide's
+    // own serve line, in both sections' words, is this spawn's argv.
+    assert_eq!(
+        Server::guide_argv("One server", &data),
+        Server::guide_argv("First boot", &data),
+        "the one-server command and the first boot's serve line agree"
+    );
     let mode = std::fs::metadata(common::token_file())
         .unwrap()
         .permissions()
@@ -66,7 +110,16 @@ async fn a_first_boot_serves_probes_and_reads_back() {
     git(&git_repo, &["add", "FIRST"]);
     git(&git_repo, &["commit", "-q", "-m", "first\n"]);
     let out = common::spawn_guard::across_spawn(|| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
+        // The server marked this directory's metadata Postgres; the
+        // import needs the same URL the server got (common's rule), or
+        // the open refuses it.
+        let mut import = std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"));
+        if scion_server::Backend::test_is_postgres() {
+            import
+                .arg("--postgres-url")
+                .arg(common::postgres_url(&data));
+        }
+        import
             // `--repo` names the harness's repo (the runbook's
             // default is `main`).
             .args([

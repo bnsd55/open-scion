@@ -42,6 +42,25 @@ use crate::history::NodeId;
 use crate::land::{LandOutcome, LandRequest, LandState};
 use crate::store::Store;
 
+/// One pending land the stale-land sweep found, with everything the
+/// answer to its intent line names: the repo (by ID for the ref's lock,
+/// by name for the line), the land ID, the target ref, the principal
+/// and the request key.
+pub struct StaleLand {
+    /// The repo the land belongs to, as the ref's lock names it.
+    pub repo: RepoId,
+    /// The land row's ID.
+    pub land_id: i64,
+    /// The ref the land would move.
+    pub target_ref: String,
+    /// The principal that asked for the land.
+    pub caller: String,
+    /// The request key a retry would resume the land with.
+    pub request_key: String,
+    /// The repo's name, as an audit line carries it.
+    pub repo_name: String,
+}
+
 /// The metadata storage of a server. One implementation per backend; a
 /// caller holds a concrete one and calls these methods.
 pub trait Meta: Send + Sync + 'static {
@@ -86,8 +105,9 @@ pub trait Meta: Send + Sync + 'static {
 
     /// Runs `f` in one write transaction. It commits when `f` returns `Ok`
     /// and rolls back otherwise, and returns before the commit is durable.
-    /// A backend with retryable errors may run `f` again; it must not
-    /// change anything outside the transaction.
+    /// Every backend runs `f` exactly once; a retryable error comes back
+    /// from the call instead of rerunning `f`, and `f` changes nothing
+    /// outside the transaction.
     ///
     /// # Errors
     ///
@@ -110,6 +130,16 @@ pub trait Meta: Send + Sync + 'static {
     fn flush(&self) -> Result<()>;
 }
 
+/// Most ids one `get_derived_batch` call fetches. The statement stays
+/// small (1,000 x 32-byte ids as one array parameter, the reply at most
+/// 1,000 rows), and a walk reads at most 1,000 nodes per step, so one
+/// batch covers one step.
+pub(crate) const DERIVED_BATCH: usize = 1_000;
+
+/// [`DERIVED_BATCH`] as the chain limit the statements take.
+#[allow(clippy::cast_possible_wrap)] // 1,000, far from any wrap
+pub(crate) const DERIVED_BATCH_I64: i64 = DERIVED_BATCH as i64;
+
 /// The queries on the metadata tables. Every query fails with a database
 /// error, or with the `NotFound` or `Corrupt` error that its doc says; the
 /// docs do not repeat that per method. A query may be called in a read or
@@ -125,8 +155,66 @@ pub trait MetaTx {
     /// Stores a changeset and adds it to `repo`. Safe to repeat.
     fn insert_changeset(&mut self, repo: RepoId, cs: &Changeset) -> Result<ChangesetId>;
 
+    /// Turns the importer's changeset batching on or off. While it is on,
+    /// `insert_changeset` writes the changesets row only: the parents and
+    /// the repo membership of the transaction's changesets wait for
+    /// [`MetaTx::flush_changeset_rows`], which writes them in batches at
+    /// the transaction's end. The derived values of the transaction's
+    /// changesets wait the same way: `put_derived` holds the row, and
+    /// `get_derived` answers from the values the transaction inserted
+    /// before it reads the database, so the batch's derives chain through
+    /// it. A transaction that turns this on must flush before it ends,
+    /// and its changesets must come parents first, so the batch's
+    /// generations chain in memory.
+    fn set_changeset_batching(&mut self, on: bool);
+
+    /// Holds the derived values on the first-parent chain that starts at
+    /// `start`, so the batch's reads of them cost nothing: the importer
+    /// preloads the first commits' parents' chains, and a jump outside
+    /// what the transaction inserted then costs one read for the whole
+    /// chain, not one per commit.
+    fn preload_derived_chain(
+        &mut self,
+        kind: &str,
+        version: u32,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<()>;
+
+    /// Whether the import's changeset batching is on: the caller writes
+    /// the transaction's own changesets, so their derived checks that
+    /// read what was just written wait for the flush.
+    fn changeset_batching(&self) -> bool;
+
+    /// Writes the parents and the repo membership that
+    /// [`MetaTx::set_changeset_batching`] held back, one statement per
+    /// 1,000 rows per table where the backend can.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn flush_changeset_rows(&mut self, repo: RepoId) -> Result<()>;
+
     /// Reads a changeset of `repo`, and checks it against its ID.
     fn get_changeset(&mut self, repo: RepoId, id: ChangesetId) -> Result<Changeset>;
+
+    /// `start` and up to `limit - 1` of its first-parent ancestors, as
+    /// (id, generation, body), newest first, in walk order: the page one
+    /// statement fetches where the backend can. Every row is an ancestor
+    /// of `start`, so the repo check rides the start row alone, as
+    /// [`MetaTx::get_changeset`] checks it. The page is short at the root
+    /// of the history.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if `repo` does not hold `start`.
+    /// [`Error::Corrupt`] if a row's id is not a changeset id.
+    fn first_parent_page(
+        &mut self,
+        repo: RepoId,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, i64, Vec<u8>)>>;
 
     /// Whether `repo` may see changeset `id`.
     fn has_changeset(&mut self, repo: RepoId, id: ChangesetId) -> Result<bool>;
@@ -143,6 +231,18 @@ pub trait MetaTx {
 
     /// Every parent of `id`, in order, with its generation.
     fn parents(&mut self, id: ChangesetId, id_gen: i64) -> Result<Vec<(ChangesetId, i64)>>;
+
+    /// The parents of up to [`DERIVED_BATCH`] merges, in the order asked:
+    /// for each merge, its parents in order with their generations. One
+    /// statement where the backend can. A merge asked twice in the batch
+    /// gets its parents once per ask. A merge with no parent rows gives an
+    /// empty list, as [`MetaTx::parents`] would.
+    ///
+    /// [`DERIVED_BATCH`]: crate::meta::DERIVED_BATCH
+    fn parents_many(
+        &mut self,
+        merges: &[(ChangesetId, i64)],
+    ) -> Result<Vec<Vec<(ChangesetId, i64)>>>;
 
     /// Whether `ancestor` is `descendant` or reachable from it, within a
     /// bounded walk.
@@ -170,6 +270,59 @@ pub trait MetaTx {
     /// The stored bytes of a derived value, if computed.
     fn get_derived(&mut self, kind: &str, version: u32, cs: ChangesetId)
     -> Result<Option<Vec<u8>>>;
+
+    /// The stored bytes of up to [`DERIVED_BATCH`] derived values, in the
+    /// order asked. One read transaction, one statement: a land between two
+    /// ids of the batch cannot mix two states.
+    ///
+    /// [`DERIVED_BATCH`]: crate::meta::DERIVED_BATCH
+    fn get_derived_batch(
+        &mut self,
+        kind: &str,
+        version: u32,
+        ids: &[ChangesetId],
+    ) -> Result<Vec<Option<Vec<u8>>>>;
+
+    /// The stored bytes of the derived values on the first-parent chain
+    /// that starts at `start`: `start` itself and up to `limit - 1` of its
+    /// ancestors, following first parents. One statement: the chain follows
+    /// the indexed first-parent rows, and every fetched changeset is an
+    /// ancestor of `start`, so no repo filter is needed. A changeset
+    /// without a stored value has no row, as [`MetaTx::get_derived`]
+    /// would. `limit` bounds the hops.
+    fn get_derived_chain(
+        &mut self,
+        kind: &str,
+        version: u32,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, Vec<u8>)>>;
+
+    /// Writes a test seed: `css` oldest first, every parent before its
+    /// children, file-less (no tree entries, no blobs), and the derived
+    /// values to store beside them. One statement per batch, not per
+    /// changeset, where the backend can. The default writes them one by
+    /// one through the ordinary path; backends where a round trip costs
+    /// real time override it. The rows must find an empty schema: the
+    /// bulk write does not replay the ordinary write's conflict checks.
+    ///
+    /// Returns the ids, in `css` order.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn bulk_seed(
+        &mut self,
+        repo: RepoId,
+        css: &[scion_core::Changeset],
+        derived: &[(&'static str, u32, ChangesetId, Vec<u8>)],
+    ) -> Result<Vec<ChangesetId>> {
+        let mut ids = Vec::with_capacity(css.len());
+        for cs in css {
+            ids.push(self.insert_changeset(repo, cs)?);
+        }
+        for (kind, version, cs, value) in derived {
+            self.put_derived(kind, *version, *cs, value)?;
+        }
+        Ok(ids)
+    }
 
     /// Records a derived value. A second write must agree with the first.
     fn put_derived(
@@ -244,6 +397,11 @@ pub trait MetaTx {
     /// Reads a tree, and checks it against its ID.
     fn get_tree(&mut self, id: TreeId) -> Result<Tree>;
 
+    /// The stored bytes of the trees the ids name, in the order asked:
+    /// `None` for an id that is not stored. Unchecked bytes: the caller
+    /// decodes each and checks it against its id, as `get_tree` does.
+    fn get_trees(&mut self, ids: &[TreeId]) -> Result<Vec<Option<Vec<u8>>>>;
+
     /// Reads a tree's stored `TreeV1` bytes, checked against its ID.
     fn get_tree_body(&mut self, id: TreeId) -> Result<Vec<u8>>;
 
@@ -284,9 +442,10 @@ pub trait MetaTx {
         pending_limit: Option<usize>,
     ) -> Result<(RepoId, LandOutcome)>;
 
-    /// Lists the pending lands that started more than `stale_secs` ago, as
-    /// (repo, land ID, target ref).
-    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<(RepoId, i64, String)>>;
+    /// Lists the pending lands that started more than `stale_secs` ago, with
+    /// what an answer to their intent names: the repo and its name, the land
+    /// ID, the target ref, the principal and the request key.
+    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<StaleLand>>;
 
     /// Rejects a land that is still pending, and returns whether it changed
     /// (1) or was no longer pending (0). The caller holds the ref's lock
@@ -314,6 +473,10 @@ pub trait MetaTx {
     /// Records that a git commit became the changeset. Safe to repeat.
     fn put_git_import(&mut self, repo: RepoId, oid: ObjectId, cs: ChangesetId) -> Result<()>;
 
+    /// Records that the git commits became the changesets, all of the
+    /// pairs, in one statement where the backend can. Safe to repeat.
+    fn put_git_imports(&mut self, repo: RepoId, pairs: &[(ObjectId, ChangesetId)]) -> Result<()>;
+
     /// Every git commit already imported into `repo`.
     fn imported_commits(
         &mut self,
@@ -332,6 +495,11 @@ pub trait MetaTx {
     /// Whether `repo` may name `blob`.
     fn repo_has_blob(&mut self, repo: RepoId, blob: BlobId) -> Result<bool>;
 
+    /// The blobs of the list that `repo` may not name: what the member
+    /// check of `CreateChangeset` refuses. One read for the whole list, so
+    /// a changeset's cost does not grow with its change count.
+    fn repo_missing_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<Vec<BlobId>>;
+
     /// Every repo with its name, in ID order. The walker of `gc`.
     fn repos(&mut self) -> Result<Vec<(RepoId, String)>>;
 
@@ -348,9 +516,18 @@ pub trait MetaTx {
     /// The changeset IDs that `repo` holds, all of them.
     fn repo_changeset_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>>;
 
-    /// The body of changeset `cs`, or `None` when it is not stored.
-    /// Unchecked: `fsck` reads damaged bodies.
-    fn stored_changeset_body(&mut self, cs: &[u8]) -> Result<Option<Vec<u8>>>;
+    /// The bodies of the changesets the ids name, as `(id, body)` for
+    /// every id that has a stored body. Unchecked: `fsck` reads damaged
+    /// bodies. The ids travel as one statement on Postgres: a batch is
+    /// the size the caller chooses, and a caller that reads per id pays
+    /// per statement.
+    fn stored_changeset_bodies(&mut self, ids: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+
+    /// The length of the stored body of every id that has one, as
+    /// `(id, length)`: the gc's prune sizes its body chunks from the
+    /// lengths before it fetches any body, so a chunk's memory is the
+    /// byte budget plus one body, not the whole batch.
+    fn stored_changeset_body_lengths(&mut self, ids: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, i64)>>;
 
     /// The blobs that `repo` may name, all of them.
     fn repo_blob_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>>;
@@ -381,6 +558,10 @@ pub trait MetaTx {
 
     /// Removes the row that names `blob` for `repo`.
     fn delete_repo_blob(&mut self, repo: RepoId, blob: &[u8]) -> Result<()>;
+
+    /// Removes the rows that name any of `blobs` for `repo`, all of
+    /// them, in one statement where the backend can.
+    fn delete_repo_blobs(&mut self, repo: RepoId, blobs: &[Vec<u8>]) -> Result<()>;
 
     /// Whether any repo names `blob`.
     fn any_repo_names(&mut self, blob: &[u8]) -> Result<bool>;
