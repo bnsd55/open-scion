@@ -694,6 +694,101 @@ const LOCK_TIMEOUT_FOR_WRITERS: &str = "5s";
 /// queue drains as fast as the writers commit.
 const LOCK_TIMEOUT_FOR_KEY: &str = "60s";
 
+/// The identity of this database, minted at the first open. The marker
+/// file of the data directory carries the same UUID, and an open that
+/// finds the two different refuses: a database restored on a directory
+/// of another store would name blobs of another disk. The comparison and
+/// the mint run before anything else is written, so a refusal leaves the
+/// schema untouched.
+fn store_identity(writer: &mut PgClient, marker: Marker) -> Result<[u8; 16]> {
+    let first = writer.query("SELECT uuid FROM store_uuid WHERE one = 1", &[])?;
+    if let Some(row) = first.first() {
+        // The database already names its store, and the comparison runs
+        // before anything is written: no marker, or the marker of
+        // another store, both refuse here. A database restored on the
+        // directory of another store would serve metadata whose blobs
+        // are not on this disk.
+        let uuid = uuid_of(row.get::<_, Vec<u8>>("uuid"));
+        match marker.uuid {
+            None => {
+                // A first open cut between its store's UUID row and
+                // its marker: the row commits early in the open, the
+                // marker is written at its end, and a kill in that
+                // window left a store that could never open again. A
+                // schema with no repos row served nothing, so no
+                // blob of another disk can be named: the directory
+                // takes the database's store as its own, and this
+                // open writes the marker the cut fell before. A
+                // schema that holds repos was served by a store
+                // whose marker went missing - a fresh directory
+                // pointed at a served store - and refuses.
+                let served = writer.query("SELECT 1 FROM repos LIMIT 1", &[])?;
+                if !served.is_empty() {
+                    return Err(Error::FailedPrecondition(format!(
+                        "this database names the store {}, but the data \
+                         directory carries no marker of it: give the \
+                         directory the database was served with, or a \
+                         directory it has never served",
+                        hex16(&uuid)
+                    )));
+                }
+                tracing::warn!(
+                    "the data directory carries no marker of store {}; \
+                     the schema holds no repos, so this open takes the \
+                     store (a first open cut before its marker)",
+                    hex16(&uuid)
+                );
+            }
+            Some(held) if held != uuid => {
+                return Err(Error::FailedPrecondition(format!(
+                    "this data directory belongs to the store whose \
+                     UUID is {}, but the database names the store {}: \
+                     one was restored over the other; give the \
+                     directory of the database's own store, or a \
+                     directory the database has never served",
+                    hex16(&held),
+                    hex16(&uuid)
+                )));
+            }
+            Some(_) => {}
+        }
+        Ok(uuid)
+    } else {
+        // A marker that names a store is the identity to adopt: a
+        // dump taken before the UUID existed restores next to its
+        // own directory, and they agree. But only a schema that
+        // holds the store it names: a store that ever served wrote
+        // its repo rows, so a schema with no repos row was never
+        // served by the directory's store, and adopting would give
+        // the marker's identity to an empty schema - a wrong
+        // --postgres-url, a typo in its search_path, or one never
+        // served - and every caller would read "repo not found"
+        // with no error at the start. An empty schema refuses while
+        // the marker names a store, and mints when it names none.
+        let served = writer.query("SELECT 1 FROM repos LIMIT 1", &[])?;
+        if let (Some(held), []) = (marker.uuid, served.as_slice()) {
+            return Err(Error::FailedPrecondition(format!(
+                "this data directory belongs to the store whose UUID \
+                 is {}, but this database holds no store: check \
+                 --postgres-url and its search_path",
+                hex16(&held)
+            )));
+        }
+        let fresh = marker.uuid.unwrap_or_else(uuid_new);
+        writer.query(
+            "INSERT INTO store_uuid (one, uuid) VALUES (1, $1) \
+             ON CONFLICT (one) DO NOTHING",
+            &[P::bytes(&fresh)],
+        )?;
+        // A concurrent first open may have minted its own: read the
+        // row again, and whatever it holds is the identity.
+        Ok(uuid_of(
+            writer.query("SELECT uuid FROM store_uuid WHERE one = 1", &[])?[0]
+                .get::<_, Vec<u8>>("uuid"),
+        ))
+    }
+}
+
 impl Pg {
     /// Opens the database at `url`, and the blob folder under `data`, as
     /// its server: the one `Pg` that may land. `readers` clients serve
@@ -769,76 +864,10 @@ impl Pg {
                  synchronous_commit=on"
             )));
         }
-        // The identity of this database, minted at the first open. The
-        // marker file of the data directory carries the same UUID, and an
-        // open that finds the two different refuses: a database restored
-        // on a directory of another store would name blobs of another disk.
-        let first = writer.query("SELECT uuid FROM store_uuid WHERE one = 1", &[])?;
-        let store_uuid = if let Some(row) = first.first() {
-            // The database already names its store, and the comparison
-            // runs before anything is written: no marker, or the marker
-            // of another store, both refuse here. A database restored on
-            // the directory of another store would serve metadata whose
-            // blobs are not on this disk.
-            let uuid = uuid_of(row.get::<_, Vec<u8>>("uuid"));
-            match marker.uuid {
-                None => {
-                    return Err(Error::FailedPrecondition(format!(
-                        "this database names the store {}, but the data \
-                         directory carries no marker of it: give the \
-                         directory the database was served with, or a \
-                         directory it has never served",
-                        hex16(&uuid)
-                    )));
-                }
-                Some(held) if held != uuid => {
-                    return Err(Error::FailedPrecondition(format!(
-                        "this data directory belongs to the store whose \
-                         UUID is {}, but the database names the store {}: \
-                         one was restored over the other; give the \
-                         directory of the database's own store, or a \
-                         directory the database has never served",
-                        hex16(&held),
-                        hex16(&uuid)
-                    )));
-                }
-                Some(_) => {}
-            }
-            uuid
-        } else {
-            // A marker that names a store is the identity to adopt: a
-            // dump taken before the UUID existed restores next to its
-            // own directory, and they agree. But only a schema that
-            // holds the store it names: a store that ever served wrote
-            // its repo rows, so a schema with no repos row was never
-            // served by the directory's store, and adopting would give
-            // the marker's identity to an empty schema - a wrong
-            // --postgres-url, a typo in its search_path, or one never
-            // served - and every caller would read "repo not found"
-            // with no error at the start. An empty schema refuses while
-            // the marker names a store, and mints when it names none.
-            let served = writer.query("SELECT 1 FROM repos LIMIT 1", &[])?;
-            if let (Some(held), []) = (marker.uuid, served.as_slice()) {
-                return Err(Error::FailedPrecondition(format!(
-                    "this data directory belongs to the store whose UUID \
-                     is {}, but this database holds no store: check \
-                     --postgres-url and its search_path",
-                    hex16(&held)
-                )));
-            }
-            let fresh = marker.uuid.unwrap_or_else(uuid_new);
-            writer.query(
-                "INSERT INTO store_uuid (one, uuid) VALUES (1, $1) \
-                 ON CONFLICT (one) DO NOTHING",
-                &[P::bytes(&fresh)],
-            )?;
-            // A concurrent first open may have minted its own: read the
-            // row again, and whatever it holds is the identity.
-            uuid_of(
-                writer.query("SELECT uuid FROM store_uuid WHERE one = 1", &[])?[0]
-                    .get::<_, Vec<u8>>("uuid"),
-            )
-        };
+        // The identity of this database, minted at the first open, and
+        // the marker's agreement checked before anything is written: see
+        // [`store_identity`].
+        let store_uuid = store_identity(&mut writer, marker)?;
         let blobs = Blobs::open(data)?;
         blobs.sweep_tmp(false)?;
         let inner = Arc::new(PgInner {

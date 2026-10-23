@@ -233,8 +233,9 @@ fn marker_agrees(data: &Path, uuid: [u8; 16]) -> Result<()> {
         }
         Some(_) => {}
         None => {
-            // A fresh pair, or a marker that predates the UUID: the
-            // database's identity is the one this directory takes, and
+            // A fresh pair, a marker that predates the UUID, or a first
+            // open cut before it wrote the marker: the database's
+            // identity is the one this directory takes, and
             // `write_marker` writes it durable at once.
             write_marker(&marker, uuid)?;
         }
