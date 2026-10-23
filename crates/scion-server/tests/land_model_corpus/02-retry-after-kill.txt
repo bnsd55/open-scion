@@ -1,0 +1,5 @@
+# a land whose first call is dropped stays pending across the kill, and
+# the retry phase finishes it
+cut-fresh 0 0 0
+kill-pending
+check

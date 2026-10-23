@@ -1,0 +1,4 @@
+# a land whose first call is dropped stays pending, and exactly one
+# retry (with its twin in flight) lands it
+cut-fresh 0 0 0
+check
