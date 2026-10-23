@@ -1290,11 +1290,13 @@ fn queries_check_the_repo_and_the_changesets() {
 
 /// Section 9 of `docs/architecture.md` lists the deliberate shortcuts, and
 /// the code marks each one with a `SHORTCUT` marker. This pins the table to
-/// the code: a row names files, and for every file the rows that name it
-/// are as many as its markers, one row per marker. A row that names two
-/// files counts once for each. So a PR that removes or adds a shortcut, or
-/// one of its markers, must update the table. The markers are counted in
-/// the sources of the crates (`src`), not in their tests.
+/// the code: one row per marker, everywhere the code marks one -- a
+/// crate's sources and its tests, every script under `scripts/`, and
+/// every workflow file under `.github/workflows/`. A marker with no
+/// row, or a row whose file has no marker, fails the suite. The pull
+/// request template names `SHORTCUT:` as a checklist item; it is prose,
+/// not a marker, and nothing scans it. This file holds marker strings
+/// of its own as check text; the scanner skips this file for that.
 #[test]
 fn the_shortcut_table_matches_the_markers() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1309,39 +1311,59 @@ fn the_shortcut_table_matches_the_markers() {
         .expect("section 9 of docs/architecture.md");
     let section = section.split("## 10.").next().unwrap();
 
-    // The files of each row: the backticked paths that name a file under
-    // `crates/`, as `scion-server/src/land.rs` does. A row holds 4 cells,
-    // so a row merged with the next one by a lost line break fails here.
-    let mut rows: Vec<(String, Vec<String>)> = Vec::new();
+    // The file of each row: the backticked path in the first cell, any
+    // file the shortcuts live in -- a crate's `.rs` source or test, a
+    // script, a workflow. A row holds 8 cells, so a row merged with the
+    // next one by a lost line break fails here. The risk class cell is
+    // one of the three, and no cell is empty.
+    let mut rows: Vec<(String, String)> = Vec::new();
     for line in section.lines().filter(|line| line.starts_with("| `")) {
         let cells: Vec<&str> = line.split('|').collect();
-        assert_eq!(cells.len(), 6, "a row of the table holds 4 cells: {line}");
-        let named: Vec<String> = cells[1]
+        assert_eq!(cells.len(), 10, "a row of the table holds 8 cells: {line}");
+        let file = cells[1]
             .split('`')
-            .filter(|token| {
-                token.contains("src/")
-                    && Path::new(token)
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+            .find(|token| {
+                Path::new(token).extension().is_some_and(|ext| {
+                    matches!(ext.to_str(), Some("rs") | Some("sh") | Some("yml"))
+                })
             })
-            .map(str::to_owned)
-            .collect();
-        assert!(!named.is_empty(), "a row names a file: {line}");
-        rows.push((line.to_owned(), named));
+            .unwrap_or_else(|| panic!("a row names a file: {line}"))
+            .to_owned();
+        let class = cells[3].trim();
+        assert!(
+            matches!(class, "must-replace" | "bounded" | "out-of-profile"),
+            "`{file}`: a row's risk class is one of the three: {line}"
+        );
+        for cell in [cells[2], cells[4], cells[5], cells[6], cells[7], cells[8]] {
+            assert!(!cell.trim().is_empty(), "`{file}`: an empty cell: {line}");
+        }
+        rows.push((line.to_owned(), file));
     }
     assert!(!rows.is_empty(), "the table has rows");
 
-    // Every file under `crates/` with markers, and how many it has.
+    // Every file with markers, and how many it has. The scan covers the
+    // crates (sources and tests), the scripts, and the workflows. This
+    // file's own marker strings are check text; the scanner skips this
+    // file for that.
     let mut marked: HashMap<String, usize> = HashMap::new();
-    let mut stack = vec![root.join("crates")];
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "rs")
-                && !path.components().any(|part| part.as_os_str() == "tests")
-            {
+    for top in ["crates", "scripts", ".github/workflows"] {
+        let mut stack = vec![root.join(top)];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let is_scanned = path.extension().is_some_and(|ext| {
+                    matches!(ext.to_str(), Some("rs") | Some("sh") | Some("yml"))
+                });
+                let is_self = path
+                    .strip_prefix(&root)
+                    .is_ok_and(|rel| rel.ends_with("scion-server/tests/query.rs"));
+                if !is_scanned || is_self {
+                    continue;
+                }
                 let text = fs::read_to_string(&path).unwrap();
                 let markers = text
                     .lines()
@@ -1349,31 +1371,28 @@ fn the_shortcut_table_matches_the_markers() {
                     .count();
                 if markers > 0 {
                     let rel = path
-                        .strip_prefix(root.join("crates"))
+                        .strip_prefix(&root)
                         .unwrap()
                         .to_str()
                         .unwrap()
                         .to_owned();
-                    marked.insert(rel, markers);
+                    *marked.entry(rel).or_insert(0) += markers;
                 }
             }
         }
     }
     assert!(!marked.is_empty(), "the code has markers");
 
-    for (_, named) in &rows {
-        for file in named {
-            fs::read_to_string(root.join("crates").join(file))
-                .unwrap_or_else(|_| panic!("{file} does not exist, but the table lists it"));
-        }
+    // Every file a row names exists.
+    for (_, file) in &rows {
+        fs::read_to_string(root.join(file))
+            .unwrap_or_else(|_| panic!("{file} does not exist, but the table lists it"));
     }
     // Every file with markers, and every file a row names, once per marker
     // and once per row that names it.
     let mut named: HashMap<String, usize> = HashMap::new();
-    for (_, files) in &rows {
-        for file in files {
-            *named.entry(file.clone()).or_insert(0) += 1;
-        }
+    for (_, file) in &rows {
+        *named.entry(file.clone()).or_insert(0) += 1;
     }
     let files: HashSet<String> = marked.keys().chain(named.keys()).cloned().collect();
     for file in &files {
