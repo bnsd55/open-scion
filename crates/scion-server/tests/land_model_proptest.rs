@@ -838,7 +838,8 @@ async fn run_script(script: &[Op]) -> RunSummary {
                 }
                 state.killed = true;
                 drop(server); // SIGKILL
-                server = Server::start(&data, &log);
+                let (restarted, _retried) = common::start_after_kill(&data, &log);
+                server = restarted;
                 let (scion, objects) = connect(&server.url).await.unwrap();
                 state.scion = scion;
                 state.objects = objects;
@@ -983,7 +984,8 @@ async fn run_script(script: &[Op]) -> RunSummary {
                 }
                 state.killed = true;
                 drop(server); // SIGKILL
-                server = Server::start(&data, &log);
+                let (restarted, _retried) = common::start_after_kill(&data, &log);
+                server = restarted;
                 let (scion, objects) = connect(&server.url).await.unwrap();
                 state.scion = scion;
                 state.objects = objects;
@@ -1603,6 +1605,81 @@ async fn get_changeset(scion: &mut Scion, id: ChangesetId) -> (Changeset, Change
         bytes.extend_from_slice(&part.changeset);
     }
     Changeset::decode_with_id(&bytes).unwrap()
+}
+
+/// A restart after a kill waits for the killed server's store lock. The
+/// lock outlives the SIGKILL by a moment - on Postgres the advisory
+/// lock dies with the killed server's session only when the database
+/// ends that backend - so the model's restarts go through
+/// `start_after_kill`, which retries ONLY the holder refusal, bounded.
+/// The race itself is timing-shaped, so this test holds the lock for
+/// real: a live server keeps it, the restart meets the refusal and
+/// retries, and the holder's death is what frees it - the retry count
+/// says the wait happened. Any other refusal fails at once.
+#[test]
+fn a_restart_waits_for_the_killed_servers_store_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let log = dir.path().join("server.log");
+    std::fs::create_dir_all(&data).unwrap();
+    let holder = Server::start(&data, &log);
+    // The restart races a lock the holder keeps. On its own thread, on
+    // a log of its own: `listens` takes the newest serving line of the
+    // log it is given, and the holder's line must never answer for the
+    // restart's own server. The retry loop runs while this thread
+    // waits, then the holder dies.
+    let restart_log = dir.path().join("restart.log");
+    let watch = restart_log.clone();
+    let (data, _) = (data.clone(), log.clone());
+    let waiter = std::thread::spawn(move || {
+        let (server, retried) = common::start_after_kill(&data, &restart_log);
+        // The check runs while this thread's server still lives: the
+        // restart the retry landed answers the store's reads.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (scion, mut objects) = connect(&server.url).await.unwrap();
+            drop(scion);
+            // A read that names a repo the fresh store does not hold:
+            // the answer is the store's own NotFound, which proves the
+            // restarted server answers, whatever it holds.
+            let status = resolve_ref(&mut objects, REFS[0])
+                .await
+                .expect_err("the fresh store holds no refs yet");
+            assert_eq!(status.code(), tonic::Code::NotFound, "{status}");
+        });
+        retried
+    });
+    // The order the test asserts: the waiter met the holder refusal at
+    // least once BEFORE the holder dies. The refusal text in the
+    // restart's own log is the proof; without it the wait never
+    // happened and the test fails.
+    let mark = std::fs::metadata(&watch).map_or(0, |m| usize::try_from(m.len()).unwrap());
+    let refusal_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let text = std::fs::read_to_string(&watch).unwrap_or_default();
+        let fresh = &text[mark..];
+        if fresh.contains("another server holds this store")
+            || fresh.contains("is in use by another server")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < refusal_deadline,
+            "the restart never met the holder refusal; it did not wait for the lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    drop(holder); // SIGKILL the holder; the waiter's next try must land
+    let retried = waiter.join().unwrap();
+    assert!(
+        retried >= 1,
+        "the restart retried {retried} times; the wait never happened"
+    );
+    println!("the restart met the holder refusal and retried {retried} times");
 }
 
 /// The checked-in seed corpus: each file is one script, run first, so a
