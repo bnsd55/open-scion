@@ -982,6 +982,7 @@ impl Pg {
         let mut pending = Vec::new();
         let mut derived = DerivedPending::default();
         let mut preload = std::collections::HashMap::new();
+        let mut history = HistoryPending::default();
         let mut pg = PgTx {
             c: &mut writer,
             gen_cache: std::collections::HashMap::new(),
@@ -990,6 +991,7 @@ impl Pg {
             cs_pending: Some(&mut pending),
             derived_pending: Some(&mut derived),
             derived_preload: Some(&mut preload),
+            history_pending: Some(&mut history),
             ended: true,
         };
         f(&mut pg)
@@ -1051,7 +1053,14 @@ impl Pg {
         let mut pending = Vec::new();
         let mut derived = DerivedPending::default();
         let mut preload = std::collections::HashMap::new();
-        let mut tx = PgTx::begin(&mut writer, &mut pending, &mut derived, &mut preload)?;
+        let mut history = HistoryPending::default();
+        let mut tx = PgTx::begin(
+            &mut writer,
+            &mut pending,
+            &mut derived,
+            &mut preload,
+            &mut history,
+        )?;
         // Every writer and the collector's batches of one schema order on
         // one advisory key, held to the end of the transaction: what a
         // SQLite write transaction gets from the data directory's one
@@ -1228,11 +1237,6 @@ impl Drop for PgWriteWaiter<'_> {
     }
 }
 
-/// One client of the database, inside one transaction. The queries are its
-/// [`MetaTx`] methods. The transaction is begun and ended with statements
-/// of the client, so a `PgTx` is a plain client handle: it stays covariant
-/// in its lifetime, which the backend enum's transaction needs.
-///
 /// The derived rows a batching transaction holds for the flush.
 type DerivedPending = Vec<(String, i64, ChangesetId, Vec<u8>)>;
 
@@ -1240,6 +1244,16 @@ type DerivedPending = Vec<(String, i64, ChangesetId, Vec<u8>)>;
 /// (kind, version, id).
 type DerivedPreload = std::collections::HashMap<(String, i64, Vec<u8>), Vec<u8>>;
 
+/// The history nodes a batching transaction holds for the flush, by id.
+/// The nodes are content-addressed, so a put of a node the transaction
+/// already holds is the same row.
+type HistoryPending = std::collections::HashMap<Vec<u8>, Vec<u8>>;
+
+/// One client of the database, inside one transaction. The queries are its
+/// [`MetaTx`] methods. The transaction is begun and ended with statements
+/// of the client, so a `PgTx` is a plain client handle: it stays covariant
+/// in its lifetime, which the backend enum's transaction needs.
+///
 /// `pub` with the unreachable-pub allow, like [`SqliteTx`](crate::db::SqliteTx):
 /// [`Meta::Tx`] names it, and the trait re-exports through
 /// `test_support::meta`.
@@ -1285,12 +1299,48 @@ pub struct PgTx<'a> {
     /// transaction cost one chain read for the whole chain, not one per
     /// commit. Shared with the reborrows.
     derived_preload: Option<&'a mut DerivedPreload>,
+    /// The history nodes the transaction inserted while batching: the
+    /// flush writes them after the derived rows. Shared with the
+    /// reborrows.
+    history_pending: Option<&'a mut HistoryPending>,
     /// The transaction was ended by `commit` or `rollback`; a drop then
     /// leaves the client alone.
     ended: bool,
 }
 
 impl<'a> PgTx<'a> {
+    /// Writes the history nodes the transaction inserted while batching,
+    /// after the derived rows and before the `git_import` rows: one
+    /// statement per 1,000 rows. The nodes are content-addressed, so
+    /// their order does not matter; the ids are sorted for a
+    /// deterministic statement.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn flush_history_rows(&mut self) -> Result<()> {
+        const CHUNK: usize = 1_000;
+        let Some(history) = self.history_pending.as_deref_mut() else {
+            return Ok(());
+        };
+        let mut node_rows: Vec<(Vec<u8>, Vec<u8>)> = history.drain().collect();
+        node_rows.sort();
+        for chunk in node_rows.chunks(CHUNK) {
+            let ids = chunk.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+            let bodies = chunk
+                .iter()
+                .map(|(_, body)| body.clone())
+                .collect::<Vec<_>>();
+            self.c.execute(
+                "INSERT INTO history_nodes (id, body)
+                 SELECT * FROM unnest($1::bytea[], $2::bytea[])
+                 ON CONFLICT (id) DO NOTHING",
+                &[P::bytea_array(ids), P::bytea_array(bodies)],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Begins one transaction on the client, sharing `pending` with the
     /// caller, which flushes it and refuses to commit while it holds rows.
     fn begin(
@@ -1298,6 +1348,7 @@ impl<'a> PgTx<'a> {
         pending: &'a mut Vec<(ChangesetId, Vec<ChangesetId>)>,
         derived: &'a mut DerivedPending,
         preload: &'a mut DerivedPreload,
+        history: &'a mut HistoryPending,
     ) -> Result<PgTx<'a>> {
         c.execute("BEGIN", &[])?;
         Ok(Self {
@@ -1308,6 +1359,7 @@ impl<'a> PgTx<'a> {
             cs_pending: Some(pending),
             derived_pending: Some(derived),
             derived_preload: Some(preload),
+            history_pending: Some(history),
             ended: false,
         })
     }
@@ -1345,6 +1397,7 @@ impl<'a> PgTx<'a> {
             cs_pending: None,
             derived_pending: None,
             derived_preload: None,
+            history_pending: None,
             ended: false,
         };
         tx.c.execute(
@@ -1374,6 +1427,7 @@ impl<'a> PgTx<'a> {
             cs_pending: self.cs_pending.as_deref_mut(),
             derived_pending: self.derived_pending.as_deref_mut(),
             derived_preload: self.derived_preload.as_deref_mut(),
+            history_pending: self.history_pending.as_deref_mut(),
             ended: true,
         }
     }
@@ -2101,7 +2155,14 @@ fn migrate_under_lock(client: &mut PgClient) -> Result<Option<(u32, u32)>> {
         let mut pending = Vec::new();
         let mut derived = DerivedPending::default();
         let mut preload = std::collections::HashMap::new();
-        let mut tx = PgTx::begin(client, &mut pending, &mut derived, &mut preload)?;
+        let mut history = HistoryPending::default();
+        let mut tx = PgTx::begin(
+            client,
+            &mut pending,
+            &mut derived,
+            &mut preload,
+            &mut history,
+        )?;
         tx.c.batch(&format!(
             "{sql}\nINSERT INTO schema_migrations (version, name) \
              VALUES ({}, 'postgres schema')",
@@ -2277,8 +2338,8 @@ impl MetaTx for PgTx<'_> {
             return Ok(id);
         }
         // Every parent as one statement, however many a merge has: the
-        // row number is the parent's place in the array. SQLite numbers
-        // the rows from zero, so the ordinality (one-based) shifts down.
+        // row number is the parent's place in the array, counting from
+        // zero, as the first-parent readers and the seed writer count.
         if !parents.is_empty() {
             self.c.execute(
                 "INSERT INTO changeset_parents (cs, n, parent)
@@ -2319,12 +2380,11 @@ impl MetaTx for PgTx<'_> {
     /// transaction inserted while batching, one statement per 1,000 rows
     /// per table, and returns how many statements it wrote. The parents'
     /// row numbers follow the per-commit insert's contract (the parent's
-    /// place in the array, counting from zero, as the per-commit insert
-    /// numbers them since #540). The transaction's derived rows land
-    /// after them, in the order the foreign keys read: `changesets`,
-    /// `changeset_parents`, `repo_changesets`, `derived`, `history`,
-    /// `git_import` - the history rows join the batch in the slice
-    /// after this one.
+    /// place in the array, counting from zero). The
+    /// transaction's derived rows land after them, in the order the
+    /// foreign keys read: `changesets`, `changeset_parents`,
+    /// `repo_changesets`, `derived`, `history`, `git_import` - the
+    /// history rows join the batch in the slice after this one.
     ///
     /// # Errors
     ///
@@ -2431,6 +2491,7 @@ impl MetaTx for PgTx<'_> {
             )?;
         }
         derived.clear();
+        self.flush_history_rows()?;
         Ok(())
     }
 
@@ -2917,7 +2978,8 @@ impl MetaTx for PgTx<'_> {
         // indexed first-parent rows (cs, n = 0), so every hop is one index
         // lookup, and the join keeps only the rows that carry a stored
         // value. Every fetched changeset is an ancestor of `start`, so no
-        // repo filter is needed.
+        // repo filter is needed. The reply is in walk order: newest
+        // first, from the asked node, the way first_parent_page orders.
         let version = i64::from(version);
         let rows = self.c.query(
             "WITH RECURSIVE walk(id, depth) AS (
@@ -2930,7 +2992,8 @@ impl MetaTx for PgTx<'_> {
              )
              SELECT d.cs, d.value FROM walk
              JOIN derived d ON d.cs = walk.id
-             WHERE d.kind = $3 AND d.version = $4",
+             WHERE d.kind = $3 AND d.version = $4
+             ORDER BY walk.depth",
             &[
                 P::bytes(id_bytes(start.as_bytes()).as_slice()),
                 P::i64(limit),
@@ -3574,6 +3637,15 @@ impl MetaTx for PgTx<'_> {
     /// Stores a history node under its content address. Safe to repeat.
     /// Returns whether the row was new.
     fn put_history_node(&mut self, id: NodeId, body: Vec<u8>) -> Result<(NodeId, bool)> {
+        // While the importer's batching is on, the row waits for the
+        // flush, which writes it in batches after the derived rows; the
+        // buffer answers this transaction's reads of the same node.
+        if self.cs_batching
+            && let Some(pending) = self.history_pending.as_deref_mut()
+        {
+            pending.insert(id.0.to_vec(), body);
+            return Ok((id, true));
+        }
         let stored = self.c.execute(
             "INSERT INTO history_nodes (id, body) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
             &[P::bytes(&id.0), P::bytes(&body)],
@@ -3588,6 +3660,15 @@ impl MetaTx for PgTx<'_> {
     ///
     /// [`Error::Corrupt`] if absent or if it does not match its ID.
     fn get_history_node(&mut self, id: NodeId) -> Result<(Vec<u8>, usize)> {
+        if self.cs_batching
+            && let Some(body) = self
+                .history_pending
+                .as_deref()
+                .and_then(|pending| pending.get(id.0.as_slice()))
+        {
+            let len = body.len();
+            return Ok((body.clone(), len));
+        }
         let body: Vec<u8> = self
             .c
             .query_opt(

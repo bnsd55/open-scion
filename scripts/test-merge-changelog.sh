@@ -91,3 +91,41 @@ if ! diff -u "$work/expected.md" "$work/CHANGELOG.md"; then
     exit 1
 fi
 echo "merge-changelog: fixture ok"
+
+# --check: the same rules, nothing merged. A fragment that fails the
+# merge's own contract - front matter, a section the script would
+# silently drop, an empty file, a row marker on the first line - must
+# fail with the fragment named, and a clean fixture must pass.
+check=$(mktemp -d)
+trap 'rm -rf "$work" "$check"' EXIT
+mkdir "$check/changes"
+cat >"$check/CHANGELOG.md" <<'EOF'
+## [v0.1.0] - unreleased
+EOF
+
+for bad in 'front-matter' 'bad-section' 'empty' 'row-marker'; do
+    case $bad in
+        front-matter)
+            printf -- '---\nms: "x"\n---\n\nA thing.\n' >"$check/changes/1.fixed.md"
+            ;;
+        bad-section)
+            printf 'A thing.\n' >"$check/changes/1.bad.md"
+            ;;
+        empty)
+            : >"$check/changes/1.added.md"
+            ;;
+        row-marker)
+            printf -- '- A thing.\n' >"$check/changes/1.fixed.md"
+            ;;
+    esac
+    if (cd "$check" && "$here/merge-changelog.sh" --check) >/dev/null 2>&1; then
+        echo "--check accepted a $bad fragment" >&2
+        exit 1
+    fi
+done
+
+rm -rf "$check/changes"
+mkdir "$check/changes"
+printf 'A thing that passes every rule, no front matter, no row\nmarker on the first line, no indent on any line.\n' >"$check/changes/1.fixed.md"
+(cd "$check" && "$here/merge-changelog.sh" --check) >/dev/null
+echo "merge-changelog --check: fixture ok"

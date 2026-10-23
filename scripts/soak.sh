@@ -177,12 +177,12 @@ latency() {
 
 note "soaking for $RUN_MINUTES minutes"
 mkdir -p "$WORK/read" "$WORK/cancel"
-writers & echo $! > "$WORK/soak-writers.pid"
-readers & echo $! > "$WORK/soak-readers.pid"
-importer & echo $! > "$WORK/soak-importer.pid"
-gcer & echo $! > "$WORK/soak-gcer.pid"
-canceller & echo $! > "$WORK/soak-canceller.pid"
-slow_reader & echo $! > "$WORK/soak-slow.pid"
+loop_bg soak-writers writers
+loop_bg soak-readers readers
+loop_bg soak-importer importer
+loop_bg soak-gcer gcer
+loop_bg soak-canceller canceller
+loop_bg soak-slow slow_reader
 
 : > "$WORK/metrics.csv"
 : > "$WORK/metrics-store.csv"
@@ -206,8 +206,7 @@ $(sed -n 1p "$WORK/last.sample" | cut -d, -f2),$(latency)" >> "$WORK/metrics.csv
   sleep 10
 done
 # The writers stop at the end: bench has no time limit of its own.
-pkill -TERM -P "$(cat "$WORK/soak-writers.pid")" 2> /dev/null || true
-kill "$(cat "$WORK/soak-writers.pid")" 2> /dev/null || true
+stop soak-writers
 sleep 2
 
 # The artifacts go where the workflow finds them, right after the run and

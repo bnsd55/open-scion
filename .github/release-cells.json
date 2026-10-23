@@ -8,5 +8,10 @@
     "cell": "macos-aarch64",
     "os": "macos-15",
     "target": "aarch64-apple-darwin"
+  },
+  {
+    "cell": "linux-aarch64",
+    "os": "ubuntu-24.04-arm",
+    "target": "aarch64-unknown-linux-gnu"
   }
 ]
