@@ -1355,6 +1355,26 @@ impl MetaTx for SqliteTx<'_> {
         Ok(rows)
     }
 
+    /// The stored length of every id's body. SQLite holds bodies as
+    /// BLOBs, so `length` counts bytes.
+    fn stored_changeset_body_lengths(&mut self, ids: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, i64)>> {
+        let mut rows = Vec::new();
+        let mut stmt = self
+            .0
+            .prepare_cached("SELECT id, length(body) FROM changesets WHERE id = ?1")
+            .map_err(crate::error::from_sqlite)?;
+        for id in ids {
+            if let Some(len) = stmt
+                .query_row(params![id], |row| row.get(1))
+                .optional()
+                .map_err(crate::error::from_sqlite)?
+            {
+                rows.push((id.clone(), len));
+            }
+        }
+        Ok(rows)
+    }
+
     /// The blobs that `repo` may name, all of them.
     fn repo_blob_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>> {
         let mut stmt = self

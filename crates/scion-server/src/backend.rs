@@ -832,6 +832,13 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn stored_changeset_body_lengths(&mut self, ids: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, i64)>> {
+        match self {
+            Self::Sqlite(tx) => tx.stored_changeset_body_lengths(ids),
+            Self::Postgres(pg) => pg.stored_changeset_body_lengths(ids),
+        }
+    }
+
     fn repo_blob_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>> {
         match self {
             Self::Sqlite(tx) => tx.repo_blob_ids(repo),

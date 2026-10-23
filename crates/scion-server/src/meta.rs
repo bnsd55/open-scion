@@ -523,6 +523,12 @@ pub trait MetaTx {
     /// per statement.
     fn stored_changeset_bodies(&mut self, ids: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
 
+    /// The length of the stored body of every id that has one, as
+    /// `(id, length)`: the gc's prune sizes its body chunks from the
+    /// lengths before it fetches any body, so a chunk's memory is the
+    /// byte budget plus one body, not the whole batch.
+    fn stored_changeset_body_lengths(&mut self, ids: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, i64)>>;
+
     /// The blobs that `repo` may name, all of them.
     fn repo_blob_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>>;
 
