@@ -154,9 +154,6 @@ jobs:
         run: scripts/check-changelog.sh
       - name: the changelog merge script does what it says
         run: scripts/test-merge-changelog.sh
-      # The release pipeline's tag verdicts, fed canned tag objects: no
-      # CI run holds a signed release tag, so the decision is tested
-      # here instead of being trusted.
       - name: the release tag verdicts hold (release-verify-tag)
         run: scripts/test-release-verify-tag.sh
       # A workflow that cannot parse fails here, on the PR that carries
@@ -164,6 +161,8 @@ jobs:
       # actionlint release is pinned by version and sha256.
       - name: the workflows parse (actionlint)
         run: scripts/lint-workflows.sh
+      - name: the capacity reader counters count the log's own shapes
+        run: scripts/test-capacity-counters.sh
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy

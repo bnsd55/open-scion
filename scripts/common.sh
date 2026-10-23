@@ -337,3 +337,15 @@ cpu() { awk '($1 == "user" || $1 == "sys") && NF == 2 { s += $2 } END { printf "
 file_bytes() {
   find "$@" -type f -exec wc -c {} + | awk '$2 != "total" { s += $1 } END { print s + 0 }'
 }
+
+# The reader log's outcome counts: the lines the reader loop writes name
+# their event, but not at the line's start, so the greps match the event
+# text anywhere in the line.
+count_reader_timeouts() {
+  [ -f "$1" ] || { echo 0; return; }
+  grep -c "timeout after 60s" "$1" || true
+}
+count_reader_failures() {
+  [ -f "$1" ] || { echo 0; return; }
+  grep -c "checkout failed rc=" "$1" || true
+}
