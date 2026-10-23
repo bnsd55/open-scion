@@ -151,6 +151,7 @@ jobs:
           # log — so the measure fails itself, loudly, while there is
           # still room to log the numbers.
           ( while sleep 30; do date -u +%T; df -h / | tail -1; free -m | awk 'NR==2'; du -sh target/coverage 2>/dev/null; \
+              ps -eo pid,rss,pcpu,etime,comm --sort=-rss | head -4 | tee -a watcher.log; \
               avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9'); \
               mem=$(free -m | awk 'NR==2 {print $7}'); \
               { [ "$avail" -gt 3 ] && [ "$mem" -gt 600 ]; } || { echo 'the runner is out of disk or memory'; df -h /; free -m; ps aux --sort=-rss | head -12; exit 2; }; done ) &
@@ -302,6 +303,7 @@ jobs:
         run: |
           set -o pipefail
           ( while sleep 30; do date -u +%T; df -h / | tail -1; free -m | awk 'NR==2'; du -sh target/coverage 2>/dev/null; \
+              ps -eo pid,rss,pcpu,etime,comm --sort=-rss | head -4 | tee -a watcher.log; \
               avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9'); \
               mem=$(free -m | awk 'NR==2 {print $7}'); \
               { [ "$avail" -gt 3 ] && [ "$mem" -gt 600 ]; } || { echo 'the runner is out of disk or memory'; df -h /; free -m; ps aux --sort=-rss | head -12; exit 2; }; done ) &
