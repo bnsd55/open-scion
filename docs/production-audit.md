@@ -54,7 +54,45 @@ document landed on.
 | Finding | Evidence | Status |
 | --- | --- | --- |
 | The Postgres writer pings the database with an autocommit `SELECT 1` while holding the writer mutex | `crates/scion-server/src/pg.rs:905` | bounded — ceiling: 1 statement per writer-idle probe (not per call); the probe's role is stated in `operations.md`'s connection-cap paragraph (the server holds 9 connections) |
-| A systematic sweep for SQL inside repository-sized loops, missing `ORDER BY` on paged reads, and isolation assumptions across the pool is not done | `crates/scion-server/src/pg.rs`, `read.rs` | open |
+| The sweep below ran over both backends. No production site pays a statement per repository item over the wire: Postgres chunks every multi-row write (1,000 rows per `unnest` insert) or answers one `ANY($1)` statement per list, every paged read is a keyset page with a matching `ORDER BY`, and SQLite's per-item loops are local prepared statements on its one connection (no round trips), which the code names as its batch at `db.rs:276,876,1181,1372` | `db.rs:228,278,875,1193,1346,1384,1518`; `pg.rs:1330,2401,2573,2634,2979,3313,3599,3710-3910`; `fsck.rs:240,300`; `land.rs:1041,1170`; `import.rs:236` | fixed by design (chunked or local; no REPO-SIZED site) |
+
+### The sweep, per site
+
+| Site | The loop grows with | Statements per iteration | Verdict |
+| --- | --- | --- | --- |
+| `db.rs:228` `insert_changeset`: per-parent generation read, then the per-parent `changeset_parents` inserts | the parents of one changeset | 2 statements per parent, local | BATCHED — a client commit has exactly one parent (`write.rs:278` refuses otherwise); only git import carries merges, and it runs ≤ 1,000 commits per transaction (`import.rs:44,236`), all local |
+| `db.rs:278` `repo_missing_blobs`: per-blob existence read | the blob list of one upload request | 1 local SELECT per blob | BATCHED — local (the comment at `db.rs:276` names it); Postgres answers one `ANY($1)` statement per 1,000 (`pg.rs:2573`) |
+| `db.rs:875` `get_trees`: per-id body read | the ids of one request | 1 local SELECT per id | BATCHED — local; Postgres chunks at `meta::DERIVED_BATCH` (`pg.rs:3313`) |
+| `db.rs:1193` `put_git_imports`: per-pair insert | the pairs of one import batch | 1 local INSERT per pair | BATCHED — local; Postgres inserts one `unnest` per batch (`pg.rs:3599`) |
+| `db.rs:1346` `delete_repo_blobs`: per-blob delete | the blobs gc removes | 1 local DELETE per blob | BATCHED — local; Postgres answers one `ANY($2)` statement (`pg.rs:3809`) |
+| `db.rs:1384` `changeset_bodies_after`/`tree_bodies_after`, `derived_rows_after`; `pg.rs:3710-3910` the same readers | the whole table | 1 statement per ≤ 1,000-row keyset page | BATCHED — keyset pagination, each page ordered by its key |
+| `db.rs:1518` `lands_with_missing_changesets` | two fixed columns | 2 statements | BOUNDED (2) |
+| `fsck.rs:240,300` the check page loops | every changeset and tree | 1 statement per page | BATCHED |
+| `land.rs:1041,1170` the path index walks (`first_parent_page`) | the repo's history length | 1 statement per 1,000-change page | BATCHED — the page is one recursive CTE with `ORDER BY walk.depth` |
+| `pg.rs:1330,2401` the change flushes (`flush_history_rows`, `flush_changeset_rows`) | the transaction's pending rows | 1 `unnest` insert per 1,000 rows | BATCHED |
+| `pg.rs:2283` the per-changeset parent-generation read | the parents the transaction did not insert | 1 statement with `= ANY($2)` | BATCHED |
+| `pg.rs:2634,2979` `first_parent_page`/`get_derived_chain` recursive CTEs | the history the walk covers | 1 statement per page | BATCHED |
+
+### Queries a caller's order depends on
+
+Every paged read and every recursive CTE carries the `ORDER BY` its
+keyset or walk needs (`db.rs:354,649,1362,1415,1432,1553`;
+`pg.rs:2646,2994,3710,3734,3742,3757,3768,3800,3844,3861,3874,3890,3951`).
+Three queries lack `ORDER BY`, and no caller depends on their order —
+each caller answers per row and the reply is a set:
+
+- `dangling_refs` (`pg.rs:3912`, `db.rs:1510`) — fsck reports each row.
+- `stale_lands` (`pg.rs:3462`) — the janitor rejects each land by id.
+- `lands_with_missing_changesets` (`db.rs:1518`, `pg.rs:3929`) — fsck
+  reports each row.
+
+### Postgres isolation, per transaction
+
+| Transaction | Level | Read-then-write paths at that level | Lost update? |
+| --- | --- | --- | --- |
+| Writes (`pg.rs:1355`, plain `BEGIN`) | READ COMMITTED (Postgres's default) — one in-process writer mutex, and every write transaction of the schema holds the schema's one advisory key until it commits, so two writers serialize even across processes | `cas_ref` keeps its version predicate inside the UPDATE; `record_land`'s count-then-insert runs under the advisory key (`pg.rs:3407`); `settle` re-reads the ref and writes only under the version it read (`land.rs:810`); `put_derived`'s agree-check reads and writes in one writer-serialized transaction | No — `two_lands_that_record_together_respect_the_pending_cap` (`pg.rs:4735`) proves the count, `a_conflict_recorded_while_an_import_moved_the_ref_is_not_final` (`land.rs:1982`, run on both backends) proves the verdict's CAS window |
+| Reads (`pg.rs:1389`) | REPEATABLE READ, READ ONLY — one snapshot per read, with `SET LOCAL` statement and idle timeouts | none (read-only) | No |
+| SQLite | one writer; plain reads run per-statement autocommit on pooled readers, `read_snapshot` holds one explicit read transaction (`store.rs:494`) | the same CAS and quota shapes, one writer | No |
 | A server asked for Postgres refuses rather than falling back to SQLite (a mismatched data directory is refused at the open) | `crates/scion-server/src/backend.rs:128,183` | fixed by design (refusal, not fallback) |
 
 ## 5. Failure paths
