@@ -153,6 +153,7 @@ for backend in sqlite postgres; do
           -c "CREATE DATABASE $pg_db" || die "the $backend database reset failed"
       fi
       rm -rf "$WORK/server"
+      mkdir -p "$WORK/server"
       note "importing for $backend"
       /usr/bin/time -p "$BIN/scion-server" --data "$WORK/server" import \
         --rev main "$WORK/src.git" \

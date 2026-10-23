@@ -36,8 +36,11 @@ printf %s "$SCION_TOKEN" > /srv/scion-token
 ./scion-server --data /srv/scion serve --token-file /srv/scion-token
 ```
 
-The `umask 077` and the printf make the token file private (0600). The
-serve command creates the data directory if it does not exist, keeps
+The `umask 077` and the printf make the token file private (0600). A
+data directory the server does not find is refused, not created: every
+subcommand except restore answers "<path> does not exist; create it or
+pass --data" (D25), so make the directory before the first command.
+The serve command keeps
 its files private, and serves. The log's `serving` line names the address.
 
 ```sh

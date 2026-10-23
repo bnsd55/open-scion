@@ -101,6 +101,8 @@ run_story() {
 
   step repo make_repo
 
+  # D25: the server refuses a missing data directory; create it here.
+  mkdir -p "$WORK/server"
   step import "$BIN/scion-server" --data "$WORK/server" import "$WORK/src"
 
   # The ticket key, as the README prints it: the server signs with the

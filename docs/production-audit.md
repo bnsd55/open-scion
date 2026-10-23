@@ -179,7 +179,7 @@ in-process; stated in the PR).
 
 | Finding | Evidence | Status |
 | --- | --- | --- |
-| The default data directory is `scion-data` relative to the server's working directory, and the server creates it | `crates/scion-server/src/main.rs:29` | bounded — ceiling: the created directory is the one flag-named (or cwd-relative default) path, 0700 by the process umask; `docs/cli.md` documents the flag and the default. The open question — create vs refuse — is tracked open |
+| The default data directory is `scion-data` relative to the server's working directory | `crates/scion-server/src/main.rs:29` | fixed (D25): a missing data directory is refused, not created — every subcommand except restore answers "<path> does not exist; create it or pass --data" (`main.rs`, `refuse_missing_data_dir`); fsck's refusal exits 2, its "could not run" code; `tests/refuse_data_dir.rs` holds every subcommand to the refusal and asserts nothing is created |
 | Secrets on argv: `--postgres-url` is deprecated and warns; `--postgres-url-file` and `SCION_POSTGRES_URL` are the supported forms | `crates/scion-server/src/main.rs:33-43` | fixed (the warning ships; the removal is on the deprecation clock) |
 | Ticket and seed files are 0600; the access file refuses group/other writable and symlinks | `crates/scion-server/src/main.rs:1333,1433,1493` | bounded — ceiling: 0600 on every secret file, the access file refuses go-w and symlinks at the open; `operations.md` "The open checks" states the refusal |
 | Listeners default to loopback | `crates/scion-server/src/main.rs:59` (`default_value = "127.0.0.1:7878"`) | bounded — ceiling: the default bind is 127.0.0.1:7878; `docs/operations.md`'s serve examples restate it |

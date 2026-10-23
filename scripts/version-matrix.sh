@@ -245,6 +245,8 @@ make_repo() {
 # is the server's, so every pair starts from what its own server wrote.
 import() {
   local dir=$1 srv=$2
+  # D25: the server refuses a missing data directory; create it here.
+  mkdir -p "$dir/server"
   make_repo "$dir"
   "$srv/scion-server" --data "$dir/server" import "$dir/src" \
     >"$dir/import.out" 2>"$dir/import.log" || {
