@@ -258,3 +258,47 @@ fn the_export_is_the_golden_and_restores_to_it() {
     );
     drop(restored);
 }
+
+/// The pairing check: the golden freezes archive version 1 (its
+/// manifest block names `"version": 1`), and docs/archive-format.md's
+/// own version line must say the same. A re-pin of the golden without
+/// the doc's version line fails here; the doc's version moving without
+/// the golden fails too. The format's additive rule is the refusal the
+/// version rule states: an unknown version or format is refused, not
+/// ignored (`archive_attacks.rs`'s
+/// `an_archive_of_an_unknown_version_or_format_is_refused`).
+#[test]
+fn the_golden_and_the_archive_doc_agree_on_the_version() {
+    let golden = fs::read_to_string(GOLDEN).expect("the golden is checked in");
+    let in_manifest = golden
+        .lines()
+        .find(|l| l.contains(r#""version":"#))
+        .expect("the golden's manifest names its version");
+    let golden_version: u32 = in_manifest
+        .split(':')
+        .next_back()
+        .unwrap()
+        .trim()
+        .trim_end_matches(',')
+        .parse()
+        .expect("the golden's version is a number");
+    let doc = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/archive-format.md"
+    ))
+    .expect("docs/archive-format.md is checked in");
+    let doc_version = doc
+        .lines()
+        .find_map(|l| {
+            let at = l.find("Version ")?;
+            let rest = &l[at + "Version ".len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse::<u32>().ok()
+        })
+        .expect("docs/archive-format.md states its version");
+    assert_eq!(
+        golden_version, doc_version,
+        "the archive golden and docs/archive-format.md disagree on the \
+         version: a re-pin needs the same PR to move the doc's version line"
+    );
+}
