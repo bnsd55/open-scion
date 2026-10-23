@@ -633,7 +633,9 @@ async fn exercise() -> (tempfile::TempDir, std::path::PathBuf) {
 
     // The collector's own admin lines: one run of the gc subcommand,
     // against its own empty store, appending to this same audit file.
+    // D25: the binary refuses a missing data directory; make it first.
     let gc_data = dir.path().join("gc-data");
+    fs::create_dir_all(&gc_data).unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
         .arg("--data")
         .arg(&gc_data)

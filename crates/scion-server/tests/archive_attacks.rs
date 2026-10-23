@@ -554,3 +554,44 @@ fn a_pg_restore_that_dies_at_the_open_leaves_the_database_empty() {
         .batch_execute(&format!("DROP DATABASE {name}"))
         .unwrap();
 }
+
+/// The doc's version rule (`docs/archive-format.md`): a reader refuses
+/// an archive whose format or version it does not know. A version-2
+/// manifest and a foreign format string each stop the restore before
+/// it writes a row, with the named error.
+#[test]
+fn an_archive_of_an_unknown_version_or_format_is_refused() {
+    let (_keep, out, _main, _second) = sound_archive();
+    let manifest_path = out.join("manifest.json");
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+
+    let future = manifest.replace(r#""version": 1"#, r#""version": 2"#);
+    assert_ne!(future, manifest, "the manifest's shape moved upstream");
+    std::fs::write(&manifest_path, future).unwrap();
+    let error = archive::restore(&out, tempfile::tempdir().unwrap().path(), None, None)
+        .expect_err("a version-2 archive must not restore");
+    assert!(
+        error.to_string().contains("version 2 is not 1"),
+        "the refusal must name the version rule: {error}"
+    );
+    let damages = archive::verify(&out).unwrap_err();
+    assert!(
+        damages.to_string().contains("version 2 is not 1"),
+        "verify refuses before it checks rows: {damages}"
+    );
+
+    let foreign = manifest
+        .replace(
+            r#""format": "scion-archive""#,
+            r#""format": "scion-archive-2""#,
+        )
+        .replace(r#""version": 1"#, r#""version": 2"#);
+    assert_ne!(foreign, manifest, "the manifest's shape moved upstream");
+    std::fs::write(&manifest_path, foreign).unwrap();
+    let error = archive::restore(&out, tempfile::tempdir().unwrap().path(), None, None)
+        .expect_err("a foreign archive must not restore");
+    assert!(
+        error.to_string().contains("not a scion archive"),
+        "the refusal must name the format rule: {error}"
+    );
+}

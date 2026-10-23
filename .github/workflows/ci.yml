@@ -167,6 +167,12 @@ jobs:
       - name: the changelog takes fragments, not edits
         if: github.event_name == 'pull_request'
         run: scripts/check-changelog.sh
+      # Depth 2 feeds this too: the pull request's own change is
+      # HEAD^1..HEAD, so a golden re-pin must carry its format doc's
+      # version line in the same pull request.
+      - name: a golden change moves its format doc's version
+        if: github.event_name == 'pull_request'
+        run: scripts/check-golden-pairing.sh
       - name: the changelog merge script does what it says
         run: scripts/test-merge-changelog.sh
       - name: the release tag verdicts hold (release-verify-tag)

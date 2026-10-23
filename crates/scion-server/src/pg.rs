@@ -3796,6 +3796,19 @@ impl MetaTx for PgTx<'_> {
             .collect())
     }
 
+    /// The stored length of every id's body. `octet_length` of a bytea is
+    /// int4; the read wants i64, so the cast.
+    fn stored_changeset_body_lengths(&mut self, ids: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, i64)>> {
+        let rows = self.c.query(
+            "SELECT id, octet_length(body)::bigint FROM changesets WHERE id = ANY($1)",
+            &[P::bytea_array(ids.to_vec())],
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
+    }
+
     /// The blobs that `repo` may name, all of them.
     fn repo_blob_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>> {
         let rows = self.c.query(
