@@ -11,6 +11,7 @@
 //! not only in the chunker's own unit test.
 
 use std::collections::BTreeMap;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use scion_core::{BlobId, Changeset, FileState, IdentityTime, RepoPath};
@@ -44,12 +45,32 @@ fn cs_put(blob: BlobId, padding: usize) -> Changeset {
     .expect("the changeset builds")
 }
 
+/// The gc's byte-budget override and body-fetch counter are process-wide
+/// statics, and one test binary's tests run in parallel threads: a second
+/// gc test running at the same moment would add its fetches to the count
+/// (so ">1 fetch" could pass on another test's work) and would run with
+/// the small budget too. Every test in this binary that runs gc takes the
+/// lock around its whole run and resets the counter under it. The other
+/// gc suites are their own binaries, whose statics this binary never
+/// sees; their tests that count gc's work would take their own lock.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+/// Takes the serial lock, or rides a poison: a panic in an earlier test
+/// must not take this one down with it.
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 #[test]
 fn the_prune_fetches_bodies_in_byte_budget_chunks() {
+    let _serial = serial();
     // Six bodies of about 400 bytes against a 512-byte budget: the chunks
     // hold one body each, so six unseen changesets take at least six
-    // fetches where the old single row-chunked fetch took one.
+    // fetches where the old single row-chunked fetch took one. Under the
+    // lock, so a parallel gc test of this binary cannot shrink its own
+    // budget into this run, or add its fetches to this count.
     Backend::test_set_gc_body_budget(512);
+    Backend::test_reset_gc_body_fetch_count();
     let dir = tempfile::TempDir::new().unwrap();
     let store = Backend::open_test_shared(dir.path()).unwrap();
     let repo_a = store.write(|c| c.create_repo("gc-a")).unwrap();
