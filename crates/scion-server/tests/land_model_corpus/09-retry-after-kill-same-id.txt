@@ -1,0 +1,5 @@
+# a kill, then a retry: the retry answers the same land the first call opened
+land 0 0 0 0
+kill
+retry 0 0
+check

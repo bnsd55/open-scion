@@ -1,0 +1,4 @@
+# two calls with the same request key answer the same land
+land 1 0 0 0
+twin 2 0
+check
