@@ -176,13 +176,16 @@ latency() {
 }
 
 note "soaking for $RUN_MINUTES minutes"
+# Every check below, from the du samples in the load loop to the
+# bounds, ORs into this one flag; it starts at 0 once, before the loop.
+fail=0
 mkdir -p "$WORK/read" "$WORK/cancel"
-writers & echo $! > "$WORK/soak-writers.pid"
-readers & echo $! > "$WORK/soak-readers.pid"
-importer & echo $! > "$WORK/soak-importer.pid"
-gcer & echo $! > "$WORK/soak-gcer.pid"
-canceller & echo $! > "$WORK/soak-canceller.pid"
-slow_reader & echo $! > "$WORK/soak-slow.pid"
+loop_bg soak-writers writers
+loop_bg soak-readers readers
+loop_bg soak-importer importer
+loop_bg soak-gcer gcer
+loop_bg soak-canceller canceller
+loop_bg soak-slow slow_reader
 
 : > "$WORK/metrics.csv"
 : > "$WORK/metrics-store.csv"
@@ -197,17 +200,17 @@ while [ "$(date +%s)" -lt "$END" ]; do
 $(sed -n 1p "$WORK/last.sample" | cut -d, -f2),$(latency)" >> "$WORK/metrics.csv"
   # The store's size on disk, next to the RSS it may share a cause with:
   # files a leak of disk would grow, and what Ben's run-length decision
-  # needs (issue #239).
-  du -sk "$WORK/server" | awk -v e="$now" '{ print e "," $1 }' \
-    >> "$WORK/metrics-store.csv"
+  # needs (issue #239). du_sample keeps the size through the server's
+  # temp-file churn (its vanished-file errors) and fails on anything
+  # else, including a sample that reads nothing.
+  du_sample "$WORK/metrics-store.csv" "$WORK/server" "$now" || fail=1
   if [ -z "$warm_rss" ] && [ $((now - T0)) -ge "$SOAK_WARM_SECONDS" ]; then
     warm_rss=$rss
   fi
   sleep 10
 done
 # The writers stop at the end: bench has no time limit of its own.
-pkill -TERM -P "$(cat "$WORK/soak-writers.pid")" 2> /dev/null || true
-kill "$(cat "$WORK/soak-writers.pid")" 2> /dev/null || true
+stop soak-writers
 sleep 2
 
 # The artifacts go where the workflow finds them, right after the run and
@@ -302,6 +305,17 @@ fi
 row "store size first -> last" "$(sed -n 1p "$WORK/metrics-store.csv" | cut -d, -f2) KB -> \
 $(tail -n 1 "$WORK/metrics-store.csv" | cut -d, -f2) KB"
 row "p99 early -> late" "${early:-?} ms -> ${late:-?} ms"
+# The backend the run really served, from the data dir, against the
+# one the run asked for (the soak serves the default store): a run
+# asked for one store that got another fails, and the summary names
+# what ran either way. served_backend comes from common.sh.
+asked_backend=sqlite
+served=$(served_backend "$WORK/server")
+row "backend (asked -> data dir)" "$asked_backend -> $served"
+if [ "$served" != "$asked_backend" ]; then
+  echo "FAIL: asked for $asked_backend, the data dir says $served" >&2
+  fail=1
+fi
 [ "${fail:-0}" -eq 0 ] || die "the soak failed its bounds"
 
 stop_scion

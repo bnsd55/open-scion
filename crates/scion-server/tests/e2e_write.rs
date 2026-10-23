@@ -110,11 +110,7 @@ async fn uploaded_file_reads_back_through_a_created_changeset() {
             stopped.await.ok();
         },
     ));
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(&format!("http://{addr}")).await.unwrap();
     let mut client = ScionClient::with_interceptor(channel.clone(), Bearer::new(TOKEN).unwrap());
 
     // More than one chunk, not a multiple of the chunk size, and a period
@@ -195,3 +191,6 @@ async fn uploaded_file_reads_back_through_a_created_changeset() {
     stop.send(()).unwrap();
     server.await.unwrap().unwrap();
 }
+
+#[path = "common/mod.rs"]
+mod common;

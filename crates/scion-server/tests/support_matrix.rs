@@ -2,8 +2,11 @@
 //! a cell marked `supported` must name a job that exists in the
 //! workflow file it names, and that job must run on the cell's OS and
 //! architecture (`runs-on`), with the cell's Postgres major in its
-//! services. A `best effort` or `unsupported` cell must name no job.
-//! The reverse holds too: every CI job that runs a platform suite
+//! services. A `best effort` or `experimental` cell may name the
+//! scheduled job that still runs it — the check then holds that job to
+//! the same platform fit, so a renamed or retargeted scheduled job
+//! fails here too — and an `unsupported` cell must name no job. The
+//! reverse holds too: every CI job that runs a platform suite
 //! (`test*`, `nfs-mount`, `power-loss`) must be claimed by at least one
 //! row, so a renamed job fails here instead of silently leaving the
 //! matrix.
@@ -93,12 +96,14 @@ fn every_supported_cell_runs_natively_and_every_platform_job_is_claimed() {
                 }
                 claimed.push(name);
             }
-            "best effort" | "unsupported" => {
+            "experimental" | "best effort" => {
+                claim_scheduled_job(row, &cell, &jobs, &mut claimed);
+            }
+            "unsupported" => {
                 assert!(
                     row.job.is_none(),
-                    "`{cell}` is {status} but claims a job; only a native job \
-                     makes a cell supported",
-                    status = row.status
+                    "`{cell}` is unsupported but claims a job; only a native job \
+                     makes a cell supported"
                 );
             }
             other => panic!("`{cell}` has an unknown status {other:?}"),
@@ -126,10 +131,14 @@ fn every_supported_cell_runs_natively_and_every_platform_job_is_claimed() {
     }
 }
 
-/// A job of a workflow: its `runs-on` label and its service images.
+/// A job of a workflow: its `runs-on` label, its service images, and
+/// the version list of its strategy matrix (a matrix job's service
+/// image is the expression `${{ matrix.version }}`, which the check
+/// resolves through the list).
 struct Job {
     runs_on: String,
     services: Vec<String>,
+    matrix_versions: Vec<String>,
 }
 
 impl Job {
@@ -150,13 +159,19 @@ impl Job {
         }
     }
 
-    /// Whether a service runs `postgres:<major>`.
+    /// Whether a service runs `postgres:<major>`: a literal image by
+    /// its own version, a matrix image through the job's version list.
     fn runs_postgres(&self, major: &str) -> bool {
-        self.services.iter().any(|image| {
-            image
-                .strip_prefix("postgres:")
-                .is_some_and(|rest| rest.split('.').next() == Some(major))
-        })
+        self.services
+            .iter()
+            .any(|image| match image.strip_prefix("postgres:") {
+                Some(version) if version.contains("matrix.version") => self
+                    .matrix_versions
+                    .iter()
+                    .any(|v| v.split('.').next() == Some(major)),
+                Some(version) => version.split('.').next() == Some(major),
+                None => false,
+            })
     }
 }
 
@@ -171,6 +186,7 @@ fn parse_jobs(text: &str) -> Vec<(String, Job)> {
     let mut key: Option<String> = None;
     let mut runs_on: Option<String> = None;
     let mut matrix_oses: Vec<String> = Vec::new();
+    let mut matrix_versions: Vec<String> = Vec::new();
     let mut services: Vec<String> = Vec::new();
     let mut in_services = false;
     for line in text.lines() {
@@ -198,6 +214,7 @@ fn parse_jobs(text: &str) -> Vec<(String, Job)> {
                     name,
                     runs_on.take(),
                     &mut matrix_oses,
+                    &mut matrix_versions,
                     &mut services,
                 );
             }
@@ -214,14 +231,26 @@ fn parse_jobs(text: &str) -> Vec<(String, Job)> {
                 "services" => in_services = true,
                 "image" if in_services => services.push(v.trim().trim_matches('\'').to_owned()),
                 "os" if v.trim().starts_with('[') => {
-                    matrix_oses = v
-                        .trim()
-                        .trim_start_matches('[')
-                        .trim_end_matches(']')
-                        .split(',')
-                        .map(|os| os.trim().to_owned())
-                        .filter(|os| !os.is_empty())
-                        .collect();
+                    matrix_oses = list(v);
+                }
+                "version" if v.trim().starts_with('[') => {
+                    matrix_versions = list(v);
+                }
+                // A conditional matrix: the versions the job can run are
+                // the union of the lists its `fromJSON` alternatives
+                // name, so a row that names a major the scheduled list
+                // carries still resolves.
+                "version" if v.contains("fromJSON") => {
+                    let mut versions = Vec::new();
+                    for expr in v.split("fromJSON").skip(1) {
+                        if let (Some(open), Some(close)) = (
+                            expr.find('['),
+                            expr[expr.find('[').unwrap_or(0)..].find(']'),
+                        ) {
+                            versions.extend(list(&expr[open..=open + close]));
+                        }
+                    }
+                    matrix_versions = versions;
                 }
                 _ => {}
             }
@@ -236,10 +265,23 @@ fn parse_jobs(text: &str) -> Vec<(String, Job)> {
             name,
             runs_on.take(),
             &mut matrix_oses,
+            &mut matrix_versions,
             &mut services,
         );
     }
     jobs
+}
+
+/// `[a, b, c]` as its parts.
+fn list(value: &str) -> Vec<String> {
+    value
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .map(|item| item.trim().trim_matches('"').trim_matches('\'').to_owned())
+        .filter(|item| !item.is_empty())
+        .collect()
 }
 
 /// Push one job, or one per strategy-matrix OS when `runs-on` is the
@@ -249,6 +291,7 @@ fn flush(
     name: String,
     runs_on: Option<String>,
     matrix_oses: &mut Vec<String>,
+    matrix_versions: &mut Vec<String>,
     services: &mut Vec<String>,
 ) {
     let Some(runs_on) = runs_on else { return };
@@ -259,6 +302,7 @@ fn flush(
                 Job {
                     runs_on: os.clone(),
                     services: services.clone(),
+                    matrix_versions: matrix_versions.clone(),
                 },
             ));
         }
@@ -268,6 +312,7 @@ fn flush(
             Job {
                 runs_on,
                 services: std::mem::take(services),
+                matrix_versions: std::mem::take(matrix_versions),
             },
         ));
     }
@@ -283,6 +328,40 @@ struct Row {
     status: String,
     job: Option<(String, String)>,
     why: String,
+}
+
+/// A scheduled job may carry a best-effort or experimental cell: the
+/// row names it, and the same platform check holds (the job exists and
+/// runs the cell's OS, architecture and Postgres major). Only a job
+/// that runs per push makes the cell supported, which is a claim of
+/// the support policy, not of this check.
+fn claim_scheduled_job(
+    row: &Row,
+    cell: &str,
+    jobs: &BTreeMap<String, Job>,
+    claimed: &mut Vec<String>,
+) {
+    let Some((file, name)) = &row.job else {
+        return;
+    };
+    let key = format!("{file}:{name}");
+    let job = jobs
+        .get(&key)
+        .unwrap_or_else(|| panic!("`{cell}` names {key}, which no workflow defines"));
+    assert!(
+        job.runs_on_matches(&row.os, &row.arch),
+        "`{cell}` names {key}, which runs on `{}`, not on {} {}",
+        job.runs_on,
+        row.os,
+        row.arch
+    );
+    if let Some(major) = &row.postgres {
+        assert!(
+            job.runs_postgres(major),
+            "`{cell}` names {key}, whose services do not run postgres {major}"
+        );
+    }
+    claimed.push(name.to_owned());
 }
 
 /// The matrix rows of docs/support.md: the table under "## Platform
@@ -344,7 +423,7 @@ fn matrix_rows() -> Vec<Row> {
 /// every shipped binary (server, cache, daemon, scn) is `supported` on
 /// that OS and architecture. A cell the release builds but the matrix
 /// does not back, or a supported cell the release omits, fails here —
-/// so coder1's support-matrix flip (#418) must move both files in one
+/// so the support-matrix flip (#418) must move both files in one
 /// change.
 #[test]
 fn release_cells_are_exactly_the_fully_supported_ones() {
@@ -411,6 +490,7 @@ fn release_cells_are_exactly_the_fully_supported_ones() {
 fn release_cell_of(target: &str) -> Option<(&'static str, &'static str)> {
     match target {
         "x86_64-unknown-linux-gnu" => Some(("Linux", "x64")),
+        "aarch64-unknown-linux-gnu" => Some(("Linux", "arm64")),
         "aarch64-apple-darwin" => Some(("macOS", "arm64")),
         "x86_64-pc-windows-msvc" => Some(("Windows", "x64")),
         _ => None,

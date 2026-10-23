@@ -19,7 +19,7 @@ use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::read::{
     self, DiffEntry, MAX_DIFF_ENTRIES, MAX_RENAME_CHUNKS, Rename,
 };
-use scion_server::{Backend, Error, test_support::tree};
+use scion_server::{Backend, Error, test_support::seed, test_support::tree};
 use tempfile::TempDir;
 
 const REPO: &str = "r";
@@ -259,35 +259,68 @@ fn graph_queries_across_many_merges_answer() {
     // A ladder: each changeset on main merges a side changeset that
     // branched from main's previous changeset. 20,001 changesets, each a
     // merge or the parent of one, so the walks take every one. With a bound
-    // of 10,000 steps, these queries failed with RESOURCE_EXHAUSTED.
+    // of 10,000 steps, these queries failed with RESOURCE_EXHAUSTED. The
+    // seed is bulk: the test measures the queries, not the seeding.
     let merges = 10_000;
     let (_data, store) = open_store();
     let (main, sides, late, early) = store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
-            let mut put = |parents: Vec<ChangesetId>, message: String| {
-                let cs = Changeset::new(
-                    parents,
-                    author(),
-                    None,
-                    message.into_bytes(),
-                    BTreeMap::new(),
-                )
-                .expect("changeset fits the format");
-                Ok::<_, Error>(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0)
-            };
-            let mut main = vec![put(vec![], "root".into())?];
+            let mut css = vec![
+                Changeset::new(vec![], author(), None, b"root".to_vec(), BTreeMap::new())
+                    .expect("changeset fits the format"),
+            ];
+            let mut main = vec![css[0].encode_with_id().1];
             let mut sides = Vec::new();
             for i in 0..merges {
                 let last = *main.last().unwrap();
-                let side = put(vec![last], format!("side {i}"))?;
-                main.push(put(vec![last, side], format!("merge {i}"))?);
-                sides.push(side);
+                let side = Changeset::new(
+                    vec![last],
+                    author(),
+                    None,
+                    format!("side {i}").into_bytes(),
+                    BTreeMap::new(),
+                )
+                .expect("changeset fits the format");
+                let side_id = side.encode_with_id().1;
+                let merge = Changeset::new(
+                    vec![last, side_id],
+                    author(),
+                    None,
+                    format!("merge {i}").into_bytes(),
+                    BTreeMap::new(),
+                )
+                .expect("changeset fits the format");
+                let merge_id = merge.encode_with_id().1;
+                css.push(side);
+                css.push(merge);
+                main.push(merge_id);
+                sides.push(side_id);
             }
             // Not merged: one from the oldest side changeset, one from root.
-            let late = put(vec![sides[0]], "late".into())?;
-            let early = put(vec![main[0]], "early".into())?;
-            Ok((main, sides, late, early))
+            let late = Changeset::new(
+                vec![sides[0]],
+                author(),
+                None,
+                b"late".to_vec(),
+                BTreeMap::new(),
+            )
+            .expect("changeset fits the format");
+            let early = Changeset::new(
+                vec![main[0]],
+                author(),
+                None,
+                b"early".to_vec(),
+                BTreeMap::new(),
+            )
+            .expect("changeset fits the format");
+            let late_id = late.encode_with_id().1;
+            let early_id = early.encode_with_id().1;
+            css.push(late);
+            css.push(early);
+            let ids = seed::seed_file_less_ladder(c, repo, &css)?;
+            assert_eq!(ids.len(), css.len());
+            Ok((main, sides, late_id, early_id))
         })
         .unwrap();
     let tip = *main.last().unwrap();
@@ -299,8 +332,95 @@ fn graph_queries_across_many_merges_answer() {
         (late, tip, sides[0]),
         (tip, early, main[0]),
     ] {
-        let bases = read::merge_base(&store, REPO, a, b, &later()).unwrap();
-        assert_eq!(bases, [base]);
+        assert_eq!(
+            read::merge_base(&store, REPO, a, b, &later()).unwrap(),
+            [base]
+        );
+    }
+}
+
+/// The bulk seed keeps its promise: a small file-less ladder seeded in
+/// batches answers exactly like the same ladder seeded through the
+/// ordinary write path. The ids match (the encoding is content-bound),
+/// so every query runs on the same pairs; any drift in the bulk rows -
+/// a generation, a jump link, a derived value - shows up here as a
+/// different answer.
+#[test]
+fn the_bulk_seed_answers_like_the_ordinary_seed() {
+    let shape = |merges: usize| {
+        let mut css = vec![
+            Changeset::new(vec![], author(), None, b"root".to_vec(), BTreeMap::new())
+                .expect("changeset fits the format"),
+        ];
+        let mut main = vec![css[0].encode_with_id().1];
+        for i in 0..merges {
+            let last = *main.last().unwrap();
+            let side = Changeset::new(
+                vec![last],
+                author(),
+                None,
+                format!("side {i}").into_bytes(),
+                BTreeMap::new(),
+            )
+            .expect("changeset fits the format");
+            let side_id = side.encode_with_id().1;
+            css.push(side);
+            let merge = Changeset::new(
+                vec![last, side_id],
+                author(),
+                None,
+                format!("merge {i}").into_bytes(),
+                BTreeMap::new(),
+            )
+            .expect("changeset fits the format");
+            let merge_id = merge.encode_with_id().1;
+            css.push(merge);
+            main.push(merge_id);
+        }
+        let late = Changeset::new(
+            vec![main[1]],
+            author(),
+            None,
+            b"late".to_vec(),
+            BTreeMap::new(),
+        )
+        .expect("changeset fits the format");
+        let late_id = late.encode_with_id().1;
+        css.push(late);
+        (css, main, late_id)
+    };
+    let ladder = shape(40);
+
+    // The ordinary path: one write per changeset.
+    let (_data, plain) = open_store();
+    plain
+        .write(|c| {
+            let repo = c.create_repo(REPO)?;
+            for cs in &ladder.0 {
+                tree::store_changeset(c, repo, cs, &mut |_| Ok(0))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    // The bulk seed.
+    let (_data, bulk) = open_store();
+    bulk.write(|c| {
+        let repo = c.create_repo(REPO)?;
+        seed::seed_file_less_ladder(c, repo, &ladder.0)?;
+        Ok(())
+    })
+    .unwrap();
+    let tip = *ladder.1.last().unwrap();
+    for (a, b) in [
+        (ladder.0[1].encode_with_id().1, tip),
+        (ladder.1[0], tip),
+        (ladder.2, tip),
+        (tip, ladder.1[0]),
+    ] {
+        let answer = |store: &Backend| read::is_ancestor(store, REPO, a, b, &later()).unwrap();
+        assert_eq!(answer(&plain), answer(&bulk), "is_ancestor({a}, {b})");
+        let bases = |store: &Backend| read::merge_base(store, REPO, a, b, &later()).unwrap();
+        assert_eq!(bases(&plain), bases(&bulk), "merge_base({a}, {b})");
     }
 }
 
@@ -1170,11 +1290,13 @@ fn queries_check_the_repo_and_the_changesets() {
 
 /// Section 9 of `docs/architecture.md` lists the deliberate shortcuts, and
 /// the code marks each one with a `SHORTCUT` marker. This pins the table to
-/// the code: a row names files, and for every file the rows that name it
-/// are as many as its markers, one row per marker. A row that names two
-/// files counts once for each. So a PR that removes or adds a shortcut, or
-/// one of its markers, must update the table. The markers are counted in
-/// the sources of the crates (`src`), not in their tests.
+/// the code: one row per marker, everywhere the code marks one -- a
+/// crate's sources and its tests, every script under `scripts/`, and
+/// every workflow file under `.github/workflows/`. A marker with no
+/// row, or a row whose file has no marker, fails the suite. The pull
+/// request template names `SHORTCUT:` as a checklist item; it is prose,
+/// not a marker, and nothing scans it. This file holds marker strings
+/// of its own as check text; the scanner skips this file for that.
 #[test]
 fn the_shortcut_table_matches_the_markers() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1189,39 +1311,59 @@ fn the_shortcut_table_matches_the_markers() {
         .expect("section 9 of docs/architecture.md");
     let section = section.split("## 10.").next().unwrap();
 
-    // The files of each row: the backticked paths that name a file under
-    // `crates/`, as `scion-server/src/land.rs` does. A row holds 4 cells,
-    // so a row merged with the next one by a lost line break fails here.
-    let mut rows: Vec<(String, Vec<String>)> = Vec::new();
+    // The file of each row: the backticked path in the first cell, any
+    // file the shortcuts live in -- a crate's `.rs` source or test, a
+    // script, a workflow. A row holds 8 cells, so a row merged with the
+    // next one by a lost line break fails here. The risk class cell is
+    // one of the three, and no cell is empty.
+    let mut rows: Vec<(String, String)> = Vec::new();
     for line in section.lines().filter(|line| line.starts_with("| `")) {
         let cells: Vec<&str> = line.split('|').collect();
-        assert_eq!(cells.len(), 6, "a row of the table holds 4 cells: {line}");
-        let named: Vec<String> = cells[1]
+        assert_eq!(cells.len(), 10, "a row of the table holds 8 cells: {line}");
+        let file = cells[1]
             .split('`')
-            .filter(|token| {
-                token.contains("src/")
-                    && Path::new(token)
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+            .find(|token| {
+                Path::new(token)
+                    .extension()
+                    .is_some_and(|ext| matches!(ext.to_str(), Some("rs" | "sh" | "yml")))
             })
-            .map(str::to_owned)
-            .collect();
-        assert!(!named.is_empty(), "a row names a file: {line}");
-        rows.push((line.to_owned(), named));
+            .unwrap_or_else(|| panic!("a row names a file: {line}"))
+            .to_owned();
+        let class = cells[3].trim();
+        assert!(
+            matches!(class, "must-replace" | "bounded" | "out-of-profile"),
+            "`{file}`: a row's risk class is one of the three: {line}"
+        );
+        for cell in [cells[2], cells[4], cells[5], cells[6], cells[7], cells[8]] {
+            assert!(!cell.trim().is_empty(), "`{file}`: an empty cell: {line}");
+        }
+        rows.push((line.to_owned(), file));
     }
     assert!(!rows.is_empty(), "the table has rows");
 
-    // Every file under `crates/` with markers, and how many it has.
+    // Every file with markers, and how many it has. The scan covers the
+    // crates (sources and tests), the scripts, and the workflows. This
+    // file's own marker strings are check text; the scanner skips this
+    // file for that.
     let mut marked: HashMap<String, usize> = HashMap::new();
-    let mut stack = vec![root.join("crates")];
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "rs")
-                && !path.components().any(|part| part.as_os_str() == "tests")
-            {
+    for top in ["crates", "scripts", ".github/workflows"] {
+        let mut stack = vec![root.join(top)];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let is_scanned = path
+                    .extension()
+                    .is_some_and(|ext| matches!(ext.to_str(), Some("rs" | "sh" | "yml")));
+                let is_self = path
+                    .strip_prefix(&root)
+                    .is_ok_and(|rel| rel.ends_with("scion-server/tests/query.rs"));
+                if !is_scanned || is_self {
+                    continue;
+                }
                 let text = fs::read_to_string(&path).unwrap();
                 let markers = text
                     .lines()
@@ -1229,31 +1371,28 @@ fn the_shortcut_table_matches_the_markers() {
                     .count();
                 if markers > 0 {
                     let rel = path
-                        .strip_prefix(root.join("crates"))
+                        .strip_prefix(&root)
                         .unwrap()
                         .to_str()
                         .unwrap()
                         .to_owned();
-                    marked.insert(rel, markers);
+                    *marked.entry(rel).or_insert(0) += markers;
                 }
             }
         }
     }
     assert!(!marked.is_empty(), "the code has markers");
 
-    for (_, named) in &rows {
-        for file in named {
-            fs::read_to_string(root.join("crates").join(file))
-                .unwrap_or_else(|_| panic!("{file} does not exist, but the table lists it"));
-        }
+    // Every file a row names exists.
+    for (_, file) in &rows {
+        fs::read_to_string(root.join(file))
+            .unwrap_or_else(|_| panic!("{file} does not exist, but the table lists it"));
     }
     // Every file with markers, and every file a row names, once per marker
     // and once per row that names it.
     let mut named: HashMap<String, usize> = HashMap::new();
-    for (_, files) in &rows {
-        for file in files {
-            *named.entry(file.clone()).or_insert(0) += 1;
-        }
+    for (_, file) in &rows {
+        *named.entry(file.clone()).or_insert(0) += 1;
     }
     let files: HashSet<String> = marked.keys().chain(named.keys()).cloned().collect();
     for file in &files {

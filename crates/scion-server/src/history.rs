@@ -180,13 +180,16 @@ type Node = BTreeMap<PathElem, Entry>;
 /// The history tree of a changeset, as the ID of its root node.
 pub struct PathHistory;
 
+use crate::derived::DeriveReport;
+
 /// Derives the path history of `cs`, and removes the rows of older
-/// versions. Returns the kind's name for the `derive` command's report.
+/// versions. Returns the kind's name and the counts the `derive`
+/// command's report carries.
 ///
 /// # Errors
 ///
-/// Errors of the `derived` fill, and of the final flush.
-pub fn backfill_path_history(store: &Backend, repo: &str, cs: ChangesetId) -> Result<&'static str> {
+/// Errors of the derived fill, and of the final flush.
+pub fn backfill_path_history(store: &Backend, repo: &str, cs: ChangesetId) -> Result<DeriveReport> {
     crate::derived::backfill::<PathHistory>(store, repo, cs)
 }
 
@@ -1008,6 +1011,25 @@ mod tests {
         assert!(matches!(page, Err(Error::DeadlineExceeded(_))), "{page:?}");
     }
 
+    /// A `Log` page checks its deadline before its first entry and then
+    /// once per [`read::DEADLINE_EVERY`] entries, with a path and without:
+    /// a check reads the clock, a system call on a host whose clocksource
+    /// has no user-space read.
+    #[test]
+    fn a_log_page_reads_the_clock_once_per_few_entries() {
+        let (_dir, store, repo) = open();
+        let steps: &[(&str, bool)] = &[("d/f", true)];
+        let ids = store_chain(&store, repo, None, &[steps; 40], true);
+        let tip = *ids.last().unwrap();
+        let checks = 40_usize.div_ceil(read::DEADLINE_EVERY);
+        for p in [None, Some(path("d/f"))] {
+            crate::deadline::CHECKS.set(0);
+            let page = read::log_page(&store, "r", tip, p.as_ref(), 40, &later()).unwrap();
+            assert_eq!(page.entries.len(), 40, "{p:?}");
+            assert_eq!(crate::deadline::CHECKS.get(), checks, "{p:?}");
+        }
+    }
+
     /// A land's check over many paths gives the same answer with a tiny
     /// cache cap as with none: clearing the cache costs re-reads, never
     /// the answer. The capped cache never holds more than the cap plus
@@ -1388,7 +1410,7 @@ mod tests {
         // A changeset that no ref points to gets its path history when it is
         // written, because its parent has one.
         let draft = changeset(Some(main[1]), &[("a", Some(blob))]);
-        let draft = write::create_changeset(&store, "r", &draft.encode()).unwrap();
+        let draft = write::create_changeset(&store, "r", &draft.encode(), &later()).unwrap();
         assert!(
             store
                 .read(|c| derived::load::<PathHistory>(c, draft))
@@ -1412,7 +1434,7 @@ mod tests {
             store.blobs().put(i.as_bytes()).unwrap();
         }
         let draft = changeset(Some(old[2]), &[("y", Some(blob))]);
-        let draft = write::create_changeset(&store, "r", &draft.encode()).unwrap();
+        let draft = write::create_changeset(&store, "r", &draft.encode(), &later()).unwrap();
         let stored = |cs| store.read(|c| derived::load::<PathHistory>(c, cs)).unwrap();
         assert!(stored(draft).is_none(), "its parent has none");
         let commits = store.commits();

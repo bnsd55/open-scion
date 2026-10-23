@@ -4,6 +4,19 @@
 #
 #   scripts/merge-changelog.sh v0.1.0
 #
+# With --check instead of a release, it applies the fragment rules and
+# changes nothing: every changes/<slug>.<section>.md is read, and a
+# fragment that the merge would turn into a broken changelog row fails
+# with its file name and the broken rule. The rules:
+#
+#   - the name is <slug>.<section>.md, where the section is one of
+#     added, changed, fixed, security, and neither half holds
+#     whitespace;
+#   - the file is not empty;
+#   - the content is plain text: no front-matter preamble (the first
+#     line is not "---"), no line that starts with a row marker ("- ")
+#     or with whitespace, which the merge would keep in the row.
+#
 # Every changes/<slug>.<section>.md becomes a "- " row at the top of the
 # matching `### <Section>` under `## [<release>]`; a subsection that does
 # not exist yet is created at the end of the release's block, in the
@@ -12,10 +25,35 @@
 set -euo pipefail
 
 if [ "$#" -ne 1 ]; then
-    echo "usage: scripts/merge-changelog.sh <release>   e.g. v0.1.0" >&2
+    echo "usage: scripts/merge-changelog.sh [--check] <release>   e.g. v0.1.0" >&2
     exit 2
 fi
-release=$1
+
+# --check: the fragment rules, nothing merged. The same rules the merge
+# relies on, from one place, so a fragment the release script refuses
+# fails CI on its own PR instead of the release refresh.
+if [ "$1" = "--check" ]; then
+    check=1
+    release=CHECK
+    # A file in changes/ that no section's find matches never merges and
+    # is never deleted: the release silently drops it. Refuse it here.
+    known=$(find changes -maxdepth 1 -type f \( -name '*.added.md' \
+        -o -name '*.changed.md' -o -name '*.fixed.md' \
+        -o -name '*.security.md' \) | wc -l | tr -d ' ')
+    all=$(find changes -maxdepth 1 -type f -name '*.md' | wc -l | tr -d ' ')
+    if [ "$known" -ne "$all" ]; then
+        find changes -maxdepth 1 -type f -name '*.md' \! \( -name '*.added.md' \
+            -o -name '*.changed.md' -o -name '*.fixed.md' \
+            -o -name '*.security.md' \) |
+            while IFS= read -r stray; do
+                echo "fragment's section is not one of added, changed, fixed, security: $stray" >&2
+            done
+        exit 1
+    fi
+else
+    check=
+    release=$1
+fi
 changelog=CHANGELOG.md
 frag_dir=changes
 
@@ -55,6 +93,26 @@ for section in added changed fixed security; do
             exit 1
             ;;
         esac
+        if [ -n "$check" ]; then
+            if [ ! -s "$fragment" ]; then
+                echo "fragment is empty: $fragment" >&2
+                exit 1
+            fi
+            if [ "$(head -n 1 "$fragment")" = "---" ]; then
+                echo "fragment starts with front matter ('---'); it is plain text: $fragment" >&2
+                exit 1
+            fi
+            # The first line becomes the row, so whitespace or a row
+            # marker on it would double ("- - x" or an indented row).
+            # Later lines may carry a nested bullet ("- ") or an indent,
+            # which the merge keeps inside the row, as the landed
+            # fragments write them.
+            if head -n 1 "$fragment" | grep -qn '^\([[:space:]]\|- \)'; then
+                echo "fragment's first line starts with whitespace or a row marker ('- '); it is plain text: $fragment" >&2
+                exit 1
+            fi
+            continue
+        fi
         # A fragment is plain text: no row marker, no indent. The row
         # marker goes on the first line, and every later line takes the
         # row's two-space indent, as today's changelog rows read.

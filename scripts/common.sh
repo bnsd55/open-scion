@@ -60,10 +60,65 @@ need() {
   [ -x /usr/bin/time ] || die "needs /usr/bin/time (Debian, Ubuntu: apt install time)"
 }
 
+# kib_per_1k START END LANDS: the growth in KiB per 1,000 lands, from
+# the lands that actually happened, not the lands a plan asked for.
+# A cell whose counter grew by 0 has no per-land growth: it prints "-"
+# rather than a division by zero or a number the plan invented.
+kib_per_1k() {
+  local start=$1 end=$2 lands=$3
+  if [ "$lands" -gt 0 ]; then
+    echo $(( (end - start) * 1000 / lands ))
+  else
+    echo "-"
+  fi
+}
+
+# served_backend DATA_DIR: what the store the server ran on really is,
+# read from the data directory. backend.rs writes the `backend` marker
+# only for Postgres, so no marker file means SQLite; a marker file with
+# any other first line is damage, not SQLite, and reads as unknown:<line>
+# — the caller fails on it rather than passing a damaged store off as
+# either backend (#561 review F3).
+served_backend() {
+  local dir=$1 line f="$1/backend"
+  [ -f "$f" ] || { echo sqlite; return 0; }
+  line=$(head -n 1 "$f" 2> /dev/null || true)
+  case $line in
+    postgres) echo postgres ;;
+    *) echo "unknown:$line" ;;
+  esac
+}
+
+# du_sample CSV DATA_DIR NOW: append the store's size as `NOW,size`.
+# du walks the live store: a temp file the server makes and deletes
+# while du reads vanishes, du reports it on stderr and exits 1 (the
+# 10-19 and 10-20 nightly failures, #561). A vanished file is churn,
+# not a failure: the size stands. Any other du complaint, or a du that
+# printed no size at all (a sample that reads nothing), fails the run.
+du_sample() {
+  local csv=$1 dir=$2 now=$3 err="$WORK/.du.err" size
+  size=$(du -sk "$dir" 2> "$err") || {
+    grep -v 'No such file or directory' "$err" > "$err.flt" || true
+    if [ -s "$err.flt" ]; then
+      cat "$err.flt" >&2
+      echo "FAIL: du failed reading $dir" >&2
+      return 1
+    fi
+  }
+  if [ -z "$size" ]; then
+    echo "FAIL: du printed no size for $dir: the sample reads nothing" >&2
+    return 1
+  fi
+  printf '%s,%s\n' "$now" "$(printf '%s' "$size" | cut -f1)" >> "$csv"
+}
+
 # make_work NAME: makes $WORK, and arranges for cleanup on exit.
 make_work() {
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/scion-$1.XXXXXX")
-  trap cleanup EXIT
+  # The owned processes go first: on INT and TERM the shell exits, and
+  # the EXIT trap stops what the script owns before the work directory
+  # goes away.
+  trap 'owned_cleanup; cleanup' EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 143' TERM
@@ -111,6 +166,9 @@ fetch_dataset() {
 # sets $COMMITS. Its times are in $WORK/import.log.
 import_dataset() {
   note "importing"
+  # D25: the server refuses a missing data directory; create it here.
+  mkdir -p "$WORK/server"
+  chmod 700 "$WORK/server"
   /usr/bin/time -p "$BIN/scion-server" --data "$WORK/server" import --rev main "$WORK/src.git" \
     > "$WORK/import.out" 2> "$WORK/import.log" || {
     tail -n 20 "$WORK/import.log" >&2
@@ -120,34 +178,236 @@ import_dataset() {
   COMMITS=$(sed -n 's/^imported [0-9]* of \([0-9]*\) commits.*/\1/p' "$WORK/import.out")
 }
 
-# start NAME READY CMD...: runs CMD under /usr/bin/time -p, with its output in
-# $WORK/NAME.log, and waits until that log shows READY.
+# start NAME READY CMD...: runs CMD in its own process group, with its
+# output in $WORK/NAME.log, and waits until that log shows READY. The
+# group, the pid and the command line go into $WORK/owned/NAME, and the
+# script's exit traps stop the group: a script that dies by error,
+# interrupt or timeout leaves no server behind it. (The orphans that
+# ran for hours were servers with no one left to stop them.)
 start() {
-  local name=$1 ready=$2 tries=300 pid
+  local name=$1 ready=$2 tries=300 pid job
   shift 2
-  /usr/bin/time -p "$@" > "$WORK/$name.log" 2>&1 &
-  pid=$!
-  echo "$pid" > "$WORK/$name.pid"
+  mkdir -p "$WORK/owned"
+  # The layout: the job ($!, a child of this shell) runs
+  # /usr/bin/time; time forks the wrapper perl, which puts itself in a
+  # group of its own — the group id is the wrapper's pid — and execs
+  # the program. The group holds the program alone; time stays in this
+  # shell's group, which is why stop waits on the job: it is what
+  # makes time's report land in the log before stop returns.
+  OWNED_INFO="$WORK/.owned.$name" OWNED_CMD="$*" \
+    /usr/bin/time -p perl -e '
+      use POSIX qw(setpgid);
+      setpgid(0, 0) or die "setpgid: $!\n";
+      open(my $fh, ">", $ENV{OWNED_INFO}) or die "record: $!\n";
+      print $fh "pid=$$\npgid=", getpgrp(0), "\n";
+      close $fh;
+      exec @ARGV or die "exec: $!\n";
+    ' -- "$@" > "$WORK/$name.log" 2>&1 &
+  job=$!
+  tries=0
+  while [ ! -s "$WORK/.owned.$name" ] && [ "$tries" -lt 50 ]; do
+    kill -0 "$job" 2> /dev/null || break
+    sleep 0.1
+    tries=$((tries + 1))
+  done
+  # The record: pid and pgid from perl (the group itself), the program
+  # name and the command line from the shell. A job that died before it
+  # recorded is recorded as the shell saw it; the readiness loop below
+  # fails the start either way.
+  if [ -s "$WORK/.owned.$name" ]; then
+    { cat "$WORK/.owned.$name"; echo "job=$job"; echo "cmd=$*"; } \
+      > "$WORK/owned/$name"
+  else
+    { echo "pid=$job"; echo "pgid="; echo "job=$job"; echo "cmd=$*"; } \
+      > "$WORK/owned/$name"
+  fi
+  rm -f "$WORK/.owned.$name"
+  pid=$job
+  # Its own counter: the record loop above runs down its own budget.
+  # SHORTCUT: nothing sweeps a pidfile left by a script that died by
+  # SIGKILL — the trap cannot run then. The janitor sweep is the named
+  # upgrade path if stale servers show up.
+  tries_ready=300
   while ! grep -q "$ready" "$WORK/$name.log"; do
     if ! kill -0 "$pid" 2> /dev/null; then
       tail -n 20 "$WORK/$name.log" >&2
-      rm -f "$WORK/$name.pid"
+      rm -f "$WORK/owned/$name"
       die "$name did not start"
     fi
-    tries=$((tries - 1))
-    [ "$tries" -gt 0 ] || die "$name did not start within 30 s"
+    tries_ready=$((tries_ready - 1))
+    [ "$tries_ready" -gt 0 ] || die "$name did not start within 30 s"
     sleep 0.1
   done
 }
 
-# stop NAME: stops what `start NAME` started. Its times are then in its log.
+# Out of scope, said where a reader would look for it: a job that calls
+# setsid leaves its group and survives every stop here. Nothing in this
+# repository starts one.
+
+# owned_kill PID PGID: stop one owned job. With a group, TERM the group
+# and KILL it after five seconds; without one, TERM the pid and its
+# children. Either way the caller has already checked the pidfile.
+owned_kill() {
+  local pid=$1 pgid=$2
+  if [ -n "$pgid" ]; then
+    kill -TERM "-$pgid" 2> /dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$pid" 2> /dev/null || return 0
+      sleep 0.5
+    done
+    kill -KILL "-$pgid" 2> /dev/null || true
+  else
+    kill -TERM "$pid" 2> /dev/null || true
+    pkill -TERM -P "$pid" 2> /dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$pid" 2> /dev/null || return 0
+      sleep 0.5
+    done
+    kill -KILL "$pid" 2> /dev/null || true
+    pkill -KILL -P "$pid" 2> /dev/null || true
+  fi
+}
+
+# owned_cleanup: stop every owned process the script leaves behind.
+# Runs from the exit traps; safe to call twice.
+OWNED_CLEANUP_DONE=
+owned_cleanup() {
+  [ -n "$OWNED_CLEANUP_DONE" ] && return 0
+  OWNED_CLEANUP_DONE=1
+  local f n live
+  [ -n "${WORK:-}" ] && [ -d "$WORK/owned" ] || return 0
+  for f in "$WORK"/owned/*; do
+    [ -e "$f" ] || continue
+    owned_stop_one "$f"
+  done
+  # A member that reparented when its loop shell died is invisible to
+  # the parentage probes in owned_stop_one, but every client this
+  # script raised carries a path under $WORK in its command line (the
+  # socket, the data dir, an output file). Sweep them, bounded: TERM on
+  # the first round, KILL from the second on, each live pid named on
+  # stderr; after 10 rounds name what survived. The rm that follows
+  # cannot lose to a writer it cannot name (#561's rm: Directory not
+  # empty).
+  n=0
+  while [ "$n" -lt 10 ]; do
+    live=$(pgrep -f "$WORK/" 2> /dev/null || true)
+    [ -z "$live" ] && break
+    for pid in $live; do
+      ps -o pid=,comm= -p "$pid" >&2
+    done
+    if [ "$n" -eq 0 ]; then
+      pkill -TERM -f "$WORK/" 2> /dev/null || true
+    else
+      pkill -KILL -f "$WORK/" 2> /dev/null || true
+    fi
+    sleep 0.5
+    n=$((n + 1))
+  done
+  if live=$(pgrep -f "$WORK/" 2> /dev/null) && [ -n "$live" ]; then
+    echo "owned: survivors after the sweep:" >&2
+    for pid in $live; do
+      ps -o pid=,comm= -p "$pid" >&2
+    done
+  fi
+}
+
+# owned_stop_one PIDFILE: the one process one pidfile names. The group
+# is the identity, not a name: a live group holds the recorded id, and
+# the system does not hand out a pid that is still a live group's id,
+# so a recorded group with members is ours whatever program it runs —
+# a wrapper that execed another program is still ours to stop. A
+# record with no group (a function loop) falls back to the pid, and a
+# live pid whose program is not the recorded one is skipped, with a
+# line saying so: silence here is how a skipped cleanup hides.
+#
+# Either way, the kill bounds the leader, not the members: a member
+# that missed the TERM (one only starting as the TERM landed) can
+# still be writing into $WORK while the caller's rm removes it —
+# #561's "rm: Directory not empty". So after the kill, wait, bounded,
+# until the leader, its group and its direct children are all gone,
+# KILL whatever is still live on each round, and only then release
+# the pidfile.
+owned_stop_one() {
+  local f=$1 pid pgid job have n stopped
+  local leader_live=0 group_live=0 children_live=0
+  pid=$(sed -n 's/^pid=//p' "$f")
+  pgid=$(sed -n 's/^pgid=//p' "$f")
+  job=$(sed -n 's/^job=//p' "$f")
+  [ -n "$pid" ] || { rm -f "$f"; return 0; }
+  stopped=
+  if [ -n "$pgid" ] && kill -0 "-$pgid" 2> /dev/null; then
+    owned_kill "$pid" "$pgid"
+    stopped=1
+  elif kill -0 "$pid" 2> /dev/null; then
+    have=$(ps -o comm= -p "$pid" 2> /dev/null)
+    case "$have" in
+      *bash)
+        owned_kill "$pid" ""
+        stopped=1
+        ;;
+      *)
+        echo "owned: skipped $f: pid $pid runs '$have', not what the record names" >&2
+        ;;
+    esac
+  fi
+  # The member wait, only for a record the kill ran on: a skipped
+  # record is not ours, and its pid must not be touched. The kill
+  # bounds the leader, and a member it missed would race the rm that
+  # follows the cleanup. Wait them out, KILL each target only while
+  # its own probe says it is live (the leader may be dead and its
+  # number reused while the group lives), then release the record.
+  [ -n "$stopped" ] || { rm -f "$f"; return 0; }
+  n=0
+  while [ "$n" -lt 10 ]; do
+    leader_live=0
+    group_live=0
+    children_live=0
+    kill -0 "$pid" 2> /dev/null && leader_live=1
+    if [ -n "$pgid" ]; then
+      kill -0 "-$pgid" 2> /dev/null && group_live=1
+    fi
+    pgrep -P "$pid" > /dev/null 2>&1 && children_live=1
+    [ "$leader_live" = 0 ] && [ "$group_live" = 0 ] && [ "$children_live" = 0 ] && break
+    [ "$leader_live" = 1 ] && kill -KILL "$pid" 2> /dev/null
+    [ "$group_live" = 1 ] && kill -KILL "-$pgid" 2> /dev/null
+    [ "$children_live" = 1 ] && pkill -KILL -P "$pid" 2> /dev/null
+    sleep 0.5
+    n=$((n + 1))
+  done
+  if [ "$leader_live" = 1 ] || [ "$group_live" = 1 ] || [ "$children_live" = 1 ]; then
+    echo "owned: $(basename "$f"): pid $pid${pgid:+ group -$pgid} survived the cleanup after 5 s" >&2
+  fi
+  rm -f "$f"
+  wait "$job" 2> /dev/null || true
+}
+
+# loop_bg NAME FUNC ARGS...: runs FUNC in the background as one the
+# script owns, recorded like a `start`ed server. A loop is the script's
+# own shell, so it has no process group of its own; the pidfile still
+# survives a script that was killed outright, where a janitor sweep can
+# find it. # SHORTCUT: no process group for function loops — bash only
+# grants one to an exec'd program; the upgrade path is a dispatch
+# subcommand the script re-invokes for the loop.
+loop_bg() {
+  local name=$1 pid
+  shift
+  mkdir -p "$WORK/owned"
+  "$@" &
+  pid=$!
+  {
+    echo "pid=$pid"
+    echo "pgid="
+    echo "comm=bash"
+    echo "cmd=loop $name: $*"
+  } > "$WORK/owned/$name"
+}
+
+# stop NAME: stops what `start NAME` started, through its pidfile. Its
+# times are then in its log.
 stop() {
-  local pid
-  pid=$(cat "$WORK/$1.pid")
-  rm -f "$WORK/$1.pid"
-  # /usr/bin/time ignores signals while it waits, so signal its child.
-  pkill -TERM -P "$pid" 2> /dev/null || true
-  wait "$pid" 2> /dev/null || true
+  local name=$1 f="$WORK/owned/$1"
+  [ -e "$f" ] || { rm -f "$WORK/$1.pid" 2> /dev/null; return 0; }
+  owned_stop_one "$f"
 }
 
 # The server, then a cache in front of it, then a daemon in front of the
@@ -157,7 +417,7 @@ stop() {
 # key's public half. The daemon only forwards the tickets.
 start_scion() {
   if [ ! -f "$WORK/ticket.key" ]; then
-    "$BIN/scion-server" ticket-key --out "$WORK/ticket.key" > "$WORK/ticket.pub"
+    "$BIN/scion-server" --data "$WORK/server" ticket-key --out "$WORK/ticket.key" > "$WORK/ticket.pub"
   fi
   start server serving "$BIN/scion-server" --data "$WORK/server" serve \
     --listen "127.0.0.1:$SERVER_PORT" \
@@ -336,4 +596,16 @@ cpu() { awk '($1 == "user" || $1 == "sys") && NF == 2 { s += $2 } END { printf "
 # the find(1) tests.
 file_bytes() {
   find "$@" -type f -exec wc -c {} + | awk '$2 != "total" { s += $1 } END { print s + 0 }'
+}
+
+# The reader log's outcome counts: the lines the reader loop writes name
+# their event, but not at the line's start, so the greps match the event
+# text anywhere in the line.
+count_reader_timeouts() {
+  [ -f "$1" ] || { echo 0; return; }
+  grep -c "timeout after 60s" "$1" || true
+}
+count_reader_failures() {
+  [ -f "$1" ] || { echo 0; return; }
+  grep -c "checkout failed rc=" "$1" || true
 }

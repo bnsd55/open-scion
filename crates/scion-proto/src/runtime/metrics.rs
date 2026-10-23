@@ -102,7 +102,7 @@ const LANDS: [&str; 14] = [
 /// change a label's meaning. The land handler counts after it builds the
 /// reply's `Status`.
 #[must_use]
-pub fn land_error_label(code: tonic::Code) -> &'static str {
+pub fn code_label(code: tonic::Code) -> &'static str {
     match code {
         tonic::Code::Aborted => "aborted",
         tonic::Code::DeadlineExceeded => "deadline_exceeded",
@@ -1297,6 +1297,31 @@ mod tests {
             }
         }
         assert_eq!(found, RPCS.len(), "the proto has rpcs the table misses");
+    }
+
+    /// The stalled gauge hides until a reply stalls, so the golden of
+    /// the metric surface (`tests/metrics_golden.rs`) cannot exercise
+    /// it: its name, type and label set pin here instead.
+    #[test]
+    fn the_stalled_gauge_renders_once_a_reply_holds_bytes() {
+        let metrics = Metrics::default();
+        assert!(!metrics.render().contains("scion_stalled_reply_bytes"));
+        metrics.stalled_reply_held(512);
+        let text = metrics.render();
+        assert!(
+            text.contains(
+                "# HELP scion_stalled_reply_bytes Bytes that stalled \
+                 replies hold in HTTP/2, as one estimate per stalled reply.\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE scion_stalled_reply_bytes gauge\n"),
+            "{text}"
+        );
+        assert!(text.contains("scion_stalled_reply_bytes 512"), "{text}");
+        metrics.stalled_reply_freed(512);
+        assert!(!metrics.render().contains("scion_stalled_reply_bytes"));
     }
 
     /// The Postgres pool metrics render with their names, units, and the

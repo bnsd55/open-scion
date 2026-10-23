@@ -18,7 +18,7 @@ use crate::db::SqliteTx;
 use crate::error::Result;
 use crate::history::NodeId;
 use crate::land::{LandOutcome, LandRequest, LandState};
-use crate::meta::{FsckDerivedRow, Meta, MetaTx, RefState, RepoChangeset, RepoId};
+use crate::meta::{FsckDerivedRow, Meta, MetaTx, RefState, RepoChangeset, RepoId, StaleLand};
 use crate::pg::{Pg, PgTx};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -62,6 +62,17 @@ impl Backend {
     /// The Postgres handle, when this backend is one. The crate's own
     /// code reads it to tell the one-writer engines apart (a Postgres
     /// database always has one writer; a data directory may be shared).
+    /// The schema versions this open moved, when the open migrated: the
+    /// process that opened records the move in its audit log. A fresh
+    /// open creates the schema and reports none.
+    #[must_use]
+    pub fn migrated(&self) -> Option<(u32, u32)> {
+        match &self.inner {
+            Inner::Sqlite(store) => store.migrated(),
+            Inner::Postgres(pg) => pg.migrated(),
+        }
+    }
+
     pub(crate) fn as_postgres(&self) -> Option<&Pg> {
         match &self.inner {
             Inner::Postgres(pg) => Some(pg),
@@ -222,8 +233,9 @@ fn marker_agrees(data: &Path, uuid: [u8; 16]) -> Result<()> {
         }
         Some(_) => {}
         None => {
-            // A fresh pair, or a marker that predates the UUID: the
-            // database's identity is the one this directory takes, and
+            // A fresh pair, a marker that predates the UUID, or a first
+            // open cut before it wrote the marker: the database's
+            // identity is the one this directory takes, and
             // `write_marker` writes it durable at once.
             write_marker(&marker, uuid)?;
         }
@@ -430,6 +442,26 @@ impl Backend {
             Inner::Postgres(pg) => pg.tx_age(),
         }
     }
+
+    /// Runs `f` so every statement sees one snapshot, as an export's
+    /// sections claim. On Postgres, [`Backend::read`] already runs in one
+    /// REPEATABLE READ transaction. On SQLite, [`Backend::read`] runs each
+    /// statement autocommit, so the snapshot needs an explicit read
+    /// transaction on the reader connection.
+    ///
+    /// # Errors
+    ///
+    /// What `f` returns, or a database error from the transaction's
+    /// begin.
+    pub(crate) fn read_snapshot<T>(
+        &self,
+        f: impl FnOnce(&mut BackendTx<'_>) -> Result<T>,
+    ) -> Result<T> {
+        match &self.inner {
+            Inner::Sqlite(store) => store.read_snapshot(|tx| f(&mut BackendTx::Sqlite(tx))),
+            Inner::Postgres(pg) => pg.read(|tx| f(&mut BackendTx::Postgres(tx.reborrow()))),
+        }
+    }
 }
 
 impl Backend {}
@@ -514,6 +546,40 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn set_changeset_batching(&mut self, on: bool) {
+        match self {
+            Self::Sqlite(tx) => tx.set_changeset_batching(on),
+            Self::Postgres(pg) => pg.set_changeset_batching(on),
+        }
+    }
+
+    fn preload_derived_chain(
+        &mut self,
+        kind: &str,
+        version: u32,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.preload_derived_chain(kind, version, start, limit),
+            Self::Postgres(pg) => pg.preload_derived_chain(kind, version, start, limit),
+        }
+    }
+
+    fn changeset_batching(&self) -> bool {
+        match self {
+            Self::Sqlite(tx) => tx.changeset_batching(),
+            Self::Postgres(pg) => pg.changeset_batching(),
+        }
+    }
+
+    fn flush_changeset_rows(&mut self, repo: RepoId) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.flush_changeset_rows(repo),
+            Self::Postgres(pg) => pg.flush_changeset_rows(repo),
+        }
+    }
+
     fn insert_changeset(&mut self, repo: RepoId, cs: &Changeset) -> Result<ChangesetId> {
         match self {
             Self::Sqlite(tx) => tx.insert_changeset(repo, cs),
@@ -532,6 +598,18 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.has_changeset(repo, id),
             Self::Postgres(pg) => pg.has_changeset(repo, id),
+        }
+    }
+
+    fn first_parent_page(
+        &mut self,
+        repo: RepoId,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, i64, Vec<u8>)>> {
+        match self {
+            Self::Sqlite(tx) => tx.first_parent_page(repo, start, limit),
+            Self::Postgres(pg) => pg.first_parent_page(repo, start, limit),
         }
     }
 
@@ -561,6 +639,16 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.parents(id, id_gen),
             Self::Postgres(pg) => pg.parents(id, id_gen),
+        }
+    }
+
+    fn parents_many(
+        &mut self,
+        merges: &[(ChangesetId, i64)],
+    ) -> Result<Vec<Vec<(ChangesetId, i64)>>> {
+        match self {
+            Self::Sqlite(tx) => tx.parents_many(merges),
+            Self::Postgres(pg) => pg.parents_many(merges),
         }
     }
 
@@ -627,10 +715,24 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn put_trees(&mut self, trees: &[(TreeId, Vec<u8>)]) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.put_trees(trees),
+            Self::Postgres(pg) => pg.put_trees(trees),
+        }
+    }
+
     fn get_tree(&mut self, id: TreeId) -> Result<Tree> {
         match self {
             Self::Sqlite(tx) => tx.get_tree(id),
             Self::Postgres(pg) => pg.get_tree(id),
+        }
+    }
+
+    fn get_trees(&mut self, ids: &[TreeId]) -> Result<Vec<Option<Vec<u8>>>> {
+        match self {
+            Self::Sqlite(tx) => tx.get_trees(ids),
+            Self::Postgres(pg) => pg.get_trees(ids),
         }
     }
 
@@ -655,7 +757,14 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
-    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<(RepoId, i64, String)>> {
+    fn add_repo_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.add_repo_blobs(repo, blobs),
+            Self::Postgres(pg) => pg.add_repo_blobs(repo, blobs),
+        }
+    }
+
+    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<StaleLand>> {
         match self {
             Self::Sqlite(tx) => tx.stale_lands(stale_secs),
             Self::Postgres(pg) => pg.stale_lands(stale_secs),
@@ -716,10 +825,17 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
-    fn stored_changeset_body(&mut self, cs: &[u8]) -> Result<Option<Vec<u8>>> {
+    fn stored_changeset_bodies(&mut self, ids: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         match self {
-            Self::Sqlite(tx) => tx.stored_changeset_body(cs),
-            Self::Postgres(pg) => pg.stored_changeset_body(cs),
+            Self::Sqlite(tx) => tx.stored_changeset_bodies(ids),
+            Self::Postgres(pg) => pg.stored_changeset_bodies(ids),
+        }
+    }
+
+    fn stored_changeset_body_lengths(&mut self, ids: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, i64)>> {
+        match self {
+            Self::Sqlite(tx) => tx.stored_changeset_body_lengths(ids),
+            Self::Postgres(pg) => pg.stored_changeset_body_lengths(ids),
         }
     }
 
@@ -758,6 +874,13 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.delete_repo_blob(repo, blob),
             Self::Postgres(pg) => pg.delete_repo_blob(repo, blob),
+        }
+    }
+
+    fn delete_repo_blobs(&mut self, repo: RepoId, blobs: &[Vec<u8>]) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.delete_repo_blobs(repo, blobs),
+            Self::Postgres(pg) => pg.delete_repo_blobs(repo, blobs),
         }
     }
 
@@ -843,6 +966,13 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn repo_missing_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<Vec<BlobId>> {
+        match self {
+            Self::Sqlite(tx) => tx.repo_missing_blobs(repo, blobs),
+            Self::Postgres(pg) => pg.repo_missing_blobs(repo, blobs),
+        }
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     fn is_ancestor(
         &mut self,
@@ -886,6 +1016,44 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.get_derived(kind, version, cs),
             Self::Postgres(pg) => pg.get_derived(kind, version, cs),
+        }
+    }
+
+    fn get_derived_batch(
+        &mut self,
+        kind: &str,
+        version: u32,
+        ids: &[ChangesetId],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        match self {
+            Self::Sqlite(tx) => tx.get_derived_batch(kind, version, ids),
+            Self::Postgres(pg) => pg.get_derived_batch(kind, version, ids),
+        }
+    }
+
+    fn get_derived_chain(
+        &mut self,
+        kind: &str,
+        version: u32,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, Vec<u8>)>> {
+        match self {
+            Self::Sqlite(tx) => tx.get_derived_chain(kind, version, start, limit),
+            Self::Postgres(pg) => pg.get_derived_chain(kind, version, start, limit),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn bulk_seed(
+        &mut self,
+        repo: RepoId,
+        css: &[scion_core::Changeset],
+        derived: &[(&'static str, u32, ChangesetId, Vec<u8>)],
+    ) -> Result<Vec<ChangesetId>> {
+        match self {
+            Self::Sqlite(tx) => tx.bulk_seed(repo, css, derived),
+            Self::Postgres(pg) => pg.bulk_seed(repo, css, derived),
         }
     }
 
@@ -944,6 +1112,13 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.put_git_import(repo, oid, cs),
             Self::Postgres(pg) => pg.put_git_import(repo, oid, cs),
+        }
+    }
+
+    fn put_git_imports(&mut self, repo: RepoId, pairs: &[(ObjectId, ChangesetId)]) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.put_git_imports(repo, pairs),
+            Self::Postgres(pg) => pg.put_git_imports(repo, pairs),
         }
     }
 

@@ -8,9 +8,15 @@ start with v0.4.
 ## Platform matrix
 
 What runs where, at what confidence. A cell is a component on an OS,
-an architecture, a data filesystem and a Postgres major. The rule of
-the v0.8 gate ([ROADMAP.md](ROADMAP.md)): a cell the matrix marks
-**supported** runs natively in CI — a job of
+an architecture, a data filesystem and a Postgres major. The statuses
+are four: **supported** — a native CI job builds and tests the cell on
+its own platform, every push; **experimental** — tested in CI, but not
+yet recommended for production and not relied on for data-safety
+evidence; **best effort** — a scheduled job (the nightly, or a release
+candidate's dispatch) still runs the cell, but not on every push, and
+nothing depends on it; **unsupported** — nothing runs it and nothing
+is claimed. The rule of the v0.8 gate ([ROADMAP.md](ROADMAP.md)): a
+cell the matrix marks **supported** runs natively in CI — a job of
 [.github/workflows/ci.yml](../.github/workflows/ci.yml) builds and
 tests it on its own platform, every push. Cross-compiling is not
 evidence: a binary built on another platform proves nothing about the
@@ -20,20 +26,24 @@ marked supported here.
 | Component | OS | Arch | Data filesystem | Postgres | Status | CI job | Why |
 |---|---|---|---|---|---|---|---|
 | scion-server | Linux | x64 | ext4 | — | supported | `test` (ci.yml) | The default runner disk; the whole workspace suite runs on it |
-| scion-server | Linux | x64 | ext4 | 17 | supported | `test-postgres` (ci.yml) | The Postgres-backed suite, native `postgres:17.11` service, plus the takeover drill |
+| scion-server | Linux | x64 | ext4 | 16 | experimental | `test-postgres` (ci.yml) | Tested in CI; not yet recommended for production or relied on for data-safety evidence. Runs nightly and on release candidates |
+| scion-server | Linux | x64 | ext4 | 17 | experimental | `test-postgres` (ci.yml) | Tested in CI; not yet recommended for production or relied on for data-safety evidence. The one major that also runs per push, on data-path changes |
+| scion-server | Linux | x64 | ext4 | 18 | experimental | `test-postgres` (ci.yml) | Tested in CI; not yet recommended for production or relied on for data-safety evidence. Runs nightly and on release candidates |
+| scion-server | Linux | x64 | ext4 | 15 | unsupported | — | Upstream supports 15 until November 2027, but the project does not claim it yet; one matrix line adds it when an operator asks |
 | scion-server | Linux | x64 | tmpfs | — | supported | `test` (ci.yml) | The `disk_full` step fills a real tmpfs (`SCION_DISK_REQUIRE=1`) |
-| scion-server | Linux | arm64 | ext4 | — | best effort | — | The code has no arch pins, but no native job runs it yet; hosted `ubuntu-24.04-arm` is free for public repos |
-| scion-server | Linux | arm64 | ext4 | 17 | best effort | — | Same: the arm64 job lands before this cell claims supported |
+| scion-server | Linux | arm64 | ext4 | — | best effort | `test-arm64` (ci.yml) | The arm64 suite runs nightly and on release candidates, not per push; the cell is best effort until v0.8, and the Linux arm64 binaries return with the v0.8 support wave |
+| scion-server | Linux | arm64 | ext4 | 17 | best effort | — | No job runs Postgres on arm64; the Postgres-backed arm64 run comes with the Postgres-major wave |
+| scion-server | Linux | x64 | xfs | — | best effort | `test-xfs` (ci.yml) | Every store the server suite opens lands on a real xfs loop device (TMPDIR); the job runs nightly and on release candidates, not per push |
 | scion-server | macOS | arm64 | APFS | — | supported | `test-macos` (ci.yml) | Native `macos-15` runner, full workspace suite; the runner's disk is APFS |
 | scion-server | Windows | x64 | any | — | unsupported | — | No job builds or tests it; the lock files and paths assume POSIX. Unsupported until a native job exists |
 | scion-cache | Linux | x64 | memory | — | supported | `test` (ci.yml) | The suite covers the tier crate; objects live in memory |
-| scion-cache | Linux | arm64 | memory | — | best effort | — | No native job yet |
+| scion-cache | Linux | arm64 | memory | — | best effort | `test-arm64` (ci.yml) | The suite covers the tier crate on arm64; the job runs nightly and on release candidates |
 | scion-cache | macOS | arm64 | memory | — | supported | `test-macos` (ci.yml) | The suite covers the tier crate |
 | scion-daemon | Linux | x64 | local disk | — | supported | `test` (ci.yml) | The suite covers the tier crate; the daemon's power-cut evidence is the `power-loss` job (LazyFS fault injection, a harness — not a filesystem promise) |
-| scion-daemon | Linux | arm64 | local disk | — | best effort | — | No native job yet |
+| scion-daemon | Linux | arm64 | local disk | — | best effort | `test-arm64` (ci.yml) | The suite covers the tier crate on arm64; the job runs nightly and on release candidates; the power-cut evidence stays on x64 (`power-loss`) |
 | scion-daemon | macOS | arm64 | local disk (APFS) | — | supported | `test-macos` (ci.yml) | The suite covers the tier crate |
 | scn | Linux | x64 | any | — | supported | `test` (ci.yml) | The CLI suite runs in the workspace job |
-| scn | Linux | arm64 | any | — | best effort | — | No native job yet |
+| scn | Linux | arm64 | any | — | best effort | `test-arm64` (ci.yml) | The CLI suite runs in the arm64 job, which runs nightly and on release candidates |
 | scn | macOS | arm64 | any | — | supported | `test-macos` (ci.yml) | The CLI suite runs in the macOS job; the runner's disk is APFS |
 | scn mount | Linux | x64 | NFS | — | supported | `nfs-mount` (ci.yml) | The kernel NFS client mounts scn's server on the runner |
 | scn mount | macOS | arm64 | NFS | — | best effort | — | macOS can mount NFS, but no job proves it |
@@ -44,12 +54,19 @@ labels this table names are checked against the workflows by a test,
 `support_matrix` in `crates/scion-server/tests/`, the same way
 [stability.md](stability.md)'s promises are pinned. A cell flips to
 supported only when its native job exists; the test fails while a
-supported row's job is missing, mismatched, or gone.
+supported row's job is missing, mismatched, or gone. A best-effort or
+experimental row may name the scheduled job that still runs it — the
+test checks that the named job exists — and flips to supported only
+when that job runs the cell per push.
 
-Postgres majors are promised per cell, not as a family: the server
-answers on the majors the `test-postgres` job runs (17 today), and
-adding a major is one service line plus its suite minutes — the cell
-row is added when the job runs it.
+Postgres majors are promised per cell, not as a family. Every Postgres
+cell is **experimental** in v0.1.0: tested in CI, but not yet
+recommended for production or relied on for data-safety evidence —
+SQLite is the backend the alpha builds its evidence on. The
+`test-postgres` job runs Postgres 17 per push (on data-path changes),
+and all three supported-upstream majors (16, 17, 18) nightly and on
+release candidates; adding a major is one service line plus its suite
+minutes — the cell row is added when the job runs it.
 
 ## Severity levels
 
