@@ -45,6 +45,7 @@ use crate::error::{Error, Result};
 use crate::graph::{self, CommitGraph};
 use crate::history::{self, PathHistory};
 use crate::meta::Meta as _;
+use crate::meta::StaleLand;
 use crate::meta::{MetaTx, RefState, RepoId};
 use crate::tree;
 
@@ -172,6 +173,11 @@ pub struct LandOutcome {
 /// Per-ref state, guarded by the ref's lock.
 type RefSlot = Arc<Mutex<Option<PathIndex>>>;
 
+/// The test step the settle runs after it recorded the land in the
+/// index: it sees the index, and runs under the slot's lock.
+#[cfg(test)]
+type AfterRecord = Box<dyn FnOnce(&mut Option<PathIndex>) + Send>;
+
 /// Serializes lands per ref and keeps each ref's `PathIndex`.
 pub struct Lands {
     /// The most pending lands one principal may hold at once. `None` turns
@@ -195,6 +201,11 @@ pub struct Lands {
     /// for certain, where a timed race depends on the machine.
     #[cfg(test)]
     before_settle: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// A step the tests run inside the slot's critical section, right
+    /// after the land recorded its outcome in the index, once: a test
+    /// poisons the slot there, where the panic unwinds through its lock.
+    #[cfg(test)]
+    after_record: Mutex<Option<AfterRecord>>,
 }
 
 impl Default for Lands {
@@ -220,6 +231,8 @@ impl Lands {
             metrics,
             #[cfg(test)]
             before_settle: Mutex::new(None),
+            #[cfg(test)]
+            after_record: Mutex::new(None),
         }
     }
 
@@ -228,6 +241,17 @@ impl Lands {
     fn set_before_settle(&self, step: Box<dyn FnOnce() + Send>) {
         *self
             .before_settle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(step);
+    }
+
+    /// Sets the step the next settle runs after it recorded the land in
+    /// the ref's index, once. The step runs while the slot's lock is
+    /// still held, so a panic there poisons it.
+    #[cfg(test)]
+    fn set_after_record(&self, step: AfterRecord) {
+        *self
+            .after_record
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(step);
     }
@@ -254,15 +278,32 @@ impl Lands {
     /// pending under it. A row rejected here has no live call: the 600 s
     /// call limit ended long before, and a retry that had the lock would
     /// have finished the land.
-    pub fn sweep_stale(&self, store: &Backend, stale_secs: i64) -> Result<u64> {
+    ///
+    /// The sweep writes the land's result line itself: the job that would
+    /// have written it is long gone, and every intent line gets one result
+    /// line, so the audit never holds an intent that nothing answers.
+    pub fn sweep_stale(
+        &self,
+        store: &Backend,
+        stale_secs: i64,
+        audit: &crate::audit::Audit,
+    ) -> Result<u64> {
         let stale = store.read(|c| c.stale_lands(stale_secs))?;
         let mut rejected = 0;
-        for (repo, land_id, target_ref) in stale {
+        for StaleLand {
+            repo,
+            land_id,
+            target_ref,
+            caller,
+            request_key,
+            repo_name,
+        } in stale
+        {
             // The same per-ref lock that the land path holds, so a retry
             // that is finishing this land wins the race: the sweep then
             // finds the row no longer pending, and leaves it alone.
             let slot = self.slot(repo, &target_ref);
-            let index = slot.lock().unwrap_or_else(PoisonError::into_inner);
+            let index = Self::lock_slot(repo, &target_ref, &slot);
             let detail = format!(
                 "stale: pending for more than {stale_secs} s, so the server stopped \
                      before it finished; retry with a new request key"
@@ -273,6 +314,32 @@ impl Lands {
             rejected += changed;
             if changed == 1 {
                 tracing::info!(land_id, "rejected a stale pending land");
+                // The intent's request id is the call's and is not
+                // stored, so this line carries a fresh id of its own:
+                // the auditor joins it to the intent on the request key
+                // and the land id (both in the line), not on request_id.
+                if let Err(why) = audit.record_blocking(&crate::audit::Event::new(
+                    "land",
+                    "failed",
+                    crate::service::json_fields(
+                        &scion_proto::runtime::request_id::generate(),
+                        &caller,
+                        &serde_json::json!({
+                            "rpc": "Land",
+                            "repo": repo_name,
+                            "ref": target_ref,
+                            "land_id": land_id,
+                            "request_key": request_key,
+                            "why": "stale",
+                        }),
+                    ),
+                )) {
+                    tracing::error!(
+                        reason = %why,
+                        land_id,
+                        "the sweep's audit line was not made durable"
+                    );
+                }
             }
         }
         Ok(rejected)
@@ -295,8 +362,9 @@ impl Lands {
         // while, so it happens here, outside every lock.
         let evicted = mem::take(&mut *self.evicted.lock().unwrap_or_else(PoisonError::into_inner));
         drop(evicted);
-        let outcome = outcome?;
-        if let Some(metrics) = &self.metrics {
+        if let Ok(outcome) = &outcome
+            && let Some(metrics) = &self.metrics
+        {
             metrics.land(match outcome.state {
                 LandState::Landed => "landed",
                 LandState::Conflict => "conflict",
@@ -306,9 +374,12 @@ impl Lands {
             });
         }
         // Lands on one ref commit one at a time. Waiting for the flush after
-        // the ref lock is released lets them share it.
+        // the ref lock is released lets them share it. Every reply waits for
+        // the flush, the error replies included: a reply that says the land
+        // stays pending rests on the row the land recorded, and that row
+        // must be durable before the reply goes out.
         store.flush()?;
-        Ok(outcome)
+        outcome
     }
 
     /// [`Lands::land`], up to commits that are not durable yet. Its reads do
@@ -334,7 +405,7 @@ impl Lands {
         // The head whose history this call derived.
         let mut derived = None;
         loop {
-            let mut index = slot.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut index = Self::lock_slot(repo, &req.target_ref, &slot);
             // The outcome check rides the plan's read transaction: a call
             // with the same key may have finished the land while this one
             // waited for the lock, and the plan must not run for a land
@@ -368,6 +439,32 @@ impl Lands {
                 )));
             }
             derive_history(store, repo, head, &req.deadline).map_err(stays_pending)?;
+        }
+    }
+
+    /// Locks the slot of a ref. A poisoned lock means a panic held the
+    /// index mid-update: the index may be half-written, and the conflict
+    /// check would trust it. The index is a cache and the database is the
+    /// truth, so the poisoned one is dropped - the next land rebuilds it
+    /// - and the poison is cleared for the locks that follow.
+    fn lock_slot<'a>(
+        repo: RepoId,
+        name: &str,
+        slot: &'a RefSlot,
+    ) -> MutexGuard<'a, Option<PathIndex>> {
+        match slot.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                *guard = None;
+                slot.clear_poison();
+                tracing::warn!(
+                    repo = ?repo,
+                    target_ref = %name,
+                    "the path index of a ref was dropped after a panic; it rebuilds"
+                );
+                guard
+            }
         }
     }
 
@@ -411,7 +508,7 @@ impl Lands {
     /// could not free enough. Also removes the slots that hold no index and
     /// that no land uses, so the next eviction does not look at them.
     fn evict(&self, bytes: usize) -> bool {
-        let slots: Vec<RefSlot> = {
+        let slots: Vec<((RepoId, String), RefSlot)> = {
             let mut refs = self.lock_refs();
             // No land can clone a slot while `refs` is locked, so a slot that
             // only `refs` holds is not in use.
@@ -419,19 +516,34 @@ impl Lands {
                 Arc::strong_count(slot) > 1
                     || !matches!(slot.try_lock(), Ok(index) if index.is_none())
             });
-            refs.iter().map(|(_, slot)| Arc::clone(slot)).collect()
+            refs.iter()
+                .map(|(key, slot)| (key.clone(), Arc::clone(slot)))
+                .collect()
         };
         let free = MAX_INDEX_BYTES - self.used.load(Ordering::Acquire);
         let short = bytes.saturating_sub(free);
         let mut idle = Vec::new();
         let mut freed = 0;
-        for slot in &slots {
+        for ((repo, name), slot) in &slots {
             if freed >= short {
                 break;
             }
             let index = match slot.try_lock() {
                 Ok(index) => index,
-                Err(TryLockError::Poisoned(e)) => e.into_inner(),
+                Err(TryLockError::Poisoned(e)) => {
+                    // A panic held this index mid-update: it may be
+                    // half-written. Dropped like any evicted index, its
+                    // bytes back in the budget; the next land rebuilds it
+                    // from the database.
+                    let guard = e.into_inner();
+                    slot.clear_poison();
+                    tracing::warn!(
+                        repo = ?repo,
+                        target_ref = %name,
+                        "the path index of a ref was dropped after a panic; it rebuilds"
+                    );
+                    guard
+                }
                 Err(TryLockError::WouldBlock) => continue,
             };
             if let Some(held) = index.as_ref() {
@@ -499,10 +611,25 @@ fn check_name(what: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// A verdict the head decided, and the ref version the plan read it
+/// from: `settle` records it only while the ref still answers that
+/// version, and an import that moved it in the window replans.
+struct Verdict {
+    state: LandState,
+    detail: String,
+    paths: Vec<RepoPath>,
+    /// The ref version the plan read; `None` for a ref the plan read
+    /// and did not find.
+    expected: Option<i64>,
+}
+
 /// What step 4 decided.
 enum Plan {
+    /// A verdict that does not depend on the ref: the changeset's own
+    /// shape refused it before any head was read.
     Reject(String),
-    Conflict(String, Vec<RepoPath>),
+    /// A verdict the head decided.
+    Verdict(Verdict),
     Land {
         rebased: Changeset,
         head: RefState,
@@ -593,12 +720,16 @@ fn finish(
             plan(lands, c, repo, req, index).map(Planned::Do)
         })?;
         #[cfg(test)]
-        if let Some(step) = lands
+        let step = lands
             .before_settle
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
+            .take();
+        #[cfg(test)]
+        // The hook runs with the seam's lock released: a hook that arms
+        // the next one (a land that must lose the CAS at every attempt)
+        // takes the same lock to set it.
+        if let Some(step) = step {
             step();
         }
         let plan = match planned {
@@ -634,7 +765,12 @@ fn plan(
         ));
     };
     let Some(head) = c.get_ref(repo, target)? else {
-        return Ok(Plan::Reject(format!("ref {target:?} does not exist")));
+        return Ok(Plan::Verdict(Verdict {
+            state: LandState::Rejected,
+            detail: format!("ref {target:?} does not exist"),
+            paths: vec![],
+            expected: None,
+        }));
     };
     let index = match index {
         Some(index) => index,
@@ -644,9 +780,12 @@ fn plan(
     let conflicts = match index.check(lands, c, repo, base, cs.changes(), &req.deadline)? {
         Checked::Paths(conflicts) => conflicts,
         Checked::NotOnHistory => {
-            return Ok(Plan::Reject(format!(
-                "base {base} is not on the first-parent history of {target:?}"
-            )));
+            return Ok(Plan::Verdict(Verdict {
+                state: LandState::Rejected,
+                detail: format!("base {base} is not on the first-parent history of {target:?}"),
+                paths: vec![],
+                expected: Some(head.version),
+            }));
         }
         Checked::Derive => return Ok(Plan::Derive(head.target)),
     };
@@ -655,7 +794,12 @@ fn plan(
             "{} path(s) changed on {target:?} after the base",
             conflicts.len()
         );
-        return Ok(Plan::Conflict(detail, conflicts));
+        return Ok(Plan::Verdict(Verdict {
+            state: LandState::Conflict,
+            detail,
+            paths: conflicts,
+            expected: Some(head.version),
+        }));
     }
     let rebased = cs
         .with_parents(vec![head.target])
@@ -663,8 +807,14 @@ fn plan(
     Ok(Plan::Land { rebased, head })
 }
 
-/// Step 5: records what the plan decided. If the ref moved since the plan,
-/// writes nothing and returns [`Error::Aborted`].
+/// Step 5: records what the plan decided. If the ref moved since the
+/// plan, writes nothing and returns [`Error::Aborted`]: a verdict the
+/// head decided is final only against the head it was planned on, so it
+/// carries the ref version the plan read, and the recording transaction
+/// re-reads the ref and writes only under that version - the same
+/// guard the land's own move has in its CAS. An import that moved the
+/// ref in the window aborts the verdict, and `finish` replans against
+/// the head the import made.
 fn settle(
     lands: &Lands,
     store: &Backend,
@@ -683,11 +833,9 @@ fn settle(
                 })
                 .map(Finished::Outcome);
         }
-        Plan::Conflict(detail, paths) => {
+        Plan::Verdict(verdict) => {
             return store
-                .commit(|c| {
-                    c.set_land_state(repo, land_id, LandState::Conflict, None, detail, paths)
-                })
+                .commit(|c| record_verdict(c, repo, target, land_id, verdict))
                 .map(Finished::Outcome);
         }
         Plan::Land { rebased, head } => (rebased, head),
@@ -728,22 +876,81 @@ fn settle(
             if let (Some(index), Some(id)) = (index.as_mut(), outcome.result) {
                 index.record(lands, id, generation, rebased.changes());
             }
+            // The hook runs with the slot's lock still held: a test that
+            // panics here poisons the ref's mutex with a half-written
+            // index.
+            #[cfg(test)]
+            if let Some(step) = lands
+                .after_record
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+            {
+                step(index);
+            }
             tracing::info!(land_id, id = ?outcome.result, target = %target, "landed");
             Ok(Finished::Outcome(outcome))
         }
         // The path check passed, but the changes still clash with the head's
         // tree (for example a delete of a file the head never had). The
         // transaction rolled back; record the conflict.
+        // The path check passed, but the changes still clash with the head's
+        // tree (for example a delete of a file the head never had). The
+        // transaction rolled back; record the conflict - against the
+        // head the apply ran on, with the same version guard as any
+        // verdict: the failed transaction and this one are two, and an
+        // import can move the ref between them.
         Err(Error::Apply(e)) => {
             let detail = format!("does not apply to {target:?}: {e}");
             store
                 .commit(|c| {
-                    c.set_land_state(repo, land_id, LandState::Conflict, None, detail, vec![])
+                    record_verdict(
+                        c,
+                        repo,
+                        target,
+                        land_id,
+                        Verdict {
+                            state: LandState::Conflict,
+                            detail,
+                            paths: vec![],
+                            expected: Some(head.version),
+                        },
+                    )
                 })
                 .map(Finished::Outcome)
         }
         Err(e) => Err(e),
     }
+}
+
+/// Records a verdict the head decided, only while the ref still answers
+/// the version the plan read it from. The re-read shares the write
+/// transaction with the verdict: the write orders this transaction
+/// against the import's move on every backend (the one write connection,
+/// or the collector's key), so a ref the plan read is either still
+/// here, or the import committed before this transaction began and the
+/// read below sees it. A ref that moved aborts the verdict, and
+/// `finish` replans against the head the import made.
+fn record_verdict(
+    c: &mut dyn MetaTx,
+    repo: RepoId,
+    target: &str,
+    land_id: i64,
+    verdict: Verdict,
+) -> Result<LandOutcome> {
+    let Verdict {
+        state,
+        detail,
+        paths,
+        expected,
+    } = verdict;
+    let at = c.get_ref(repo, target)?.map(|r| r.version);
+    if at != expected {
+        return Err(Error::Aborted(format!(
+            "ref {target:?} moved during the land; retry with the same request key"
+        )));
+    }
+    c.set_land_state(repo, land_id, state, None, detail, paths)
 }
 
 /// For one ref's first-parent history: the newest generation at which each
@@ -812,6 +1019,12 @@ impl PathIndex {
         }
     }
 
+    /// The page one walk reads at a time: one statement per page, where
+    /// a walk that reads one changeset at a time pays a round trip per
+    /// changeset. A page may hold rows past the point the walk stops at;
+    /// that costs rows, not statements.
+    const WALK_PAGE: i64 = 1_000;
+
     /// Indexes the changesets from the current tip forward to `head`. Starts
     /// over at `head` if `head` does not descend from the tip (the ref moved
     /// to other history), if `head` is more than [`MAX_DEPTH`] changesets
@@ -835,45 +1048,49 @@ impl PathIndex {
         let mut most = 0;
         let mut steps = 0;
         let mut cur = Some(head);
-        while let Some(id) = cur {
-            if id == self.tip {
-                let cost = self.cost(walked.iter().map(|(_, g, changes)| (*g, changes)));
-                let grew = self.grow(lands, cost, |index| {
-                    for (id, generation, changes) in walked {
-                        index.add(id, generation, &changes);
+        'walk: while let Some(start) = cur {
+            // One statement per page of first parents: the rows carry the
+            // generation and the body that the two per-changeset reads
+            // fetched. The stop rules below stay per changeset.
+            for (id, generation, body) in c.first_parent_page(repo, start, Self::WALK_PAGE)? {
+                if id == self.tip {
+                    let cost = self.cost(walked.iter().map(|(_, g, changes)| (*g, changes)));
+                    let grew = self.grow(lands, cost, |index| {
+                        for (id, generation, changes) in walked {
+                            index.add(id, generation, &changes);
+                        }
+                    });
+                    if grew {
+                        self.tip = head;
+                        return Ok(());
                     }
-                });
-                if grew {
-                    self.tip = head;
-                    return Ok(());
+                    tracing::info!("the path indexes are full; it starts over at the head");
+                    break 'walk;
                 }
-                tracing::info!("the path indexes are full; it starts over at the head");
-                break;
+                deadline.check()?;
+                steps += 1;
+                if steps > MAX_DEPTH {
+                    tracing::info!(
+                        steps,
+                        "the ref moved far; the path index starts over at the head"
+                    );
+                    break 'walk;
+                }
+                if generation <= tip_gen {
+                    break 'walk;
+                }
+                let cs = decode_page_changeset(id, &body)?;
+                most += added_bytes(cs.changes());
+                if self.bytes + most > MAX_INDEX_BYTES {
+                    tracing::info!(
+                        generation,
+                        "the path indexes are full; it starts over at the head"
+                    );
+                    break 'walk;
+                }
+                walked.push((id, generation, cs.changes().clone()));
+                cur = cs.parents().first().copied();
             }
-            deadline.check()?;
-            steps += 1;
-            if steps > MAX_DEPTH {
-                tracing::info!(
-                    steps,
-                    "the ref moved far; the path index starts over at the head"
-                );
-                break;
-            }
-            let generation = c.generation(repo, id)?;
-            if generation <= tip_gen {
-                break;
-            }
-            let cs = c.get_changeset(repo, id)?;
-            most += added_bytes(cs.changes());
-            if self.bytes + most > MAX_INDEX_BYTES {
-                tracing::info!(
-                    generation,
-                    "the path indexes are full; it starts over at the head"
-                );
-                break;
-            }
-            cur = cs.parents().first().copied();
-            walked.push((id, generation, cs.changes().clone()));
         }
         *self = Self::new(c, repo, head, &self.used)?;
         Ok(())
@@ -947,23 +1164,26 @@ impl PathIndex {
         deadline: &Deadline,
     ) -> Result<Walk> {
         loop {
-            deadline.check()?;
-            let id = self.floor;
-            let generation = c.generation(repo, id)?;
-            if generation <= base_gen {
-                return Ok(Walk::Missed);
-            }
-            let cs = c.get_changeset(repo, id)?;
-            let cost = self.cost([(generation, cs.changes())]);
-            if !self.grow(lands, cost, |index| index.add(id, generation, cs.changes())) {
-                return Ok(Walk::Stopped);
-            }
-            let Some(&parent) = cs.parents().first() else {
-                return Ok(Walk::Missed);
-            };
-            self.floor = parent;
-            if parent == base {
-                return Ok(Walk::Reached);
+            // One statement per page of first parents; the stop rules
+            // below stay per changeset. A page may hold rows past the
+            // point the walk stops at, which costs rows, not statements.
+            for (id, generation, body) in c.first_parent_page(repo, self.floor, Self::WALK_PAGE)? {
+                deadline.check()?;
+                if generation <= base_gen {
+                    return Ok(Walk::Missed);
+                }
+                let cs = decode_page_changeset(id, &body)?;
+                let cost = self.cost([(generation, cs.changes())]);
+                if !self.grow(lands, cost, |index| index.add(id, generation, cs.changes())) {
+                    return Ok(Walk::Stopped);
+                }
+                let Some(&parent) = cs.parents().first() else {
+                    return Ok(Walk::Missed);
+                };
+                self.floor = parent;
+                if parent == base {
+                    return Ok(Walk::Reached);
+                }
             }
         }
     }
@@ -1104,6 +1324,20 @@ fn entry_bytes(key: &[u8]) -> usize {
 }
 
 /// The most that [`PathIndex::add`] adds for a changeset with `changes`.
+/// The changeset a page row carries: the same decode and ID check
+/// [`MetaTx::get_changeset`] runs, so a page row and a per-changeset read
+/// agree.
+fn decode_page_changeset(id: ChangesetId, body: &[u8]) -> Result<Changeset> {
+    let (cs, actual) = Changeset::decode_with_id(body)
+        .map_err(|e| Error::Corrupt(format!("changeset {id}: {e}")))?;
+    if actual != id {
+        return Err(Error::Corrupt(format!(
+            "changeset {id} does not match its ID"
+        )));
+    }
+    Ok(cs)
+}
+
 fn added_bytes(changes: &BTreeMap<RepoPath, Option<FileState>>) -> usize {
     let paths = changes.keys().map(|path| {
         let path = path.as_bytes();
@@ -1274,6 +1508,18 @@ mod tests {
     fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        fixture_on(store, dir)
+    }
+
+    /// The same repo, on the test backend the environment names: the
+    /// verdict race runs on SQLite and on the test database alike.
+    fn fixture_shared() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::open_test_shared(dir.path()).unwrap();
+        fixture_on(store, dir)
+    }
+
+    fn fixture_on(store: Backend, dir: tempfile::TempDir) -> Fixture {
         let (repo, root) = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
@@ -1500,6 +1746,102 @@ mod tests {
         );
     }
 
+    /// A panic that dies under a ref's lock poisons it with a
+    /// half-written index. The index is a cache and the database is the
+    /// truth, so the poisoned slot must be dropped and rebuilt: a land
+    /// the half-index would wrongly pass still answers conflict. With
+    /// the old recover-and-keep code this test fails: the empty
+    /// half-index sits at the tip, the conflict check reads no path, and
+    /// the land that must conflict lands.
+    #[test]
+    fn a_poisoned_slot_drops_its_index_and_the_next_land_sees_the_database() {
+        let f = fixture_shared();
+        // The index records a/x changing at generation 2.
+        let cs_a = f.commit(f.root, &[put("a/x", "A")]);
+        assert_eq!(f.land(cs_a, "ka").state, LandState::Landed);
+        // The next land lands normally, but its settle's hook tears the
+        // just-recorded path out of the index - the half-written state a
+        // panic mid-add leaves - and panics under the slot's lock.
+        f.lands.set_after_record(Box::new(|index| {
+            if let Some(index) = index.as_mut() {
+                index.files.remove(b"a/x".to_vec().as_slice());
+            }
+            panic!("the slot's index dies half-written");
+        }));
+        let cs_b = f.commit(cs_a, &[put("b/y", "B")]);
+        let panicked =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f.land(cs_b, "kb")));
+        assert!(panicked.is_err(), "the armed panic unwound");
+        // A land whose base predates the a/x change conflicts. The torn
+        // index no longer knows a/x and would land it.
+        let cs_c = f.commit(f.root, &[put("a/x", "C")]);
+        let out = f.land(cs_c, "kc");
+        assert_eq!(out.state, LandState::Conflict, "{}", out.detail);
+    }
+
+    /// An error reply says the land stays pending and a retry with the
+    /// same request key resumes it. The row that promise rests on must be
+    /// durable before the reply goes out, so a crash that follows the
+    /// reply cannot lose it. The call's guard drops before the plan
+    /// starts, so the land ends in that error reply right after it records
+    /// its row, before any settle work runs.
+    #[test]
+    fn an_error_reply_waits_for_the_pending_row_to_be_durable() {
+        let f = fixture();
+        // The index starts at B, so the import below moves main past it,
+        // and the plan's next step checks the deadline before it derives
+        // anything.
+        f.move_main(f.commit(f.root, &[put("b/y", "B")]));
+        f.fill("f", 1);
+        f.move_main(f.commit(f.main().target, &[put("c", "import")]));
+        let cs = f.commit(f.main().target, &[put("a/x", "mine")]);
+        // The call went before the plan started: the guard drops, the
+        // deadline itself is far in the future.
+        let deadline = Deadline::new(Instant::now() + std::time::Duration::from_secs(600));
+        let guard = deadline.guard();
+        let gone = LandRequest {
+            deadline,
+            ..req(cs, "k")
+        };
+        drop(guard);
+        let commits_before = f.store.commits();
+        let err = f.lands.land(&f.store, &caller(), &gone).unwrap_err();
+        // The reply says the land stays pending, and a retry with the
+        // same request key resumes it.
+        assert!(
+            matches!(err, Error::Cancelled(ref d)
+                if d.contains("the land stays pending, retry with the same request key")),
+            "{err}"
+        );
+        // The row's commit is durable when the reply is built: a flush
+        // covered every commit made before the reply, the pending row's
+        // included. `flushed_upto` is the store's own durability mark, the
+        // one a flush updates on every platform. The check runs before any
+        // read of this test: a read of an unflushed commit flushes on its
+        // own, which would hide the bug.
+        assert!(
+            f.store.flushed_upto() > commits_before,
+            "the error reply went out before the pending row was durable: \
+             flushed to {}, commits reach {}",
+            f.store.flushed_upto(),
+            commits_before + 1,
+        );
+        let state: String = f
+            .store
+            .read(|c| {
+                c.sqlite()
+                    .unwrap()
+                    .query_row(
+                        "SELECT state FROM lands WHERE request_key = 'k'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(crate::error::from_sqlite)
+            })
+            .unwrap();
+        assert_eq!(state, "pending");
+    }
+
     #[test]
     fn a_head_without_a_root_tree_is_derived_in_steps_before_the_land() {
         let f = fixture();
@@ -1625,6 +1967,57 @@ mod tests {
         assert_eq!(parents, vec![import], "the land rebased onto the import");
         assert_eq!(metrics.land_replans(), 1, "the replan counted once");
         // A retry with the same key returns the same outcome.
+        let again = lands.land(&f.store, &caller(), &req(cs, "hook")).unwrap();
+        assert_eq!(stored(&again), stored(&out));
+    }
+
+    /// The collector of a stale verdict: the plan reads a Conflict off
+    /// the head, an import moves the ref before the settle, and the
+    /// settle must not record the verdict the old head answered for. The
+    /// settle re-reads the ref version inside its own transaction and
+    /// replans, so the reply names every path the head the import made
+    /// changed after the base - and a retry with the same key reads the
+    /// same verdict back.
+    #[test]
+    fn a_conflict_recorded_while_an_import_moved_the_ref_is_not_final() {
+        let f = fixture_shared();
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        let lands = Lands::new(None, Some(Arc::clone(&metrics)));
+        // Main moves past the base and takes `b/y`, so the plan reads a
+        // Conflict on `b/y`.
+        f.move_main(f.commit(f.root, &[put("b/y", "import")]));
+        let cs = f.commit(f.root, &[put("b/y", "mine"), put("c", "mine")]);
+        // The import commits its changeset but holds its ref move for
+        // the moment between the land's plan and its settle.
+        let import = f.commit(f.main().target, &[put("c", "import too")]);
+        let hook_store = f.store.clone();
+        let hook_repo = f.repo;
+        lands.set_before_settle(Box::new(move || {
+            let head = hook_store
+                .read(|c| Ok(c.get_ref(hook_repo, "main")?.unwrap()))
+                .unwrap();
+            let moved = hook_store
+                .write(|c| c.cas_ref(hook_repo, "main", Some(head.version), import))
+                .unwrap();
+            assert!(moved, "the import's move lost a race it cannot lose");
+        }));
+
+        let out = lands.land(&f.store, &caller(), &req(cs, "hook")).unwrap();
+        assert_eq!(out.state, LandState::Conflict, "{}", out.detail);
+        // The verdict is the plan's answer to the head the import made:
+        // it names `c`, which only that head changed. The stale verdict
+        // planned on the earlier head names `b/y` alone.
+        assert!(
+            out.conflict_paths.iter().any(|p| p.as_bytes() == b"c"),
+            "the verdict names the head the import made: {:?}",
+            out.conflict_paths
+        );
+        assert_eq!(
+            metrics.land_replans(),
+            1,
+            "the stale verdict replanned against the head the import made"
+        );
+        // A retry with the same key returns the same verdict.
         let again = lands.land(&f.store, &caller(), &req(cs, "hook")).unwrap();
         assert_eq!(stored(&again), stored(&out));
     }
@@ -2947,6 +3340,11 @@ mod tests {
     #[test]
     fn the_sweep_rejects_only_pending_lands_past_the_cutoff() {
         let f = fixture();
+        // The audit file lives in its own temp dir, so two test runs
+        // never share it.
+        let audit_dir = tempfile::tempdir().unwrap();
+        let audit_path = audit_dir.path().join("audit.log");
+        let audit = crate::audit::Audit::open(&audit_path).unwrap();
         let cs = f.commit(f.root, &[put("a/x", "new")]);
         let lands = Lands::new(Some(8), None);
         let recorded = f
@@ -2956,7 +3354,7 @@ mod tests {
         assert_eq!(recorded.1.state, LandState::Pending);
 
         // A fresh pending land stays, even at a cutoff of now.
-        let rejected = lands.sweep_stale(&f.store, 60).unwrap();
+        let rejected = lands.sweep_stale(&f.store, 60, &audit).unwrap();
         assert_eq!(rejected, 0);
 
         // The row is old now: the sweep rejects it, and the detail says
@@ -2974,7 +3372,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let rejected = lands.sweep_stale(&f.store, 60).unwrap();
+        let rejected = lands.sweep_stale(&f.store, 60, &audit).unwrap();
         assert_eq!(rejected, 1);
         let (state, detail): (String, String) = f
             .store
@@ -3000,6 +3398,27 @@ mod tests {
             .write(|c| c.record_land(&caller(), &req(cs, "old"), None))
             .unwrap();
         assert_eq!(resumed.1.state, LandState::Rejected);
+
+        // The sweep answered the land's intent: one result line, why
+        // stale, joined to the intent by the request key and the land id.
+        let lines: Vec<serde_json::Value> = String::from_utf8(std::fs::read(&audit_path).unwrap())
+            .unwrap()
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let results: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|line| line["event"] == "land" && line["outcome"] == "failed")
+            .collect();
+        assert_eq!(results.len(), 1, "one result line for one intent");
+        assert_eq!(results[0]["why"], "stale");
+        // The request id is the sweep's own fresh id: the intent's
+        // request id is not stored, so the line joins the intent on the
+        // request key, not on request_id.
+        assert_eq!(results[0]["request_key"], "old");
+        assert_ne!(results[0]["request_id"], "old");
+        assert_eq!(results[0]["land_id"], recorded.1.land_id);
     }
 
     /// Pass 5, W1: a request key is scoped to one caller in one repo. B
