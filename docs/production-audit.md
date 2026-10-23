@@ -162,11 +162,15 @@ in-process; stated in the PR).
 | Archive (`docs/archive-format.md`) | `crates/scion-server/tests/archive_golden.rs` + `archive_v1.golden`: one export's files and normalized manifest, byte-for-byte, on both backends | a manifest with an unknown version or format is refused with the named error before any write (`an_archive_of_an_unknown_version_or_format_is_refused`); red-proven: a reader that accepts version 2 restores the archive and fails the test | the lint watches `archive_v1.golden` and `archive_golden.rs` |
 
 The pairing is enforced on the diff: `scripts/check-golden-pairing.sh`
-(the CI lint job, on the pull request's own `HEAD^1..HEAD`) fails a
-pull request that changes a golden file without moving its format
-document's version line in the same pull request. A golden file the
-pull request adds is its initial pin: the in-tree tests hold that
-first pin against the doc, and the lint holds every later change.
+(the CI lint job, on the pull request's own `HEAD^1..HEAD`). Pinned
+bytes (the wire golden, the store pins, the archive golden) fail
+without their format document's version line in the same pull request.
+`proto/scion.proto` and the surface golden are additive - they need no
+new version (the doc's additive table) - so they need only the same
+pull request changing `docs/protocol-v1.md`, any line: the contract
+must describe the new surface. A golden file the pull request adds is
+its initial pin: the in-tree tests hold that first pin against the
+doc, and the lint holds every later change.
 | Migrations carry no rollback path; the evidence is forward-only: N-1 opens N's store, N refuses a newer database, and the failed-migration runbook restores from backup | `crates/scion-server/tests/schema_drift.rs`, `scripts/version-matrix.sh:10-13`, `docs/operations.md` "A failed migration" | fixed by design (forward-only, with the matrix and the runbook as the evidence) |
 | Fixtures of the current build only: the version matrix runs the pinned N-1 binaries against the current store both directions | `scripts/version-matrix.sh` | fixed (#540-era legs; the matrix never passes as a skip) |
 | Backups and the failed-migration runbook are tested against a live server, not hand-written fixtures | `crates/scion-server/tests/backup.rs`, `crash.rs:342` | fixed |
