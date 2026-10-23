@@ -311,7 +311,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["16.15", "17.11", "18.6"]
+        # Every Postgres cell is experimental in v0.1.0. Postgres 17 is
+        # the one major that runs per push (on data-path changes, through
+        # the tier rule above); the 16 and 18 cells are best effort and
+        # run nightly and on a release candidate's dispatch.
+        version: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && fromJSON('["16.15", "17.11", "18.6"]') || fromJSON('["17.11"]') }}
     services:
       postgres:
         image: postgres:${{ matrix.version }}
@@ -467,6 +471,9 @@ jobs:
   # are proven there, and one platform carries that evidence.
   test-arm64:
     name: test (linux arm64)
+    # The arm64 cells are best effort until v0.8: the nightly and a
+    # release candidate's dispatch prove them, a push does not.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 40
     steps:
@@ -492,6 +499,9 @@ jobs:
   # suite running on xfs at all.
   test-xfs:
     name: test (xfs)
+    # The xfs cell is best effort until v0.8: the nightly and a release
+    # candidate's dispatch prove it, a push does not.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:

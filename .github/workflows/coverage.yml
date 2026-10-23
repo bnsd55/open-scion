@@ -171,9 +171,16 @@ jobs:
           ulimit -v 6291456
           # shellcheck disable=SC1090
           source <(cargo llvm-cov show-env --sh)
+          # One .profraw per test process made thousands per job, and
+          # the runner was lost four runs in a row with no log (#565).
+          # The %4m pool folds them into four files per test binary.
+          # The gate merges *.profraw, so the report does not change.
+          export LLVM_PROFILE_FILE="$PWD/target/coverage/sqlite-%4m.profraw"
           nice -n 19 cargo nextest run --workspace --no-fail-fast \
             | tee measure.log
           kill "$watcher"
+          df -h / | tail -1; free -m | awk 'NR==2'
+          du -sh target/coverage; find target/coverage -name '*.profraw' | wc -l
 
       - name: upload the measure's profiles
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

@@ -1,0 +1,8 @@
+# the collector runs while lands sit pending: five lands queue on the
+# ref's lock, so their rows sit pending while the head runs; the kill
+# lands mid-queue and the rows never decide; then gc runs on the
+# stopped data dir with grace 0, and the retry finishes the lands and
+# the check reads their files back
+burst-cut 5 0
+gc
+check

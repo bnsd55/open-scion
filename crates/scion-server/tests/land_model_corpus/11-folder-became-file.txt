@@ -1,0 +1,8 @@
+# a folder that became a file: caller 1's lands play the three steps -
+# put m2/child, then (fresh base) delete the child and make m2 a file,
+# then re-put the child on the stale first head, under a folder the
+# ref turned into a file - so the last land conflicts
+land 1 0 0 0
+land 1 0 0 0
+land 1 0 1 0
+check
