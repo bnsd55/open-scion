@@ -1298,6 +1298,20 @@ pub(crate) async fn wait_until(what: &str, ready: impl Fn() -> bool) {
     }
 }
 
+/// Waits until `ready` holds, for at most 10 s, and says whether it
+/// ever held. For a wait whose miss is not a failure: the caller logs
+/// the skip and moves on, where `wait_until` panics.
+pub(crate) async fn wait_until_or_timeout(_what: &str, ready: impl Fn() -> bool) -> bool {
+    let give_up = Instant::now() + Duration::from_secs(10);
+    while !ready() {
+        if Instant::now() >= give_up {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    true
+}
+
 /// The environment variable `name` as a number, or `default`.
 pub(crate) fn env(name: &str, default: u64) -> u64 {
     std::env::var(name).map_or(default, |v| v.parse().unwrap())
