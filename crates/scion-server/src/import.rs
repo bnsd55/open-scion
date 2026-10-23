@@ -28,6 +28,7 @@ use scion_core::{
 
 use crate::backend::Backend;
 use crate::deadline::{CALL_LIMIT, Deadline};
+use crate::derived::Kind;
 use crate::error::{Error, Git, Result};
 use crate::graph;
 use crate::meta::Meta as _;
@@ -129,6 +130,9 @@ pub struct ImportReport {
     pub imported: usize,
     /// Commits whose Scion tree was checked against the git tree.
     pub verified: usize,
+    /// Refs the import moved onto the tip: 1 when `target_ref` took the
+    /// tip, 0 when it already held or contained it.
+    pub refs_moved: usize,
     /// The changeset for the imported revision.
     pub tip: ChangesetId,
 }
@@ -285,18 +289,20 @@ fn import_with_cache(
     // that the server has not flushed yet. A full flush covers it, as it
     // covers every commit that another process made before it.
     store.flush()?;
-    pointed?;
+    let refs_moved = usize::from(pointed?);
     // Every planned check ran, or the import failed above.
     let report = ImportReport {
         commits: plan.reachable,
         imported: plan.todo.len(),
         verified: plan.verify.len(),
+        refs_moved,
         tip,
     };
     tracing::info!(
         commits = report.commits,
         imported = report.imported,
         verified = report.verified,
+        refs_moved,
         secs = started.elapsed().as_secs(),
         %tip,
         "git import done"
@@ -349,20 +355,66 @@ fn store_batch(
                     .map(|(_, blob)| blob),
             )?;
             let result = store.write(|c| {
+                // The provenance of the commits this transaction took, for
+                // the one batch write at its end: a crash then loses whole
+                // commits, never a changeset without its provenance row,
+                // and the busy retry reruns the closure whole, as today.
+                let mut provenance = Vec::new();
+                // The changesets row lands per commit, because the
+                // derived rows of the same commit name it by an immediate
+                // foreign key; the parents and the repo membership of the
+                // transaction's changesets wait for the flush below, one
+                // statement per 1,000 rows. The commits come parents
+                // first, so their generations chain through the
+                // generation cache, and the database reads only the
+                // parents this transaction did not insert, usually the
+                // first commit's. When the last per-commit writer of a
+                // commit moves into the batch, the changesets row moves
+                // with it, and every table writes at the transaction's
+                // end in the order the foreign keys read: changesets,
+                // changeset_parents, repo_changesets, derived, history,
+                // git_import.
+                c.set_changeset_batching(true);
+                // The batch's first commits derive from parents this
+                // transaction did not insert. Holding their first-parent
+                // chains of derived values (one chain read each) makes
+                // every read outside the batch - the Myers' jump of
+                // commit_graph, the parents' generations - cost one read
+                // for the whole chain, never one per commit; a jump past
+                // the preloaded chain falls back to a single read.
+                if let Some((_, first, _)) = rest.first() {
+                    for parent in first.parents() {
+                        c.preload_derived_chain(
+                            <crate::graph::CommitGraph as Kind>::NAME,
+                            <crate::graph::CommitGraph as Kind>::VERSION,
+                            *parent,
+                            crate::meta::DERIVED_BATCH_I64,
+                        )?;
+                    }
+                }
                 for (commit, cs, git_tree) in rest {
                     #[cfg(test)]
                     if !slow_record.is_zero() {
                         std::thread::sleep(slow_record);
                     }
-                    let root = record(c, repo_id, *commit, cs, &mut crate::tree::lens_from(&lens))?;
+                    let (id, root) =
+                        record(c, repo_id, *commit, cs, &mut crate::tree::lens_from(&lens))?;
                     if plan.verify.contains(commit) {
                         checker.check(c, *commit, *git_tree, root)?;
                     }
+                    provenance.push((*commit, id));
                     taken += 1;
                     if shared && started_tx.elapsed() >= TX_BUDGET {
                         break;
                     }
+                    #[cfg(any(test, feature = "test-hooks"))]
+                    if PER_COMMIT_TXS.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
                 }
+                c.flush_changeset_rows(repo_id)?;
+                c.put_git_imports(repo_id, &provenance)?;
+                c.set_changeset_batching(false);
                 Ok(taken)
             });
             match result {
@@ -394,6 +446,17 @@ fn store_batch(
         }
     }
     Ok(())
+}
+
+/// Whether the import takes one commit per write transaction, for the
+/// tests that compare the batch against the per-commit rows.
+#[cfg(any(test, feature = "test-hooks"))]
+static PER_COMMIT_TXS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Sets whether the import takes one commit per write transaction.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn set_import_per_commit_txs(per_commit: bool) {
+    PER_COMMIT_TXS.store(per_commit, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// What to import, in order.
@@ -479,23 +542,23 @@ fn plan(
     })
 }
 
-/// Records that a git commit became the changeset `cs` whose changes build
-/// the tree `root`. Safe to repeat.
+/// Stores the changeset `cs` whose changes build the tree `root`, and
+/// gives the changeset's id with the tree: the caller writes the git
+/// provenance in one batch for the whole transaction.
 fn record(
     c: &mut dyn MetaTx,
     repo: RepoId,
     commit: ObjectId,
     cs: &Changeset,
     lens: crate::tree::BlobLens<'_>,
-) -> Result<TreeId> {
+) -> Result<(ChangesetId, TreeId)> {
     let (id, root) = tree::store_changeset(c, repo, cs, lens).map_err(|e| match e {
         Error::Apply(e) => Error::Corrupt(format!(
             "commit {commit}: changes do not apply to the first parent: {e}"
         )),
         other => other,
     })?;
-    c.put_git_import(repo, commit, id)?;
-    Ok(root)
+    Ok((id, root))
 }
 
 /// Points `name` at `tip`, creating it if missing. Leaves it alone if it is
@@ -508,7 +571,9 @@ fn record(
 /// The move is a compare-and-swap on the ref's version, as a land's is. A
 /// server can land on the ref while the import checks it, so a lost swap
 /// checks the ref again.
-fn point_ref(store: &Backend, repo: RepoId, name: &str, tip: ChangesetId) -> Result<()> {
+/// Returns whether the call moved `name` onto `tip` (`false` when the ref
+/// already held or contained the tip).
+fn point_ref(store: &Backend, repo: RepoId, name: &str, tip: ChangesetId) -> Result<bool> {
     // The check runs in reads, outside any write transaction, so a server
     // that shares the data directory does not wait for it. Each check
     // reads O(log n) nodes of the derived commit graph, and stops at the
@@ -521,7 +586,7 @@ fn point_ref(store: &Backend, repo: RepoId, name: &str, tip: ChangesetId) -> Res
             // Already there, or the ref already contains the tip (changes
             // were landed on top of an earlier import): nothing to do.
             if current.target == tip || contains(current.target, tip)? {
-                return Ok(());
+                return Ok(false);
             }
             if !contains(tip, current.target)? {
                 return Err(Error::FailedPrecondition(format!(
@@ -541,7 +606,7 @@ fn point_ref(store: &Backend, repo: RepoId, name: &str, tip: ChangesetId) -> Res
             move_ref(store, repo, name)?;
         }
         if store.write(|c| c.cas_ref(repo, name, expected, tip))? {
-            return Ok(());
+            return Ok(true);
         }
         tracing::info!(
             name,

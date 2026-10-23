@@ -205,3 +205,36 @@ connects, resolves the ref and walks the tree call by call, while git's
 jobs read local objects the mirror already holds and move nothing over
 the wire. A long-lived client, or a mount that keeps one process, does
 not pay that 50 times — but this benchmark's 50 fresh checkouts do.
+
+## Fault soak (Run B)
+
+The fault soak holds one server under writes while an outside script
+kills and restarts its process: the check is that no acknowledged land
+is lost. Two writers landed at a measured rate for 12 hours with 11
+kills; the script is
+[`scripts/soak-fault.sh`](../scripts/soak-fault.sh), the run and its
+acceptance are in [issue
+#399](https://github.com/bnsd55/openscion/issues/399) (the
+[report](https://github.com/bnsd55/openscion/issues/399#issuecomment-6309530315)
+and the
+[acceptance](https://github.com/bnsd55/openscion/issues/399#issuecomment-6309577329)).
+
+- Commit `1db68866d93369fc03ee8504ce01919a1cef02b0`, macOS 26.6.2
+  (arm64), 2026-10-20T18:21:16Z to 2026-10-21T06:21:46Z (UTC), exit 0,
+  no FAIL lines.
+- Lands acknowledged: 81244 (the ledger count; the in-server counter
+  resets on each restart, so it covers only the last segment).
+- 11 kills, one between the run's 12 segments. The fault log holds one
+  ledger check per segment, 12 in all, each passed; the last covers
+  all 81244 entries against main's history. fsck is clean after each
+  kill and at the end.
+- p99 read latency 25 ms early, 32 ms late, over 4265 samples.
+- RSS 15376 KB first, 33568 KB at the end, 35088 KB at its highest.
+- The store grew from 233812 KB to 1303900 KB.
+
+Two bounds this run did not measure, so their zeros are not a pass
+(the issue names them F1 and F2): the open-files count read `/proc`,
+which macOS does not have, so every sample read 0; and the slow reader
+never ran (its command line was misquoted). The scripts were fixed
+after this run ([#405](https://github.com/bnsd55/openscion/pull/405));
+a later run measures both.

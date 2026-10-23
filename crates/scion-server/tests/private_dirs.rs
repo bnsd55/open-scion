@@ -135,7 +135,13 @@ fn serve_starts_with_its_ticket_key_in_a_data_directory_that_it_made() {
     ));
     run(server(
         "000",
-        &["ticket-key".as_ref(), "--out".as_ref(), key.as_os_str()],
+        &[
+            "--data".as_ref(),
+            data.as_os_str(),
+            "ticket-key".as_ref(),
+            "--out".as_ref(),
+            key.as_os_str(),
+        ],
     ));
     assert_eq!(mode_of(&key), 0o600);
 

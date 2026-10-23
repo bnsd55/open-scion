@@ -123,8 +123,8 @@ fn a_section_holds_one_snapshot_when_a_writer_lands_between_its_statements() {
 
     // And a restore replays it into an empty store with a clean fsck.
     let restored_dir = tempfile::tempdir().unwrap();
-    let names = archive::restore(&out, restored_dir.path(), None, None).unwrap();
-    assert_eq!(names, vec![REPO]);
+    let report = archive::restore(&out, restored_dir.path(), None, None).unwrap();
+    assert_eq!(report.repos, vec![REPO]);
     let restored = Backend::open(restored_dir.path(), None, None).unwrap();
     let problems = fsck::run(&restored, fsck::BATCH, &mut |_| {}).unwrap();
     assert!(problems.problems.is_empty(), "{problems:?}");
@@ -181,8 +181,8 @@ fn an_export_beside_a_writer_verifies_and_restores_resolving_main() {
     // generations, a clean fsck, and a main that resolves to what the
     // snapshot read.
     let restored_dir = tempfile::tempdir().unwrap();
-    let names = archive::restore(&out, restored_dir.path(), None, None).unwrap();
-    assert_eq!(names, vec![REPO]);
+    let report = archive::restore(&out, restored_dir.path(), None, None).unwrap();
+    assert_eq!(report.repos, vec![REPO]);
     let restored = Backend::open(restored_dir.path(), None, None).unwrap();
     let problems = fsck::run(&restored, fsck::BATCH, &mut |_| {}).unwrap();
     assert!(problems.problems.is_empty(), "{problems:?}");

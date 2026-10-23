@@ -35,8 +35,108 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The tier gate. It reads the pull request's own file list from the
+  # API: no checkout, no fetch, no third-party action. A PR that touches
+  # only docs/**, *.md or changes/** cannot change behavior, so
+  # docs_only=true and only the docs tests run for it. The risk flags
+  # add jobs: pg adds test (postgres), macos adds test (macOS),
+  # workflows adds the release smoke. A draft PR skips every job, this
+  # one included. Main, the nightly schedule and a dispatch run every
+  # job as before.
+  tier:
+    name: what a pull request touches
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request' && !github.event.pull_request.draft
+    outputs:
+      docs_only: ${{ steps.files.outputs.docs_only }}
+      pg: ${{ steps.files.outputs.pg }}
+      macos: ${{ steps.files.outputs.macos }}
+      workflows: ${{ steps.files.outputs.workflows }}
+    steps:
+      - id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The path rules live here, once; the table is in the pull
+          # request body. Each line names the file's change status and
+          # path, so a file the pull request deletes is skipped before
+          # any read of its content.
+          files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/${{ github.event.pull_request.number }}/files" --jq '.[] | "\(.status) \(.filename)"')
+          docs_only=true
+          pg=false
+          macos=false
+          workflows=false
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            status=${line%% *}
+            file=${line#* }
+            case "$file" in
+              docs/*|*.md|changes/*) ;;
+              *) docs_only=false ;;
+            esac
+            # Server code, and tests that opt into the Postgres
+            # backend: the server's correctness depends on the
+            # Postgres transaction order, so any change under the
+            # server's src runs the Postgres tests; a test opts in
+            # when its text names the shared backend or the env var,
+            # and the globs catch the ones named pg or postgres, new
+            # ones included.
+            case "$file" in
+              crates/scion-server/src/*|\
+              crates/scion-server/migrations/*|\
+              crates/scion-server/tests/*pg*.rs|\
+              crates/scion-server/tests/*postgres*.rs) pg=true ;;
+              crates/scion-server/tests/*.rs)
+                # A file the pull request deletes has no content, so
+                # it is skipped before the read; the path rules above
+                # already applied to it. A file that cannot be read
+                # runs Postgres rather than skipping it.
+                if [ "$status" = removed ]; then
+                  :
+                elif ! content=$(gh api "repos/$GITHUB_REPOSITORY/contents/$file?ref=${{ github.event.pull_request.head.sha }}" --jq '.content' 2>/dev/null); then
+                  pg=true
+                  echo "::notice::cannot read $file, running Postgres to be safe"
+                elif printf '%s' "$content" | base64 -d 2>/dev/null \
+                  | grep -q 'open_test\|SCION_TEST_BACKEND\|SCION_TEST_POSTGRES_URL'; then
+                  pg=true
+                fi
+                ;;
+            esac
+            # macOS or filesystem code: the tier store, the scn vfs
+            # and mount path, the permission checks — the ACL and
+            # group-writable walk in the runtime auth module is
+            # macOS-specific (#507 was a macOS-only bug there).
+            case "$file" in
+              crates/scion-tier/*|\
+              crates/scion-proto/src/runtime/auth/*|\
+              crates/scn/src/vfs.rs|\
+              crates/scn/src/cmd/mount.rs|\
+              crates/scn/src/cmd/checkout.rs|\
+              crates/scn/src/materialize.rs) macos=true ;;
+            esac
+            # Workflow or release files. The lint job's actionlint
+            # step already runs for every pull request; the release
+            # smoke is the addition.
+            case "$file" in
+              .github/workflows/*|scripts/release*) workflows=true ;;
+            esac
+          done <<< "$files"
+          {
+            echo "docs_only=$docs_only"
+            echo "pg=$pg"
+            echo "macos=$macos"
+            echo "workflows=$workflows"
+          } >> "$GITHUB_OUTPUT"
+
   lint:
     name: fmt + clippy
+    needs: tier
+    # Fast tier: every event, but on a pull request only a ready,
+    # non-docs-only one. The tier job is skipped on main, the nightly
+    # and a dispatch; the fast jobs then run as they always did.
+    if: >-
+      ${{ !cancelled() && (needs.tier.result == 'success' || needs.tier.result == 'skipped') && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -86,6 +186,11 @@ jobs:
 
   docs:
     name: rustdoc
+    needs: tier
+    # The docs tests run on every event and for every ready pull
+    # request; for a docs-only PR they are the only tier that runs.
+    if: >-
+      ${{ !cancelled() && (needs.tier.result == 'success' || needs.tier.result == 'skipped') && !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -101,6 +206,8 @@ jobs:
 
   supply-chain:
     name: cargo-deny
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -112,6 +219,11 @@ jobs:
 
   test:
     name: test
+    needs: tier
+    # Fast tier: every event, but on a pull request only a ready,
+    # non-docs-only one.
+    if: >-
+      ${{ !cancelled() && (needs.tier.result == 'success' || needs.tier.result == 'skipped') && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -126,7 +238,9 @@ jobs:
           cache-workspace-crates: true
       - run: cargo test --workspace
         env:
-          PROPTEST_CASES: "2000"
+          # The fast tier: a pull request runs 500 cases, main, the
+          # nightly and a dispatch the full 2000.
+          PROPTEST_CASES: ${{ github.event_name == 'pull_request' && '500' || '2000' }}
       - name: the work tree is still clean after the tests
         run: |
           # A test that writes outside its sandbox (the #332 class) shows up
@@ -157,6 +271,12 @@ jobs:
 
   test-postgres:
     name: test (postgres)
+    needs: tier
+    # Risk tier: a pull request that touches Postgres or metadata code
+    # also runs this job, on one Postgres version as today. Main, the
+    # nightly and a dispatch always run it.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' && needs.tier.outputs.pg == 'true')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
@@ -189,6 +309,34 @@ jobs:
           PROPTEST_CASES: "64"
           SCION_TEST_BACKEND: postgres
           SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+          # The backup test dumps the live metadata with the job's own
+          # Postgres, so its tools match the server: the container name
+          # points at the service container above, and the test never
+          # stops it (the takeover step below does, after the tests).
+          SCION_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
+      # The fault rows whose metadata half is Postgres itself: on this
+      # backend the blob files live in the data directory of each step
+      # below, and the metadata lives in the database, so a cut of the
+      # data directory cannot cut the metadata. The SQLSTATE 53100 arm of
+      # the disk-full mapping is a unit test of the run above.
+      - name: a real disk full (tmpfs), on Postgres
+        run: cargo test -p open-scion-server --test disk_full
+        env:
+          SCION_DISK_REQUIRE: "1"
+          SCION_TEST_BACKEND: postgres
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+      - name: block-level power cuts (dm-log-writes), on Postgres
+        run: |
+          # replay-log, pinned as in the SQLite job above.
+          git clone https://github.com/josefbacik/log-writes "$RUNNER_TEMP/dlw"
+          git -C "$RUNNER_TEMP/dlw" checkout 7b70d8a6863c5de30933d42a7672d35d01d2dc6c
+          gcc -O2 -o "$RUNNER_TEMP/replay-log" "$RUNNER_TEMP/dlw/replay-log.c" "$RUNNER_TEMP/dlw/log-writes.c"
+          cargo test -p open-scion-server --test dm_log_writes
+        env:
+          SCION_DMW_REQUIRE: "1"
+          SCION_DMW_REPLAY: ${{ runner.temp }}/replay-log
+          SCION_TEST_BACKEND: postgres
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
       - name: the work tree is still clean after the tests
         run: |
           # New untracked files count too (a stray bench-output.txt);
@@ -199,6 +347,7 @@ jobs:
             echo "::error::the test suite left the work tree dirty: $dirty"
             exit 1
           fi
+
       # The takeover test stops the database and restarts it. The service
       # container of this job is the only postgres:17.11 on the runner, and
       # it belongs to this job alone, so it may go down and come back.
@@ -215,6 +364,12 @@ jobs:
 
   test-macos:
     name: test (macOS)
+    needs: tier
+    # Risk tier: a pull request that touches the tier store, the scn
+    # vfs or mount path, or the permission checks also runs this job.
+    # Main, the nightly and a dispatch always run it.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' && needs.tier.outputs.macos == 'true')) }}
     runs-on: macos-15
     timeout-minutes: 40
     steps:
@@ -228,14 +383,15 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-workspace-crates: true
       # The Linux lint job never compiles macOS-only code (the ACL FFI
-      # module among it), so clippy runs here too, before the tests:
-      # same warm cache, a couple of minutes on a job that already
-      # builds everything, and no second macOS runner to book.
-      - run: cargo clippy --workspace --lib --bins -- -D warnings
+      # module among it), so clippy runs here, before the tests: same
+      # warm cache, a couple of minutes on a job that already builds
+      # everything, and no second macOS runner to book. --all-targets
+      # covers the lib, the bins and the test code in one pass.
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
         env:
-          PROPTEST_CASES: "2000"
+          # A pull request runs 500 cases, main and the nightly 2000.
+          PROPTEST_CASES: ${{ github.event_name == 'pull_request' && '500' || '2000' }}
       - name: the work tree is still clean after the tests
         run: |
           # New untracked files count too (a stray bench-output.txt);
@@ -249,6 +405,8 @@ jobs:
 
   promtool:
     name: promtool
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -295,8 +453,26 @@ jobs:
 
   power-loss:
     name: power-loss
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
+    services:
+      # The second run opens a Postgres-backed store on the same LazyFS:
+      # the blob files take the cuts, the metadata sits in the database's
+      # own WAL, and the run proves the store reads what the cut left.
+      postgres:
+        image: postgres:17.11
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       SCION_POWER_REQUIRE: "1"
     steps:
@@ -343,6 +519,16 @@ jobs:
           SCION_LAZYFS: ${{ runner.temp }}/lazyfs
           SCION_LAZYFS_TRACE_DIR: ${{ runner.temp }}/lazyfs-trace
         run: cargo test -p open-scion-server --test power
+      - name: run (postgres)
+        env:
+          SCION_LAZYFS: ${{ runner.temp }}/lazyfs
+          SCION_LAZYFS_TRACE_DIR: ${{ runner.temp }}/lazyfs-trace
+          SCION_TEST_BACKEND: postgres
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+        # One server of the database at a time: the binary's Postgres open
+        # takes the database's one-server lock, so the suite runs serially
+        # here. The SQLite run above stays parallel.
+        run: cargo test -p open-scion-server --test power -- --test-threads=1
       # The suite writes the LazyFS ops trace to
       # $SCION_LAZYFS_TRACE_DIR/lazyfs-r<N>.log; on a failure the trace
       # says what the cut actually persisted.
@@ -358,8 +544,26 @@ jobs:
 
   nfs-mount:
     name: mount (NFS)
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
+    services:
+      # The second run mounts an NFS server whose store is Postgres-backed:
+      # the marker and the blob files sit on the NFS mount, the metadata
+      # sits in the database, and the run proves the mount of that half.
+      postgres:
+        image: postgres:17.11
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -378,9 +582,16 @@ jobs:
       # a failed step cannot hang the runner until this cap.
       - name: run the mount script
         run: timeout 600 scripts/mount-nfs.sh
+      - name: run the mount script (postgres)
+        run: |
+          SCION_TEST_BACKEND=postgres \
+          SCION_TEST_POSTGRES_URL=postgres://postgres:scion@localhost:5432/scion \
+          timeout 600 scripts/mount-nfs.sh
 
   publish-check:
     name: publish check
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -398,6 +609,8 @@ jobs:
 
   msrv:
     name: check (MSRV)
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -413,6 +626,8 @@ jobs:
 
   grpc-conformance:
     name: conformance (grpcurl)
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -433,6 +648,8 @@ jobs:
 
   docker:
     name: docker demo
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -455,6 +672,8 @@ jobs:
 
   fuzz:
     name: fuzz smoke (60 s)
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -501,6 +720,12 @@ jobs:
 
   release-smoke:
     name: release smoke (${{ matrix.os }})
+    needs: tier
+    # Risk tier: a pull request that touches a workflow or a release
+    # script also runs this job. Main, the nightly and a dispatch
+    # always run it.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' && needs.tier.outputs.workflows == 'true')) }}
     strategy:
       fail-fast: false
       matrix:
@@ -523,6 +748,8 @@ jobs:
 
   nightly-streak:
     name: nightly streak
+    # The slow tier: main, the nightly and a dispatch only.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     # A report, not a gate: the v0.8.0 line "the scheduled full suite

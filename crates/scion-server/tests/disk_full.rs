@@ -11,8 +11,18 @@
 //! `mount`, `remount`, and `umount` commands themselves.
 mod common;
 
+use scion_core::{Changeset, FileState, RepoPath};
+use scion_server::test_support::deadline::Deadline;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+use scion_server::test_support::tree;
+use scion_server::test_support::write;
 use scion_server::{Backend, Error};
+
+fn later() -> Deadline {
+    Deadline::new(std::time::Instant::now() + std::time::Duration::from_secs(600))
+}
+
+use crate::common::{REPO, author};
 
 fn required() -> bool {
     if !cfg!(target_os = "linux") {
@@ -189,7 +199,8 @@ fn a_full_metadata_disk_answers_out_of_space_and_needs_no_repair() {
     }
     if Backend::test_is_postgres() {
         // The metadata lives in the database then; its disk full is the
-        // SQLSTATE 53100 arm, not a data-directory row.
+        // SQLSTATE 53100 arm of the pg mapping, a unit test of pg.rs,
+        // not a data-directory row.
         return;
     }
     let mount = Mount::new("meta", "1m", "4096");
@@ -278,6 +289,44 @@ fn seed_client_blob(
 /// step: the disk fills and refuses, the gc routine frees what nothing
 /// names (a dry run first, then a real one), fsck is clean, and writes
 /// resume with no restart and no repair.
+/// The output of one `gc` run on `data`, dry or real. On the database
+/// backend the subprocess needs what the store's own open had: the URL,
+/// whose `options` carry the schema, so the gc's open lands in this
+/// directory's database corner and not beside it.
+fn gc_args(data: &std::path::Path, dry: bool) -> String {
+    let mut args = vec!["--data".to_owned(), data.display().to_string()];
+    if Backend::test_is_postgres()
+        && let Ok(url) = std::env::var("SCION_TEST_POSTGRES_URL")
+    {
+        // The URL is a flag of the root command, so it goes before the
+        // subcommand; its options carry this directory's schema.
+        let schema = Backend::test_schema(data).expect("the test names a schema");
+        args.push("--postgres-url".to_owned());
+        args.push(format!(
+            "{url}{}options=--search_path%3D{schema}",
+            if url.contains('?') { "&" } else { "?" }
+        ));
+    }
+    args.extend(["gc".to_owned(), "--grace-secs".to_owned(), "0".to_owned()]);
+    if dry {
+        args.push("--dry-run".to_owned());
+    }
+    let out = common::spawn_guard::across_spawn(|| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
+            .args(&args)
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("the gc command runs")
+    });
+    assert!(
+        out.status.success(),
+        "gc {} failed: {}",
+        if dry { "--dry-run" } else { "real" },
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
 #[test]
 fn a_disk_full_runbook_gcs_then_writes_resume() {
     if !required() {
@@ -329,32 +378,7 @@ fn a_disk_full_runbook_gcs_then_writes_resume() {
     // unnamed blobs. The blobs are seconds old, so the grace must be
     // zero for the run to take them.
     let data = mount.0.join("data");
-    let gc = |dry: bool| {
-        let mut args = vec![
-            "--data".to_owned(),
-            data.display().to_string(),
-            "gc".to_owned(),
-            "--grace-secs".to_owned(),
-            "0".to_owned(),
-        ];
-        if dry {
-            args.push("--dry-run".to_owned());
-        }
-        let out = common::spawn_guard::across_spawn(|| {
-            std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
-                .args(&args)
-                .env("NO_COLOR", "1")
-                .output()
-                .expect("the gc command runs")
-        });
-        assert!(
-            out.status.success(),
-            "gc {} failed: {}",
-            if dry { "--dry-run" } else { "real" },
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).to_string()
-    };
+    let gc = |dry: bool| gc_args(&data, dry);
     let dry = gc(true);
     assert!(dry.contains("(dry run)"), "a dry run labels itself: {dry}");
     let real = gc(false);
@@ -385,6 +409,27 @@ fn a_disk_full_runbook_gcs_then_writes_resume() {
     let freed = store.blobs().put(b"freed\n").unwrap();
     assert_eq!(store.blobs().get(freed).unwrap(), b"freed\n");
 
+    // The audit records the run it could not greet: both runs' intents
+    // failed to go in on the full disk, and the real run's line went in
+    // after the run freed the space, marked with why it was late. The
+    // dry run removed nothing, so its deferred line had nowhere to go.
+    let audit = std::fs::read_to_string(data.join("audit.log")).unwrap();
+    let lines: Vec<serde_json::Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "one deferred intent and one result: {lines:?}"
+    );
+    assert_eq!(lines[0]["event"], "admin");
+    assert_eq!(lines[0]["outcome"], "intent");
+    assert_eq!(lines[0]["what"], "gc");
+    assert_eq!(lines[0]["deferred"], "disk_full");
+    assert_eq!(lines[1]["event"], "admin");
+    assert_eq!(lines[1]["outcome"], "ok");
+
     // Step 2 of the runbook: fsck, and it is clean.
     let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
     assert!(report.is_clean(), "{:?}", report.problems);
@@ -402,4 +447,441 @@ fn a_disk_full_runbook_gcs_then_writes_resume() {
     let store = open_store(&mount, "reopen of the runbook test");
     let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
     assert!(report.is_clean(), "{:?}", report.problems);
+}
+
+/// A raw connection of the database, for the fill and the checks.
+fn raw(url: &str) -> postgres::Client {
+    postgres::Client::connect(url, postgres::NoTls).expect("the test database is up")
+}
+
+/// The SQLSTATE a store error carries, when it does.
+fn sqlstate(e: &Error) -> Option<String> {
+    use std::error::Error as _;
+    match e {
+        Error::Storage(storage) => {
+            let inner = storage.source()?;
+            let down = inner.downcast_ref::<postgres::Error>()?;
+            down.code().map(|state| state.code().to_owned())
+        }
+        _ => None,
+    }
+}
+
+/// The bytes free on the database's data directory: the tmpfs's size
+/// minus what the default tablespace holds. The run prints it at each
+/// phase, so one run shows the whole picture.
+fn free_bytes(client: &mut postgres::Client) -> String {
+    let used: i64 = client
+        .query_one("SELECT pg_tablespace_size('pg_default')", &[])
+        .expect("the tablespace size answers")
+        .get(0);
+    match std::env::var("SCION_PG_TMPFS_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+    {
+        Some(total) => format!("{} bytes free", total - used),
+        // The dry run has no tmpfs witness: report what is held.
+        None => format!("{used} bytes held (no tmpfs witness)"),
+    }
+}
+
+/// The database's data directory, as the database names it.
+fn data_dir(client: &mut postgres::Client) -> String {
+    client
+        .query_one("SHOW data_directory", &[])
+        .expect("the data directory answers")
+        .get::<_, String>(0)
+}
+
+/// A chunk the database cannot shrink: bytes of a plain pseudorandom
+/// sequence, so TOAST's compression keeps none of the room the test
+/// means to spend (run 7's evidence: a chunk of one repeated byte
+/// compressed 4:1, and the 64 MiB margin held under 1 MiB).
+#[allow(clippy::cast_possible_truncation)]
+fn incompressible(len: usize) -> Vec<u8> {
+    let mut state = 0x5343_494F_4E53_u64;
+    (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u8
+        })
+        .collect()
+}
+
+/// Fills the margin table to `total` bytes, the room the store's open
+/// and first lands will spend later. Its files unlink at the DROP, so
+/// freeing it needs no vacuum's luck about where the dead pages sit.
+fn fill_margin(client: &mut postgres::Client, chunk_len: usize, total: usize) {
+    client
+        .batch_execute(
+            "CREATE SCHEMA IF NOT EXISTS diskfull_filler;
+             CREATE TABLE IF NOT EXISTS diskfull_filler.margin (chunk bytea)",
+        )
+        .expect("the margin table is created");
+    let chunk = incompressible(chunk_len);
+    let mut put = 0usize;
+    while put < total {
+        client
+            .execute("INSERT INTO diskfull_filler.margin VALUES ($1)", &[&chunk])
+            .expect("the margin's insert lands");
+        put += chunk_len;
+    }
+    client
+        .batch_execute("CHECKPOINT")
+        .expect("the margin's checkpoint runs");
+}
+
+/// Fills the database with `chunk`-sized rows from its own connection
+/// until its on-disk size passes `ceiling` bytes, and returns the raw
+/// error of the insert that hit the full disk, when one did - the fill
+/// itself can be the write that fails first.
+fn fill(client: &mut postgres::Client, chunk_len: usize) -> Option<postgres::Error> {
+    client
+        .batch_execute("CREATE SCHEMA IF NOT EXISTS diskfull_filler")
+        .expect("the filler schema is created");
+    client
+        .batch_execute("CREATE TABLE IF NOT EXISTS diskfull_filler.filler (chunk bytea)")
+        .expect("the filler table is created");
+    let chunk = incompressible(chunk_len);
+    loop {
+        match client.execute("INSERT INTO diskfull_filler.filler VALUES ($1)", &[&chunk]) {
+            Ok(_) => {
+                // A checkpoint keeps the WAL small, so the tmpfs's space
+                // goes to the filler's heap pages and the margin holds.
+                client
+                    .batch_execute("CHECKPOINT")
+                    .expect("the checkpoint runs");
+            }
+            Err(e) => return Some(e),
+        }
+    }
+}
+
+/// Fills to a byte budget instead of to the wall: the dry run's fill,
+/// which stops while the disk still has room.
+fn fill_to(client: &mut postgres::Client, chunk_len: usize, budget: usize) {
+    client
+        .batch_execute(
+            "CREATE SCHEMA IF NOT EXISTS diskfull_filler;
+             CREATE TABLE IF NOT EXISTS diskfull_filler.filler (chunk bytea)",
+        )
+        .expect("the filler table is created");
+    let chunk = incompressible(chunk_len);
+    let mut put = 0usize;
+    while put < budget {
+        client
+            .execute("INSERT INTO diskfull_filler.filler VALUES ($1)", &[&chunk])
+            .expect("the dry fill's insert lands");
+        put += chunk_len;
+    }
+    client
+        .batch_execute("CHECKPOINT")
+        .expect("the dry fill's checkpoint runs");
+}
+
+/// A changeset whose rows are wide: many entries, each naming a path,
+/// so one land's metadata write must grow the database.
+/// The paths the lands rewrite: the root creates them, and each land
+/// either deletes or re-creates the set, so one land's metadata write
+/// is wide and the next land applies onto it.
+const WIDE_PATHS: usize = 400;
+
+fn wide_changeset(
+    store: &Backend,
+    name: &str,
+    create: bool,
+    blob: scion_core::BlobId,
+) -> Changeset {
+    let base = store
+        .read(|c| {
+            let repo = c.repo_id(REPO)?;
+            Ok(c.get_ref(repo, "main")?.expect("main exists").target)
+        })
+        .unwrap();
+    let author = crate::common::author();
+    let entries: std::collections::BTreeMap<_, _> = (0..WIDE_PATHS)
+        .map(|i| {
+            let state = if create {
+                Some(FileState::Regular {
+                    content: blob,
+                    executable: false,
+                })
+            } else {
+                None
+            };
+            (
+                RepoPath::new(format!("d/wide/f{i}.txt").as_str()).unwrap(),
+                state,
+            )
+        })
+        .collect();
+    Changeset::new(
+        vec![base],
+        author,
+        None,
+        format!("{name}\n").into_bytes(),
+        entries,
+    )
+    .expect("changeset fits the format")
+}
+/// Fills the margin and the filler: to the wall on the wet run (the
+/// 53100 must be the filler's own insert's error), to a budget on the
+/// dry one. The lands' count starts at the fill's chunk count, so the
+/// land names stay distinct.
+fn fill_all(client: &mut postgres::Client, dry: bool) -> usize {
+    println!("phase: before the fill, {}", free_bytes(client));
+    // The margin: room for the open, the repo, and the first lands.
+    // The wet run's lands spend about 14 KiB a land, so a small margin
+    // closes the wall within a few hundred lands - a big margin would
+    // spend itself on thousands of lands first (run 13's evidence: 64
+    // MiB was spent past the 5000-land backstop).
+    let margin = if dry { 8 } else { 12 } * 1024 * 1024;
+    fill_margin(client, 4 * 1024 * 1024, margin);
+    // The lands' count starts at the fill's chunk count, so the land
+    // names stay distinct from the filler's row names.
+    let landed = 0usize;
+    let filled_by = if dry {
+        // No wall to reach: the fill stops at a budget the dry disk
+        // holds with room to spare.
+        fill_to(client, 4 * 1024 * 1024, 32 * 1024 * 1024);
+        None
+    } else {
+        fill(client, 4 * 1024 * 1024)
+    };
+    if !dry {
+        match &filled_by {
+            Some(e) if e.code() == Some(&postgres::error::SqlState::DISK_FULL) => {
+                println!("the filler's insert took the 53100 first");
+            }
+            Some(e) => panic!("the fill failed with something else: {e:?}"),
+            None => {}
+        }
+    }
+    println!("phase: the fill ended, {}", free_bytes(client));
+    landed
+}
+
+/// Lands wide changesets until the wall stops one (the wet run: the
+/// error and the stopped changeset's bytes come back for the retry),
+/// or until 40 have landed (the dry run: the last land's id). The
+/// count rides in `from` so the land names stay distinct.
+/// How the lands ended: the last land's id, and the wall - the error
+/// and the stopped changeset's bytes, for the retry - when one stopped
+/// them.
+type LandStop = (
+    Option<scion_core::ChangesetId>,
+    Result<(), (Error, Vec<u8>)>,
+);
+
+fn land_until(store: &Backend, from: usize, blob: scion_core::BlobId, dry: bool) -> LandStop {
+    let mut landed = from;
+    let mut last = None;
+    loop {
+        // A backstop: lands that never stop mean the fill was not full,
+        // which is this test's own failure, not the server's.
+        assert!(landed < 5000, "the lands never hit the database's limit");
+        if dry && landed == 40 {
+            return (last, Ok(()));
+        }
+        landed += 1;
+        let cs = wide_changeset(store, &format!("fill{landed}"), landed % 2 == 1, blob);
+        // The helper stores the changeset and its tree; the ref move is
+        // the land's own act, so main advances here and the next land's
+        // base tree holds the last land's files.
+        let id = match write::create_changeset(store, REPO, &cs.encode(), &later()) {
+            Ok(id) => id,
+            Err(e) => return (last, Err((e, cs.encode()))),
+        };
+        move_main(store, id);
+        last = Some(id);
+    }
+}
+
+#[test]
+fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
+    if !Backend::test_is_postgres() {
+        println!("skipping: the database's own disk full is a Postgres row");
+        return;
+    }
+    // The dry run: the plumbing of this row - margin, drop, open, repo,
+    // wide lands - against any Postgres, with the fill capped small and
+    // the lands stopped by a count. No wall, so no 53100 to assert; the
+    // point is that a dispatch is not the first run of a change here.
+    let dry = std::env::var("SCION_PG_DISKFULL_DRY").is_ok();
+    // The wet run needs the tmpfs's witness: the workflow's job mounts
+    // the small disk and says so here. SHORTCUT: the env var is the
+    // tmpfs's only witness - a local run against a big disk would fill
+    // for hours before 53100.
+    let bytes = match std::env::var("SCION_PG_TMPFS_BYTES") {
+        Ok(bytes) => bytes,
+        Err(_) if dry => String::new(),
+        Err(_) => {
+            println!(
+                "skipping: set SCION_PG_TMPFS_BYTES to the service's tmpfs size, or SCION_PG_DISKFULL_DRY=1 for the dry run"
+            );
+            return;
+        }
+    };
+    if !dry {
+        bytes
+            .parse::<u64>()
+            .expect("SCION_PG_TMPFS_BYTES must be a number of bytes");
+    }
+    let url = std::env::var("SCION_TEST_POSTGRES_URL").expect("SCION_TEST_POSTGRES_URL");
+    let mut client = raw(&url);
+    if !dry {
+        // The wet run's data directory is the service container's own;
+        // the job cannot see it, and the env var is the witness instead.
+        let dir = data_dir(&mut client);
+        if !std::path::Path::new(&dir).exists() {
+            println!("the data directory {dir} is the service's own; the env var vouches for it");
+        }
+    }
+    // The WAL is off the tmpfs (the service mounts it elsewhere), so a
+    // heap extend is the write that fails, with the clean 53100 - a
+    // lost connection is the Database unreachable row, not this one.
+    let landed = fill_all(&mut client, dry);
+    // Free the margin: the DROP unlinks the margin table's files at
+    // commit, so the room returns with nothing left to luck - a VACUUM
+    // only truncates a table's empty tail (run 4's evidence). The
+    // store's open and lands spend the freed room until the wall
+    // closes again.
+    client
+        .batch_execute("DROP TABLE diskfull_filler.margin;")
+        .expect("the margin frees");
+    println!("phase: the margin dropped, {}", free_bytes(&mut client));
+
+    // The proving write: lands a client would run, through the store's
+    // own write path, until the wall stops one of them.
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let store = Backend::open_test(&data).expect("the store opens");
+    // The repo, its root changeset, and the ref main, all through the
+    // same open the lands below use: a second open of one schema cannot
+    // run beside the first (the per-schema one-server lock), and a bare
+    // repo has no main for the lands' parent read.
+    let blob = repo_with_main(&store);
+    let (last_land, stopped) = land_until(&store, landed, blob, dry);
+    let last_land = last_land.expect("the lands landed at least one");
+    if let Ok(()) = stopped {
+        // The dry arm: the plumbing ran; the row's read, drop, and the
+        // land after, close it out.
+        println!("dry: the lands landed with no wall in the way");
+        client
+            .batch_execute("DROP SCHEMA diskfull_filler CASCADE")
+            .expect("the filler drops");
+        client
+            .batch_execute("CHECKPOINT")
+            .expect("the checkpoint runs");
+        store
+            .write(|c| c.create_repo("after"))
+            .expect("the same write lands");
+        return;
+    }
+    let Err((outcome, failed)) = stopped else {
+        unreachable!("the dry arm returned above");
+    };
+    // The wet run's break carries the error; a land that never fails is
+    // the backstop's own panic above.
+    assert!(
+        sqlstate(&outcome).as_deref() == Some("53100"),
+        "the proving write failed another way: {outcome:?}"
+    );
+    // The clean 53100, mapped to the disk-full storage class - the
+    // class the fixed ResourceExhausted reply rides on (the pg_error_of
+    // unit test pins the reply's text). The WAL is off the tmpfs, so a
+    // heap extend is the write that fails, and a lost connection cannot
+    // wear the disk's reply.
+    assert!(
+        is_out_of_space(&outcome),
+        "the full database's write must map to out of space: {outcome:?}"
+    );
+    // Reads work on both arms: the rows the fill landed are still there.
+    let read: i64 = client
+        .query_one("SELECT count(*) FROM diskfull_filler.filler", &[])
+        .expect("the filler reads")
+        .get(0);
+    assert!(read > 0, "the filler's rows vanished");
+
+    // Reads work through the store while the disk is full: main names
+    // the last land, and that land's blob reads back whole.
+    assert_eq!(main_target(&store), last_land, "main names the last land");
+    let readback = store.blobs().get(blob).expect("the blob reads");
+    assert_eq!(readback, incompressible(64), "the blob reads back whole");
+
+    // The space comes back, and the exact write the wall stopped - the
+    // same encoded bytes - lands now, and main moves to it.
+    client
+        .batch_execute("DROP SCHEMA diskfull_filler CASCADE")
+        .expect("the filler drops");
+    client
+        .batch_execute("CHECKPOINT")
+        .expect("the checkpoint runs");
+    let retried = write::create_changeset(&store, REPO, &failed, &later())
+        .expect("the stopped write lands once the database has room");
+    move_main(&store, retried);
+    assert_eq!(
+        main_target(&store),
+        retried,
+        "main moves to the retried write"
+    );
+}
+
+/// Moves the ref main to `id`: the ref move is the land's own act, so
+/// every stored changeset needs this to become the head.
+fn move_main(store: &Backend, id: scion_core::ChangesetId) {
+    let head = store
+        .read(|c| {
+            let repo = c.repo_id(REPO)?;
+            Ok(c.get_ref(repo, "main")?
+                .map(|r| (repo, r.version))
+                .expect("main exists"))
+        })
+        .unwrap();
+    store
+        .write(|c| {
+            assert!(c.cas_ref(head.0, "main", Some(head.1), id)?, "main moves");
+            Ok(())
+        })
+        .expect("main advances");
+}
+
+/// The repo the lands land into: the root changeset, the ref main,
+/// and one stored blob the re-creations share - all through the same
+/// open the lands use (a second open of one schema cannot run beside
+/// the first: the per-schema one-server lock).
+fn repo_with_main(store: &Backend) -> scion_core::BlobId {
+    // The blob the re-creations share: stored first, then named a
+    // member of the repo, so the lands' checks accept it.
+    let blob = store.blobs().put(&incompressible(64)).unwrap();
+    store
+        .write(|c| {
+            let repo = c.create_repo(REPO)?;
+            let root = Changeset::new(
+                vec![],
+                author(),
+                None,
+                b"root\n".to_vec(),
+                std::collections::BTreeMap::new(),
+            )
+            .expect("the root fits the format");
+            let (id, _) = tree::store_changeset(c, repo, &root, &mut tree::lens_of(store))?;
+            assert!(c.cas_ref(repo, "main", None, id)?);
+            c.add_repo_blobs(repo, &[blob])?;
+            Ok(())
+        })
+        .expect("the repo and its main land");
+    blob
+}
+
+/// The ref main's target, read through the store.
+fn main_target(store: &Backend) -> scion_core::ChangesetId {
+    store
+        .read(|c| {
+            let repo = c.repo_id(REPO)?;
+            Ok(c.get_ref(repo, "main")?.expect("main exists").target)
+        })
+        .expect("main reads")
 }

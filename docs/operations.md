@@ -115,7 +115,7 @@ drain still waits for.
 #### One server, and no automatic failover
 
 There is no automatic failover. One active server holds the store: a
-second server on the same data directory (or the same Postgres database)
+second server on the same data directory (or the same Postgres schema)
 refuses to start, and a running server whose lock the database gave to
 another process is fenced — it answers `FailedPrecondition` to every call
 and exits. That is the guard against two servers taking one store, not a
@@ -264,9 +264,10 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
   transaction per migration, under a database lock with the same 5 s clock:
   an open that waits longer answers busy, and the caller retries. A
   database of a newer build is refused: run that build's server.
-- One server process serves one database: a second `serve` on the same
-  `--postgres-url` fails at its open with "another server holds this
-  database". An import does not take that lock and runs beside a server.
+- One server process serves one store - a data directory, or a Postgres
+  schema: a second `serve` on the same `--postgres-url` (and schema)
+  fails at its open with "another server holds this store". An import
+  does not take that lock and runs beside a server.
 - The server opens one write connection and a pool of 8 read
   connections, plus the short-lived connections of a migration or an
   import. Size the database's `max_connections` for all of it: the
@@ -275,8 +276,9 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
   refuses the server's next connection, and every call that needs one
   answers `unavailable` until one is free.
 - The one-server rule and the write queue are Postgres advisory locks,
-  visible as `pg_locks` rows of kind `advisory`: the one-server lock
-  and the migration lock are fixed keys of the database, and every
+  visible as `pg_locks` rows of kind `advisory`: the one-server lock is
+  a key of the schema `current_schema()` names, the migration lock is a
+  fixed key of the database, and every
   write transaction also takes the schema's collector key
   (`pg_advisory_xact_lock(hashtext(current_schema() || ':gc'))`),
   which orders it against the collector's sweeps and gives up on that
@@ -298,7 +300,11 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
   the database against a directory that names another store is refused
   with both UUIDs, so a restore that mixes a database with the wrong
   directory fails at the start instead of serving metadata whose blobs
-  are not on this disk.
+  are not on this disk. A directory whose marker names a store also
+  refuses a database that holds no store at all - the usual cause is a
+  `--postgres-url` whose search_path names a schema no store ever
+  served - so the mistake fails at the start, not as "repo not found"
+  on every later call.
 - One server process serves one database, and it stays that way: if the
   server's connection drops and the lock is lost to another process, the
   server is fenced. Every read and write fails with the loss named, the
@@ -369,6 +375,18 @@ The server records an audit log: an append-only JSON-lines file of
 refused authentication (counted per peer), writes, ref changes, lands
 and administrative changes, with no tokens and no contents. It lives at
 `audit.log` in the data directory; `--audit-file` puts it elsewhere.
+The CLI's state-changing subcommands record their own admin lines in
+the same file: one intent before a change, and one result after it.
+Every state-changing command is covered: gc, import, restore, derive,
+ticket-key generation, and the schema migration an open performs. The
+restore's lines land in the restored store's own
+audit file, so its history opens with the restore that made it. The
+collector is the runbook's cure for a full disk, so a gc whose intent
+cannot go in because the disk is full runs anyway, and records its
+intent, marked `deferred: disk_full`, after it freed the space. The
+migration's line has no intent before it: it ran inside the store's
+open, before the audit could exist, so its record, marked with the
+versions it moved, goes in as soon as the audit exists.
 There is no way to turn it off: a server that cannot record refuses the
 changes it cannot account for, and flips readiness until a restart. The
 file is mode 0600, never a symlink, in a directory only the server's
@@ -378,6 +396,16 @@ The lines of concurrent changes can appear in a different order than the
 changes themselves: each job records its result after its change. Each
 ref line names its old and new head, so a ref's history is rebuilt by
 linking old to new, not by line order.
+
+Every intent line gets one result line: the store job that claimed the
+change writes it, and a call that dies before its job starts has its
+drop answer `cancelled`; a land the sweep rejects at the next start is
+answered by the sweep (`why: stale`) — that line carries a fresh
+request id of its own, because the sweep does not know the intent's:
+the auditor joins it to the intent on the request key and the land id.
+One change is left where the result can be missing: a job that dies
+after it claimed the call but before it recorded anything - the server
+log then carries what the audit line cannot.
 
 ### Folder read rules
 
@@ -681,7 +709,9 @@ Proof: crates/scion-server/tests/backup.rs::a_backup_taken_while_serving_restore
 The schema version lives in the database. On open, a server migrates an
 older schema forward, one migration per released version, each in one
 transaction, with its progress in the log (a migration can take a while:
-schema 4 walks every repo's changesets). Two rules:
+schema 4 walks every repo's changesets; on Postgres, schema 5 renumbers
+the changeset parents from one to zero, the numbering SQLite always
+wrote). Two rules:
 
 - A database with a **newer** schema than the binary refuses to open:
   `corrupt data: database schema version 7 is newer than this build (6)`.

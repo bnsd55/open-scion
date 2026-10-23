@@ -1,0 +1,157 @@
+//! The import's history nodes are written in batches: the nodes the
+//! transaction inserted answer its own reads, and the flush writes one
+//! statement per 1,000 rows after the derived rows. The statement count
+//! is a process-wide seam, so this guard owns its binary: no other test
+//! speaks SQL in its process. Only the history family's statements are
+//! counted, so the changeset, tree, derived and provenance writes of the
+//! same import stay out. On SQLite the count is always zero, which is
+//! why the guard skips there.
+
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+use scion_server::{Backend, ImportOptions, import_git};
+
+/// A throwaway git repository. `fast_commits` writes a chain of commits
+/// on `main` with `git fast-import`, which is fast for long histories.
+struct Git(tempfile::TempDir);
+
+impl Git {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let out = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(dir.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        Self(dir)
+    }
+
+    /// Commits `n` commits on `main`, one file each. Returns the tip.
+    fn fast_commits(&self, n: usize) -> String {
+        let mut stream = Vec::new();
+        for i in 0..n {
+            let (message, content) = (format!("c{i}\n"), format!("{i}\n"));
+            let when = 1_700_000_000 + i;
+            writeln!(stream, "commit refs/heads/main").unwrap();
+            writeln!(stream, "committer Bob <bob@example.com> {when} +0000").unwrap();
+            write!(stream, "data {}\n{message}", message.len()).unwrap();
+            writeln!(stream, "M 100644 inline g/f{i}").unwrap();
+            writeln!(stream, "data {}\n{content}", content.len()).unwrap();
+        }
+        let mut child = Command::new("git")
+            .args(["fast-import", "--quiet"])
+            .current_dir(self.0.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&stream).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "git fast-import: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "main"])
+                .current_dir(self.0.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim_end()
+        .to_owned()
+    }
+
+    fn path(&self) -> &std::path::Path {
+        self.0.path()
+    }
+}
+
+fn opts(rev: &str) -> ImportOptions {
+    ImportOptions {
+        rev: rev.to_owned(),
+        target_ref: "main".to_owned(),
+        verify_sample: 1000,
+    }
+}
+
+#[test]
+fn the_imports_history_family_costs_no_statement_per_commit() {
+    if !Backend::test_is_postgres() {
+        eprintln!("skip on sqlite: the statement count is a Postgres seam");
+        return;
+    }
+    for n in [100, 1000] {
+        let git = Git::new();
+        let tip = git.fast_commits(n);
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::open_test(dir.path()).unwrap();
+        Backend::test_reset_statement_count();
+        import_git(&store, "main", git.path(), &opts(&tip)).unwrap();
+        let log = Backend::test_statement_log();
+        let count = u64::try_from(
+            log.iter()
+                .filter(|sql| sql.contains("history_nodes"))
+                .count(),
+        )
+        .unwrap_or(u64::MAX);
+        let flushes = u64::try_from(
+            log.iter()
+                .filter(|sql| sql.contains("INSERT INTO history_nodes") && sql.contains("unnest"))
+                .count(),
+        )
+        .unwrap_or(u64::MAX);
+        eprintln!(
+            "the import of {n} commits wrote the history family in {count} statements, of which {flushes} were the batch's flushes"
+        );
+        let mut shapes: Vec<(String, usize)> = Vec::new();
+        for sql in log.iter().filter(|sql| sql.contains("history_nodes")) {
+            let short = sql.split_whitespace().take(4).collect::<Vec<_>>().join(" ");
+            match shapes.iter_mut().find(|(s, _)| *s == short) {
+                Some((_, c)) => *c += 1,
+                None => shapes.push((short, 1)),
+            }
+        }
+        eprintln!("history shapes: {shapes:?}");
+        // The batch wrote the history nodes. An import that drops the
+        // flush leaves the table empty and fails here.
+        let schema = Backend::test_schema(dir.path())
+            .expect("the test backend is postgres, so the schema is named");
+        let mut client = postgres::Client::connect(
+            &std::env::var("SCION_TEST_POSTGRES_URL").unwrap(),
+            postgres::NoTls,
+        )
+        .unwrap();
+        let rows = client
+            .query(&format!("SELECT count(*) FROM {schema}.history_nodes"), &[])
+            .unwrap();
+        let stored: i64 = rows[0].get(0);
+        assert!(
+            stored > 0,
+            "the import of {n} commits stored no history nodes: the flush dropped them"
+        );
+        // No statement per commit: the nodes the transaction inserted
+        // answer its reads, and the flush writes one statement per 1,000
+        // rows. The residue is a constant per transaction - the flush
+        // and the reads of the transaction's first commits' parents'
+        // nodes. A per-commit put or read adds a statement per commit
+        // and breaks this bound.
+        let residue = count.saturating_sub(flushes);
+        assert!(
+            residue <= 6 * flushes + 6,
+            "the import of {n} commits spent {residue} history statements past the \\
+             flushes, over the 6 per batch transaction ({flushes} transactions) \\
+             the batch costs"
+        );
+    }
+}
