@@ -1,0 +1,34 @@
+name: nightly flaky report
+
+# A red nightly records itself: one issue titled "nightly: flaky or
+# real?" collects every red scheduled run as a comment, and the v0.8.0
+# streak reaches 30 only while that issue is closed or absent. The
+# trigger is the completion of CI, not a job list that must name every
+# job of ci.yml: any job's failure at night reaches this file.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  report:
+    name: report a red nightly
+    # Only a scheduled run that failed: a pull request's red run is the
+    # author's to read, and a green night records nothing.
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: the flaky-or-real record
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: scripts/nightly-flaky.sh "$RUN_ID"
