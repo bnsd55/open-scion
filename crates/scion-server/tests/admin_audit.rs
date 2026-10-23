@@ -4,6 +4,8 @@
 //! whether it was a dry run, and the report's counts - never a token, a
 //! blob ID, or a file path.
 
+mod common;
+
 use std::fs;
 use std::process::{Command, Output};
 
@@ -281,21 +283,34 @@ fn one_changeset(parents: Vec<ChangesetId>, changes: &[(&str, Option<FileState>)
 }
 
 /// A store with a repository `hist` whose main holds one changeset over
-/// one blob. The caller must drop the store before the CLI opens it.
+/// one blob. When the function returns, the store is closed and its
+/// server lock is released, so the CLI a test spawns next opens the
+/// directory at once.
 fn seed_exportable(data: &std::path::Path) {
     fs::create_dir_all(data).unwrap();
-    let store = scion_server::Backend::open(data, None, None).unwrap();
-    store.blobs().put(b"a\n").unwrap();
-    store
-        .write(|c| {
-            let repo = c.create_repo("hist")?;
-            let cs = one_changeset(Vec::new(), &[("a.txt", Some(regular("a\n")))]);
-            let id =
-                scion_server::test_support::tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0;
-            assert!(c.cas_ref(repo, "main", None, id)?);
-            Ok(())
-        })
-        .unwrap();
+    {
+        let store = scion_server::Backend::open(data, None, None).unwrap();
+        store.blobs().put(b"a\n").unwrap();
+        store
+            .write(|c| {
+                let repo = c.create_repo("hist")?;
+                let cs = one_changeset(Vec::new(), &[("a.txt", Some(regular("a\n")))]);
+                let id =
+                    scion_server::test_support::tree::store_changeset(c, repo, &cs, &mut |_| {
+                        Ok(0)
+                    })?
+                    .0;
+                assert!(c.cas_ref(repo, "main", None, id)?);
+                Ok(())
+            })
+            .unwrap();
+    }
+    // The drop above releases server.lock, but the release can lag the
+    // drop by a scheduler tick (the macOS lesson in wait_for_lock_release's
+    // doc): CI saw the spawned `derive` refuse the directory as in use.
+    // The wait takes the real condition -- the lock is free -- instead of
+    // a timing guess, so a real leak still fails.
+    common::spawn_guard::wait_for_lock_release(data);
 }
 
 /// One real import: one admin intent before, one admin ok after, with
