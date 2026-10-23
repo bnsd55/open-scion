@@ -453,6 +453,65 @@ impl Drop for Server {
     }
 }
 
+/// Starts a server on `data` right after a kill. The killed server's
+/// store lock outlives the SIGKILL by a moment: on Postgres the
+/// advisory lock dies with the killed server's session, when the
+/// database gets around to ending that backend, and on SQLite the
+/// flock tears down when the kernel reaps the process. The wait takes
+/// the real condition, bounded at 10 s, and retries ONLY the holder
+/// refusal, one line per try with the elapsed time; any other exit
+/// fails at once.
+pub(crate) fn start_after_kill(data: &Path, log: &Path) -> Server {
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(10);
+    loop {
+        let mark = usize::try_from(fs::metadata(log).map_or(0, |m| m.len()))
+            .expect("the log's length fits usize");
+        let mut server = Server::spawn(data, log);
+        let mut listening = false;
+        loop {
+            if server.listens(log) {
+                listening = true;
+                break;
+            }
+            if let Some(status) = server.try_wait() {
+                let text = fs::read_to_string(log).unwrap_or_default();
+                let fresh = &text[mark..];
+                // Postgres refuses with the holder message of the
+                // advisory lock; SQLite with the one of the flock.
+                let holder = fresh.contains("another server holds this store")
+                    || fresh.contains("is in use by another server");
+                assert!(
+                    holder,
+                    "the server exited with {status}:
+{fresh}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the server never listened within 10 s:
+{}",
+                fs::read_to_string(log).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if listening {
+            return server;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the store lock of {} was never released within 10 s",
+            data.display()
+        );
+        eprintln!(
+            "start_after_kill: the store lock is still held by the killed              server's session, retrying at {} ms",
+            start.elapsed().as_millis()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 impl Server {
     /// Freezes the server, and waits until the kernel says it stopped:
     /// SIGSTOP takes effect on the child's own schedule, and a cut that
