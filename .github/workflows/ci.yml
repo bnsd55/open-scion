@@ -497,7 +497,9 @@ jobs:
         if: always()
         run: |
           sudo umount /mnt/xfs || true
-          [ -n "$xfs_loop" ] && sudo losetup -d "$xfs_loop" || true
+          # shellcheck: a bare A && B || C is not if-then-else; the if
+          # form is what is meant, and shellcheck SC2015 agrees.
+          if [ -n "$xfs_loop" ]; then sudo losetup -d "$xfs_loop"; fi
 
   power-loss:
     name: power-loss
