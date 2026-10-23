@@ -377,7 +377,6 @@ jobs:
           export CARGO_LLVM_COV_TARGET_DIR="$PWD/target/coverage"
           export CARGO_TARGET_DIR="$PWD/target/coverage"
           nice -n 19 cargo build --workspace --tests
-          ls target/coverage | head -3
           cargo llvm-cov report --summary-only --fail-under-lines 80 \
             ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
             | tee target/coverage/report-summary.txt
