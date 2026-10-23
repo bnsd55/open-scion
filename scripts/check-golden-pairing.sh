@@ -28,27 +28,38 @@ case $branch in
     release/*) exit 0 ;;
 esac
 
-# One row per golden: the files whose change pins the format, and the
-# document whose version line must move in the same pull request, with
-# the pattern that line matches. A golden file the pull request ADDS
-# is its initial pin, not a re-pin: the pairing tests in the tree hold
-# that first pin against the doc, and this check holds every later
-# change of the golden against the doc's diff. A golden that changed
-# without its doc's version line means an old reader meets new bytes:
-# the break the version rules exist for.
+# Two rules, per the docs they serve.
+#
+# VERSION (the byte goldens of existing messages): the pinned bytes
+# changed, so the document's version line must move in the same pull
+# request - the bytes ARE the grammar, and an old reader meets new
+# bytes otherwise.
+#
+# DESCRIBE (proto/scion.proto and the surface golden): an additive
+# field needs NO new version (docs/protocol-v1.md's additive table), so
+# demanding a version bump would force a v2 for every allowed change.
+# The same pull request must change the document, any line: the
+# contract must describe the new surface.
+#
+# A golden file the pull request ADDS is its initial pin, not a re-pin:
+# the in-tree tests hold that first pin against the doc, and this
+# check holds every later change of the golden against the doc's diff.
 table=(
-    "crates/scion-core/tests/golden.rs|docs/format-v1.md|^# Scion object format v"
-    "crates/scion-proto/tests/protocol_wire_v1.golden|docs/protocol-v1.md|describes version "
-    "crates/scion-proto/tests/protocol_surface_v1.golden|docs/protocol-v1.md|describes version "
-    "crates/scion-proto/proto/scion.proto|docs/protocol-v1.md|describes version "
+    "version|crates/scion-core/tests/golden.rs|docs/format-v1.md|^# Scion object format v"
+    "version|crates/scion-proto/tests/protocol_wire_v1.golden|docs/protocol-v1.md|describes version "
+    "describe|crates/scion-proto/tests/protocol_surface_v1.golden|docs/protocol-v1.md|."
+    "describe|crates/scion-proto/proto/scion.proto|docs/protocol-v1.md|."
+    "describe|proto/scion.proto|docs/protocol-v1.md|."
     "crates/scion-server/tests/archive_v1.golden|docs/archive-format.md|^Version [0-9]+ is this document"
     "crates/scion-server/tests/archive_golden.rs|docs/archive-format.md|^Version [0-9]+ is this document"
 )
 
 failed=0
 for row in "${table[@]}"; do
-    golden=${row%%|*}
+    rule=${row%%|*}
     rest=${row#*|}
+    golden=${rest%%|*}
+    rest=${rest#*|}
     doc=${rest%%|*}
     pattern=${rest#*|}
     if git diff --name-only --diff-filter=A "$base" "$head" -- "$golden" | grep -q .; then
@@ -60,11 +71,19 @@ for row in "${table[@]}"; do
     if git diff "$base" "$head" -- "$doc" | grep -E "^[+-].*$pattern" | grep -q .; then
         continue
     fi
-    echo "golden pairing: '$golden' changed on branch '$branch', but" >&2
-    echo "'$doc' version line did not. A golden change is a format" >&2
-    echo "change: move the document's version line in the same pull" >&2
-    echo "request, and name the break in a changes/ fragment. If this" >&2
-    echo "change is not a format break, it must not touch the golden." >&2
+    if [ "$rule" = version ]; then
+        echo "golden pairing: '$golden' changed on branch '$branch', but" >&2
+        echo "'$doc' version line did not. A pinned-byte change is a" >&2
+        echo "format change: move the document's version line in the same" >&2
+        echo "pull request, and name the break in a changes/ fragment. If" >&2
+        echo "this change is not a format break, it must not touch the" >&2
+        echo "golden." >&2
+    else
+        echo "contract doc: '$golden' changed on branch '$branch', but" >&2
+        echo "'$doc' did not. An additive surface change needs no new" >&2
+        echo "version, but the contract must describe it: change" >&2
+        echo "'$doc' in the same pull request (any line)." >&2
+    fi
     failed=1
 done
 exit "$failed"
