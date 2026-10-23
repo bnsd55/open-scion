@@ -230,7 +230,7 @@ jobs:
     # a bad license fails on the pull request instead of on main after
     # the merge. A draft skips every job, this one included.
     if: >-
-      ${{ github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.deps == 'true') }}
+      ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.deps == 'true')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
