@@ -123,14 +123,16 @@ leaves behind, and whether the next holder checks it.
 | `store.rs:172` `writers: Mutex<usize>` + `write_woken` | the writer count for the handoff | a stale count | SAFE — the count is repaired by `WriteWaiter`'s Drop, which runs on unwind |
 | `store.rs:2021` the flush-state lock | the flush bookkeeping | a stale marker | SAFE — the holder holds it only across counter reads and `fetch_max`es; no panic point inside leaves an inconsistent value (counters are monotonic) |
 | `store.rs:2062,2114` `SPAWNS: RwLock` | the spawn-serialization guard | — | SAFE — it fails loud (`.expect("not poisoned")`), which is fail-closed |
-| `derived.rs:178` `flights: Mutex<HashMap<FlightKey, Arc<Flight>>>` | which repo/kind walks are live | a live flight whose walk never retires: every later joiner waits for a walk counter that never moves — a caller with no deadline waits forever | UNSAFE — fixed in the panic-fix PR: `retire` runs on unwind, the panic still propagates, and the next caller owns a fresh walk |
+| `derived.rs:178` `flights: Mutex<HashMap<FlightKey, Arc<Flight>>>` | which repo/kind walks are live | a live flight whose walk never retires: every later joiner waits for a walk counter that never moves — a caller with no deadline waits forever. Two exit paths leaked it: the panic unwind past `retire`, and the permit wait's early `?` on the owner's deadline | UNSAFE — fixed in the panic-fix PR: one drop guard (`RetireOnDrop`), created the moment the join makes the caller an owner, retires the flight on every exit; the panic still propagates. Tests: a panicking derive (the next caller owns a fresh walk) and a permit timeout (red before: the next caller hung to its DeadlineExceeded; green: it finishes the chain) |
 | `derived.rs:180` `in_flight: Mutex<usize>` | the walk-permit count | a stale permit count | SAFE — `Permit`'s Drop runs on unwind and decrements |
-| `derived.rs` `flight.walks` per-flight counter + `woken` | the walk-end signal for waiters | a counter that never advances | covered by the `flights` fix above: with `retire` on unwind the waiters wake and take over a fresh walk |
+| `derived.rs` `flight.walks` per-flight counter + `woken` | the walk-end signal for waiters | a counter that never advances | covered by the `flights` fix above: with `retire` on every owner exit the waiters wake and take over a fresh walk |
 | `service.rs`/`listen.rs` semaphores and slot maps | connection/stream accounting | a leaked slot | SAFE — every holder holds it across `.await`-free counter ops; the panic points sit outside the critical sections, and the slot Drop runs on unwind |
 
-The fix PR carries: the flight-leak fix with a panicking test kind (red:
-the next caller hangs to its deadline; green: it owns a fresh walk),
-and the worker-spawn fix with the error path.
+The fix PR (#568) carries: the flight-leak fix — one drop guard over
+both leak paths — with two tests (a panicking derive; a permit timeout
+whose red run hung the next caller to its DeadlineExceeded), and the
+worker-spawn fix with the error path (EAGAIN cannot be forced
+in-process; stated in the PR).
 
 | `todo!`/`unimplemented!` in production code: none | grep across the five crates | fixed (none exist) |
 | Warn-and-continue: the import records and counts per-commit failures against the ledger; the two `eprintln!` skip lines are inside test-only helpers | `crates/scion-server/src/pg.rs:4437`, `gc.rs:1017` (both test helpers) | fixed by design (no production warn-and-continue on a correctness boundary) |
