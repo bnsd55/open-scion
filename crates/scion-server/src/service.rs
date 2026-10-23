@@ -3371,7 +3371,12 @@ mod tests {
             .collect();
         let started = Instant::now();
         while busy() < MAX_GRAPH_QUERIES {
-            assert!(started.elapsed() < Duration::from_secs(10), "the jobs run");
+            // A liveness bound, not a speed claim: only a call that
+            // never takes its slot fails here. A slow runner (the arm64
+            // debug build) may take a while to schedule the jobs; 120 s
+            // is generous to it and still fails a hang in a test's
+            // time.
+            assert!(started.elapsed() < Duration::from_secs(120), "the jobs run");
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -3388,7 +3393,11 @@ mod tests {
             blocker.join().unwrap().unwrap();
         }
         for call in calls {
-            let answer = tokio::time::timeout(Duration::from_secs(10), call)
+            // A liveness bound, not a speed claim: a parked job waits
+            // for a read connection the blockers hold, then runs a
+            // handful of queries; only a starved or deadlocked call
+            // fails a 120 s timeout, on any runner's speed.
+            let answer = tokio::time::timeout(Duration::from_secs(120), call)
                 .await
                 .expect("every call ends")
                 .unwrap();

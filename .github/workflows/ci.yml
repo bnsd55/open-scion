@@ -163,6 +163,8 @@ jobs:
         run: scripts/lint-workflows.sh
       - name: the capacity reader counters count the log's own shapes
         run: scripts/test-capacity-counters.sh
+      - name: a script that dies leaves no owned process
+        run: scripts/test-owned-run.sh
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
@@ -215,6 +217,28 @@ jobs:
         with:
           tool: cargo-deny@0.20.2
       - run: cargo deny check
+      # Each fuzz sub-workspace holds its own Cargo.lock, which the
+      # root check never reads: an advisory can ride it unseen (it did:
+      # RUSTSEC-2026-0382 sat in all four fuzz lockfiles while the root
+      # was clean). The same config runs in each, so the floors the
+      # root holds hold here too.
+      - name: cargo deny check, in every fuzz sub-workspace
+        run: |
+          for lock in crates/*/fuzz/Cargo.lock; do
+            dir="$(dirname "$lock")"
+            # Fail closed: cargo-deny only warns when its config is
+            # missing and runs with defaults, which could pass with the
+            # wrong rules. A moved or renamed config fails the job here.
+            if [ ! -f "$dir/deny.toml" ]; then
+              echo "::error::$dir has no deny.toml; refusing to run cargo deny with defaults"
+              exit 1
+            fi
+            echo "== cargo deny check in $dir"
+            (cd "$dir" && cargo deny --config deny.toml check)
+          done
+      # A new sub-workspace whose lockfile sits outside the loop above
+      # would carry advisories unseen again; this names it.
+      - run: scripts/check-deny-coverage.sh
 
   test:
     name: test
@@ -268,8 +292,13 @@ jobs:
           SCION_DMW_REQUIRE: "1"
           SCION_DMW_REPLAY: ${{ runner.temp }}/replay-log
 
+  # The Postgres majors the support matrix claims (docs/support.md):
+  # one native service per major, one matrix row each. The majors are
+  # the upstream-supported ones the project claims - checked against
+  # postgresql.org/support/versioning when this list last moved; a
+  # major leaves the list when upstream does.
   test-postgres:
-    name: test (postgres)
+    name: test (postgres ${{ matrix.version }})
     needs: tier
     # Risk tier: a pull request that touches Postgres or metadata code
     # also runs this job, on one Postgres version as today. Main, the
@@ -278,9 +307,13 @@ jobs:
       ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' && needs.tier.outputs.pg == 'true')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["16.15", "17.11", "18.6"]
     services:
       postgres:
-        image: postgres:17.11
+        image: postgres:${{ matrix.version }}
         env:
           POSTGRES_PASSWORD: scion
           POSTGRES_DB: scion
@@ -348,13 +381,13 @@ jobs:
           fi
 
       # The takeover test stops the database and restarts it. The service
-      # container of this job is the only postgres:17.11 on the runner, and
-      # it belongs to this job alone, so it may go down and come back.
-      # It must run after the tests above: it takes the database down
-      # while it runs.
+      # container of this job is the only postgres image of this job's
+      # version on the runner, and it belongs to this job alone, so it
+      # may go down and come back. It must run after the tests above: it
+      # takes the database down while it runs.
       - name: the database may go down, and the store recovers
         run: |
-          container=$(docker ps --filter ancestor=postgres:17.11 --format '{{.Names}}' | head -1)
+          container=$(docker ps --filter ancestor=postgres:${{ matrix.version }} --format '{{.Names}}' | head -1)
           test -n "$container"
           SCION_TEST_PG_CONTAINER="$container" \
           SCION_TEST_BACKEND=postgres \
@@ -423,6 +456,72 @@ jobs:
           tar -xzf /tmp/prometheus.tgz -C /tmp/promtool --strip-components 1
           /tmp/promtool/promtool check rules deploy/prometheus/openscion-alerts.yml
           /tmp/promtool/promtool test rules deploy/prometheus/openscion-alerts-test.yml
+
+
+  # The arm64 cells of the support matrix (docs/support.md) are proven
+  # here, natively: a hosted arm64 runner builds and runs the whole
+  # workspace on its own architecture. Cross-compiling is not evidence.
+  # The block-level power-cut suites (dm-log-writes) and the LazyFS
+  # power-loss job stay on x64: their loop-device and FUSE harnesses
+  # are proven there, and one platform carries that evidence.
+  test-arm64:
+    name: test (linux arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test --workspace
+        env:
+          PROPTEST_CASES: "2000"
+      - name: a real disk full (tmpfs)
+        run: cargo test -p open-scion-server --test disk_full
+        env:
+          SCION_DISK_REQUIRE: "1"
+
+  # The xfs cell of the support matrix (docs/support.md): every store
+  # the server suite opens lands on a real xfs loop device, through
+  # TMPDIR, so the storage-touching tests run on xfs natively. The
+  # tmpfs disk-full step stays with the x64 job: filling a filesystem
+  # to its cap is tmpfs-specific there, and the xfs evidence is the
+  # suite running on xfs at all.
+  test-xfs:
+    name: test (xfs)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: an xfs loop device for the stores
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xfsprogs
+          truncate -s 8G "$RUNNER_TEMP/xfs.img"
+          LOOP=$(sudo losetup -f --show "$RUNNER_TEMP/xfs.img")
+          echo "xfs_loop=$LOOP" >> "$GITHUB_ENV"
+          sudo mkfs.xfs "$LOOP"
+          sudo mkdir -p /mnt/xfs
+          sudo mount "$LOOP" /mnt/xfs
+          sudo chown "$(id -u):$(id -g)" /mnt/xfs
+      - run: TMPDIR=/mnt/xfs cargo test -p open-scion-server
+        env:
+          # The xfs job proves filesystem parity, not more cases; the
+          # SQLite job on the runner disk already runs 2000.
+          PROPTEST_CASES: "64"
+      - name: the loop device goes away
+        if: always()
+        run: |
+          sudo umount /mnt/xfs || true
+          # An if, not A && B || C: shellcheck SC2015 rejects the latter.
+          if [ -n "$xfs_loop" ]; then sudo losetup -d "$xfs_loop"; fi
 
   power-loss:
     name: power-loss

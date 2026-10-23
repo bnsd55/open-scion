@@ -1,4 +1,4 @@
-- A path lookup read each level's whole tree node: decode it into the
+A path lookup read each level's whole tree node: decode it into the
   entry map, clone the map, remove the one name. Now the level's
   stored `TreeV1` bytes are scanned for the one name — linear with an
   early exit, because variable-length entries give no random access

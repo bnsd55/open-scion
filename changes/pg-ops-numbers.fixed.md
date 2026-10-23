@@ -1,7 +1,3 @@
----
-ms: "the Postgres section names the connection count and its advisory locks"
----
-
 A Postgres operator met three numbers the manual never wrote: how
 many connections a server opens, what the advisory rows in `pg_locks`
 are, and how long the collector's key can hold a writer. The Postgres

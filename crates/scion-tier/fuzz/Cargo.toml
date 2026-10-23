@@ -3,6 +3,9 @@ name = "scion-tier-fuzz"
 version = "0.0.0"
 edition = "2024"
 publish = false
+# The fuzz workspace is private, but cargo-deny reads every crate it
+# resolves, so it carries the workspace license.
+license = "MIT OR Apache-2.0"
 
 [package.metadata]
 cargo-fuzz = true

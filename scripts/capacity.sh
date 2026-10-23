@@ -186,15 +186,19 @@ for backend in sqlite postgres; do
         done
       }
       # r reader loops, none for r=0: the cell's reader axis is real
-      # concurrency, not a label. The loops share the log and the
+      # concurrency, not a label. Each loop is recorded like a started
+      # server (loop_bg), so a killed script's exit trap and the janitor
+      # still find them, and their pids ride the pids file the cell's
+      # teardown freezes and reaps. The loops share the log and the
       # times file, so the row's counts and percentiles stay the
       # cell's own.
       : > "$WORK/capacity-readers.pids"
-      if [ "$r" -gt 0 ]; then
-        for _ in $(seq 1 "$r"); do
-          readers & echo $! >> "$WORK/capacity-readers.pids"
-        done
-      fi
+      i=0
+      while [ "$i" -lt "$r" ]; do
+        i=$((i + 1))
+        loop_bg "capacity-readers-$i" readers
+        sed -n 's/^pid=//p' "$WORK/owned/capacity-readers-$i" >> "$WORK/capacity-readers.pids"
+      done
       # The server's Land counter at the cell's start: lands served is
       # the counter's growth over the cell, so a cell whose bench dies
       # still reports what its writers got through.
