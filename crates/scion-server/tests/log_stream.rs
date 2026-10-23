@@ -405,6 +405,15 @@ async fn a_unary_reply_over_the_message_limit_is_refused() {
 /// windows back, and the reply would flow instead of stalling.
 #[tokio::test(start_paused = true)]
 async fn a_stalled_blame_reply_is_counted_and_closes_the_connection() {
+    // The log is this test's own: under nextest every test runs in its
+    // own process, so the sibling's init does not carry here, and the
+    // close notice would be asserted against an empty log. The suites
+    // take the log one test at a time, and stale lines go.
+    init_log();
+    {
+        let _serial = SERIAL.lock().unwrap();
+        LOG.0.lock().unwrap().clear();
+    }
     // Twenty changesets with 300 KB messages each: a blame of the file
     // names each author, so its reply is about six parts, and the client's
     // connection takes under two.
