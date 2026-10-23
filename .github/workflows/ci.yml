@@ -53,6 +53,7 @@ jobs:
       pg: ${{ steps.files.outputs.pg }}
       macos: ${{ steps.files.outputs.macos }}
       workflows: ${{ steps.files.outputs.workflows }}
+      deps: ${{ steps.files.outputs.deps }}
     steps:
       - id: files
         env:
@@ -67,6 +68,7 @@ jobs:
           pg=false
           macos=false
           workflows=false
+          deps=false
           while IFS= read -r line; do
             [ -z "$line" ] && continue
             status=${line%% *}
@@ -121,12 +123,25 @@ jobs:
             case "$file" in
               .github/workflows/*|scripts/release*) workflows=true ;;
             esac
+            # A dependency surface: any manifest, any lockfile (the
+            # root's or a fuzz workspace's), the deny configuration a
+            # lockfile is checked against, and the coverage script
+            # that keeps every lockfile checked. cargo-deny runs for
+            # the pull request that touches one, so an advisory or a
+            # bad license fails before the merge, not on main after it.
+            case "$file" in
+              Cargo.toml|*/Cargo.toml|\
+              Cargo.lock|*/Cargo.lock|\
+              deny.toml|*/deny.toml|\
+              scripts/check-deny-coverage.sh) deps=true ;;
+            esac
           done <<< "$files"
           {
             echo "docs_only=$docs_only"
             echo "pg=$pg"
             echo "macos=$macos"
             echo "workflows=$workflows"
+            echo "deps=$deps"
           } >> "$GITHUB_OUTPUT"
 
   lint:
@@ -208,8 +223,14 @@ jobs:
 
   supply-chain:
     name: cargo-deny
-    # The slow tier: main, the nightly and a dispatch only.
-    if: github.event_name != 'pull_request'
+    needs: tier
+    # The slow tier: main, the nightly and a dispatch only -- plus a
+    # pull request that touches a dependency surface (a manifest, a
+    # lockfile, a deny.toml or the coverage script), so an advisory or
+    # a bad license fails on the pull request instead of on main after
+    # the merge. A draft skips every job, this one included.
+    if: >-
+      ${{ github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.deps == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
