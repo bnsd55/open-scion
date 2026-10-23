@@ -50,12 +50,19 @@ env:
   # dir; nothing goes to /tmp (the run that filled the runner's disk
   # wrote there).
   CARGO_LLVM_COV_TARGET_DIR: target/coverage
+  # The instrumented build plus the whole suite is the heaviest thing
+  # this repository runs, on a runner whose agent dies of memory: the
+  # build links two objects at a time, the suite runs two tests at a
+  # time, incremental compilation is off (the instrumented build is
+  # rebuilt once and cached anyway), and the measure job's own cap is
+  # 90 minutes, above the suite's measured wall but below the hour
+  # where the agent stops answering.
 
 jobs:
   measure:
     name: coverage, ${{ matrix.backend }}, slice ${{ matrix.slice }} of ${{ matrix.total }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
