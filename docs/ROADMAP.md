@@ -21,9 +21,17 @@ Make the project safe to install anywhere it claims to work.
   022: done, [#317](https://github.com/bnsd55/openscion/issues/317)
   landed the release smoke, and its CI job runs on every push, in a
   matrix over ubuntu-24.04 and macos-15, since [#326](https://github.com/bnsd55/openscion/pull/326).
-- No known flaky test: nothing watches the full suite on a schedule —
-  only the nightly soak and the nightly version matrix run on a clock;
-  the suite runs per push and per pull request. The one suspected
+- Known flaky tests, named until they are fixed, the gate closes when
+  the nightly confirms their fixes: the land-cut audit test's call
+  counting (a fix waits on every call before it counts, #554); the
+  graph-query cap test's two 10 s liveness bounds, too tight for the
+  arm64 job's debug build (the bounds move to 120 s, #556); the
+  land-model cost the arm64 run exposes; and the admin-audit seed's
+  server.lock, which can lag its drop by a tick when the spawned CLI
+  opens at once (the seed now waits for the real lock-free condition,
+  #559). Nothing watches the full suite on a schedule — only the
+  nightly soak and the nightly version matrix run on a clock; the
+  suite runs per push and per pull request. The earlier suspected
   flake, scn's `failed printing to stdout: Broken pipe` in the release
   smoke, is confirmed fixed: [#341](https://github.com/bnsd55/openscion/pull/341)
   landed the fix, and none of the 57 CI runs on `main` from its merge
@@ -69,9 +77,11 @@ Make the pieces trustworthy together, and the data safe to lose.
   missing operating metric (gc's) a textfile
   ([#327](https://github.com/bnsd55/openscion/issues/327)).
 - The fault and recovery matrix: disk full, EIO, a Postgres restart,
-  mismatched restores: done,
-  [#238](https://github.com/bnsd55/openscion/issues/238) closed with a
-  row per case in [faults](faults.md), each naming its test.
+  mismatched restores: [#238](https://github.com/bnsd55/openscion/issues/238)
+  closed with a row per case in [faults](faults.md), each naming its
+  test. The Postgres rows reopen: until #412 their evidence ran on
+  SQLite, and the Postgres fault cells are best effort until their
+  scheduled runs carry them.
 
 ## v0.3.0 - a single-node operational beta
 
@@ -83,7 +93,9 @@ Prove the one-machine server under real load.
   ran and passed; its numbers are in
   [benchmarks](benchmarks.md#fault-soak-run-b). The 72-hour soak (Run
   A) runs on an owner machine since 2026-10-21, and its report comes
-  on [#399](https://github.com/bnsd55/openscion/issues/399). A
+  on [#399](https://github.com/bnsd55/openscion/issues/399); the run
+  counts only for the commit it was launched from — it is not evidence
+  for a later tag. A
   120-minute
   nightly soak ([#320](https://github.com/bnsd55/openscion/issues/320))
   runs scheduled on `main`; its RSS warm-up failure was fixed in
@@ -92,14 +104,21 @@ Prove the one-machine server under real load.
 - [The checkout benchmark stands against `git clone`](https://github.com/bnsd55/openscion/issues/6):
   done, the comparison and its numbers are in
   [benchmarks](benchmarks.md).
+- The capacity harness measures what it claims — the reader axis, the
+  failure counters, the throughput and the store-growth columns all
+  read true — before the 72-hour soak's numbers stand on it: moved
+  into this gate, ahead of the soak, [#461](https://github.com/bnsd55/openscion/issues/461).
 
 ## v0.4.0 - the production boundary
 
 Say exactly what v1.0 will support.
 
-- One active `scion-server` is the production topology. SQLite or a
-  named Postgres major version holds metadata. One blob store holds
-  content. Cache tiers may sit in front.
+- One active `scion-server` is the production topology. SQLite holds
+  metadata: it is the only production backend of this gate. A named
+  Postgres major holds metadata too, but Postgres is experimental —
+  tested in CI, not relied on for data-safety evidence — and its
+  promotion to production moves after v0.5's durability evidence. One
+  blob store holds content. Cache tiers may sit in front.
 - The server host, its administrators and the data directories are
   trusted. Network peers, tokens and principals are not.
 - A shared data directory, a server data directory on a network
