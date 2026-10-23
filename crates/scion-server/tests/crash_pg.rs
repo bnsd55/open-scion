@@ -306,9 +306,10 @@ impl PgServer {
     /// the test names the wait that never ended. (A lock of the
     /// schema's own key that the test's harness holds between rounds
     /// is not this server's, and must not hold the wait.)
-    /// Both waits read a count, not a row probe: a concurrent server
-    /// whose name or schema matches the same pattern makes two rows,
-    /// and a one-row probe turns that concurrency into a panic.
+    /// Both waits read a count, not a row probe: the match is exact on
+    /// name or schema, so the two rows are the dying server's own pool
+    /// sessions closing one after another, and a one-row probe turns
+    /// that concurrency into a panic.
     fn kill_and_wait(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait(); // needs &mut: the kill rides it
@@ -346,18 +347,23 @@ impl Drop for PgServer {
         // one-server lock, or that spawn races a dying session. The
         // poll is the kill's own, with its ceiling; a drop that runs
         // during unwinding must not panic, so a wait that never ends
-        // only names itself in the log.
+        // only names itself in the log. A Postgres that does not
+        // answer (a restart, a closed connection) is the same shape:
+        // the drop names the error and moves out, it does not panic.
         let mut client = raw(&pg_url());
         let start = Instant::now();
         loop {
-            let sessions = client
+            let sessions = match client
                 .query_one(
                     "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1",
                     &[&self.name],
-                )
-                .expect("the session query answers")
-                .get::<_, i64>(0)
-                > 0;
+                ) {
+                Ok(row) => row.get::<_, i64>(0) > 0,
+                Err(e) => {
+                    eprintln!("crash_pg: the drop's session query failed: {e}");
+                    return;
+                }
+            };
             if !sessions {
                 return;
             }
