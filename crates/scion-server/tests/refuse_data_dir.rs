@@ -82,6 +82,19 @@ fn a_missing_data_directory_is_refused_not_created() {
         "the refusal names the SCION_DATA path"
     );
     assert!(!empty.join("elsewhere").exists());
+    // A path that exists but is not a directory says so.
+    std::fs::write(empty.join("a-file"), b"x\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_scion-server"))
+        .arg("fsck")
+        .env("NO_COLOR", "1")
+        .env("SCION_DATA", empty.join("a-file"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is not a directory"),
+        "the refusal names a non-directory path"
+    );
 }
 
 #[test]

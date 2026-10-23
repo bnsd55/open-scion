@@ -382,6 +382,9 @@ fn refuse_missing_data_dir(data: &Path) -> anyhow::Result<()> {
     if data.is_dir() {
         return Ok(());
     }
+    if data.exists() {
+        return Err(anyhow::anyhow!("{} is not a directory", data.display()));
+    }
     Err(anyhow::anyhow!(
         "{} does not exist; create it or pass --data",
         data.display()
