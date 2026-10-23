@@ -347,6 +347,20 @@ pg_restart() {
   done
 }
 
+# served_backend DATA_DIR: what the store the server ran on really is,
+# read from the data directory (backend.rs writes the `backend` marker
+# only for Postgres; SQLite leaves no marker). C50: a soak's summary
+# names its backend, so a run that asked for one store and got another
+# cannot pass as the store it was asked for.
+served_backend() {
+  local line
+  line=$(head -n 1 "$1/backend" 2> /dev/null || true)
+  case $line in
+    postgres) echo postgres ;;
+    *) echo sqlite ;;
+  esac
+}
+
 note "fault-soaking for $RUN_MINUTES minutes, ${#KILL_AT[@]} kills"
 mkdir -p "$WORK/read" "$WORK/cancel" "$WORK/ledger" "$WORK/seed"
 END=$(($(date +%s) + RUN_MINUTES * 60))
@@ -466,10 +480,29 @@ cp "$WORK/metrics.csv" "$WORK/restarts.csv" "$WORK/metrics-store.csv" \
 cp "$WORK"/ledger/*.csv "${RUNNER_TEMP:-/tmp}/soak-fault-artifacts/" 2> /dev/null || true
 cp "$WORK"/*.log "${RUNNER_TEMP:-/tmp}/soak-fault-artifacts/" 2> /dev/null || true
 
+# A run shorter than the warm-up floor checks no per-segment RSS bound;
+# there a no-sample segment says so in the summary instead of failing,
+# because the floors the bounds need (warm baselines) cannot exist.
+if [ "$((RUN_MINUTES * 60))" -lt "$SOAK_WARM_SECONDS" ]; then
+  short_run=1
+else
+  short_run=0
+fi
+
 fail=0
 
 # C2, the whole ledger, against one full walk of main's history.
 if ! check_ledger 0; then
+  fail=1
+fi
+
+# The kills happened: one line per kill in restarts.csv, so a fault
+# loop that skipped one (a bug in the schedule or a swallowed signal)
+# is not a soak of fewer faults than the plan says (C50).
+planned_kills=${#KILL_AT[@]}
+done_kills=$(wc -l < "$WORK/restarts.csv" | tr -d ' ')
+if [ "$done_kills" -ne "$planned_kills" ]; then
+  echo "FAIL: $done_kills of $planned_kills planned kills happened" >&2
   fail=1
 fi
 
@@ -516,8 +549,12 @@ seg_fail=0
 for s in $(seq 1 "$SEG"); do
   awk -F, -v s="$s" -v w="$warm" '$2 == s { print }' "$WORK/metrics.csv" > "$WORK/seg-$s.csv"
   if [ ! -s "$WORK/seg-$s.csv" ]; then
-    echo "segment $s: no samples" >&2
-    seg_fail=1
+    if [ "$short_run" -eq 1 ]; then
+      echo "segment $s: no samples (the run is shorter than the warm-up floor)" >&2
+    else
+      echo "FAIL: segment $s has no samples" >&2
+      seg_fail=1
+    fi
     continue
   fi
   seg_start=$(head -n 1 "$WORK/seg-$s.csv" | cut -d, -f1)
@@ -589,5 +626,23 @@ row "restarts" "$((SEG - 1))"
 row "land requests served (counter)" "$landed"
 row "samples" "$rows"
 [ -n "$early" ] && row "p99 early -> late" "$early ms -> $late ms"
+# New rows go at the end of the summary (the owner's report template
+# reads the lines above; C50).
+row "kills planned -> done" "$planned_kills -> $done_kills"
+# The backend the run really served, from the data dir, against the one
+# the run asked for (SCION_FAULT_PG): a soak asked for Postgres that
+# ran on SQLite fails, and the summary names what ran either way.
+asked_backend=sqlite
+[ "${SCION_FAULT_PG:-0}" = "1" ] && asked_backend=postgres
+served=$(served_backend "$WORK/server")
+row "backend (asked -> data dir)" "$asked_backend -> $served"
+if [ "$served" != "$asked_backend" ]; then
+  echo "FAIL: asked for $asked_backend, the data dir says $served" >&2
+  fail=1
+fi
+# A run shorter than the warm-up floor checks no per-segment RSS bound
+# and says so here: the floors the bounds need cannot exist, and the
+# no-sample exception above covers the same runs.
+[ "$short_run" -eq 0 ] || row "per-segment RSS bound" "not checked: the run is shorter than the ${SOAK_WARM_SECONDS}s warm-up"
 [ "${fail:-0}" -eq 0 ] || die "the fault soak failed its checks"
 stop_scion

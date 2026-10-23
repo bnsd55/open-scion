@@ -158,6 +158,25 @@ run_story() {
   # clean. Its exit code says so (0 clean, 1 damage, 2 cannot run).
   step fsck "$BIN/scion-server" --data "$WORK/server" fsck
 
+  # The backend the run really served, from the data dir, against the
+  # one the run asked for (the smoke serves the default store; C50): a
+  # run asked for one store that got another fails, and the summary
+  # names what ran either way.
+  served_backend() {
+    local line
+    line=$(head -n 1 "$1/backend" 2> /dev/null || true)
+    case $line in
+      postgres) echo postgres ;;
+      *) echo sqlite ;;
+    esac
+  }
+  asked_backend=sqlite
+  served=$(served_backend "$WORK/server")
+  note "backend (asked -> data dir): $asked_backend -> $served"
+  if [ "$served" != "$asked_backend" ]; then
+    die "asked for $asked_backend, the data dir says $served (umask $UMASK_RUN)"
+  fi
+
   # Clean shutdown: the first signal starts the drain, and the process
   # exits 0 when the drain is done. TERM, not INT: a script's background
   # child may have INT ignored, and the story must reach the handler.

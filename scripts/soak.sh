@@ -301,6 +301,25 @@ fi
 row "store size first -> last" "$(sed -n 1p "$WORK/metrics-store.csv" | cut -d, -f2) KB -> \
 $(tail -n 1 "$WORK/metrics-store.csv" | cut -d, -f2) KB"
 row "p99 early -> late" "${early:-?} ms -> ${late:-?} ms"
+# The backend the run really served, from the data dir, against the one
+# the run asked for (the soak serves the default store; C50): a run
+# asked for one store that got another fails, and the summary names
+# what ran either way.
+served_backend() {
+  local line
+  line=$(head -n 1 "$1/backend" 2> /dev/null || true)
+  case $line in
+    postgres) echo postgres ;;
+    *) echo sqlite ;;
+  esac
+}
+asked_backend=sqlite
+served=$(served_backend "$WORK/server")
+row "backend (asked -> data dir)" "$asked_backend -> $served"
+if [ "$served" != "$asked_backend" ]; then
+  echo "FAIL: asked for $asked_backend, the data dir says $served" >&2
+  fail=1
+fi
 [ "${fail:-0}" -eq 0 ] || die "the soak failed its bounds"
 
 stop_scion
