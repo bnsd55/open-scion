@@ -23,7 +23,9 @@ Make the project safe to install anywhere it claims to work.
   matrix over ubuntu-24.04 and macos-15, since [#326](https://github.com/bnsd55/openscion/pull/326).
 - Known flaky tests, named until they are fixed, the gate closes when
   the nightly confirms their fixes: the land-cut audit test's call
-  counting (a fix waits on every call before it counts, #554); the
+  counting (fixed: the test runs rounds of 8 until one cuts a call, 10
+  at most, and every round's calls are held to the promise,
+  [#577](https://github.com/bnsd55/openscion/pull/577)); the
   graph-query cap test's two 10 s liveness bounds, too tight for the
   arm64 job's debug build (the bounds move to 120 s, #556); the
   land-model cost the arm64 run exposes; and the admin-audit seed's

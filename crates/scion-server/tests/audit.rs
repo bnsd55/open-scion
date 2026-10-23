@@ -971,82 +971,106 @@ async fn a_land_cut_at_its_deadline_gets_exactly_one_answer() {
     let start = store.resolve_ref(REPO, "main").unwrap();
     let (stop, url) = serve_with_audit(&store, dir.path(), write_access(), audit).await;
 
-    for i in 0..8 {
-        let cs = land_changeset(&store, i, start);
-        let mut ci = writer(&url, &format!("t-land-{i}")).await;
-        let mut request = Request::new(LandRequest {
-            repo: REPO.into(),
-            changeset_id: cs.as_bytes().to_vec(),
-            target_ref: "main".into(),
-            request_key: format!("k-{i}"),
-        });
-        request.set_timeout(Duration::from_nanos(1));
-        // The deadline is gone: the call answers DeadlineExceeded (or the
-        // land finished inside the same poll), and the audit says which.
-        let _ = ci.land(request).await;
-    }
-    // A 1 ns deadline can expire while the client is still sending, so
-    // a try may never reach the server at all, and how many do is a
-    // race on any runner. A call that did reach the server records its
-    // intent before it answers, but the client's own deadline can fire
-    // while that record is still in flight, so every line can appear a
-    // beat after the call returned. Wait for the file to go quiet - a
-    // longer window than one poll, so a busy runner's lag cannot fake
-    // quiet - then hold every call that DID arrive to the promise: one
-    // intent, one answer, and at least one answer the drop wrote. The
-    // vacuity floor is one arrived call: the count of arrivals is a
-    // timing claim, not a promise.
-    let count = || {
-        let Ok(bytes) = std::fs::read(&audit_path) else {
-            return 0;
+    // How many calls a 1 ns deadline cuts is a race: on a fast runner
+    // every arrived call's land can finish inside the same poll, so a
+    // single round may record no cut while the promise still holds. So
+    // the test runs rounds of 8 until one round cuts at least one call,
+    // 10 rounds at most; every round's calls are held to the promise.
+    let rounds = 10;
+    let mut cut_round = None;
+    let mut arrived_total = 0;
+    'rounds: for round in 0..rounds {
+        for j in 0..8 {
+            let i = round * 8 + j;
+            let cs = land_changeset(&store, i, start);
+            let mut ci = writer(&url, &format!("t-land-{i}")).await;
+            let mut request = Request::new(LandRequest {
+                repo: REPO.into(),
+                changeset_id: cs.as_bytes().to_vec(),
+                target_ref: "main".into(),
+                request_key: format!("k-{i}"),
+            });
+            request.set_timeout(Duration::from_nanos(1));
+            // The deadline is gone: the call answers DeadlineExceeded (or the
+            // land finished inside the same poll), and the audit says which.
+            let _ = ci.land(request).await;
+        }
+        // A 1 ns deadline can expire while the client is still sending, so
+        // a try may never reach the server at all, and how many do is a
+        // race on any runner. A call that did reach the server records its
+        // intent before it answers, but the client's own deadline can fire
+        // while that record is still in flight, so every line can appear a
+        // beat after the call returned. Wait for the file to go quiet - a
+        // longer window than one poll, so a busy runner's lag cannot fake
+        // quiet - then hold every call that DID arrive to the promise: one
+        // intent, one answer, and at least one answer the drop wrote. The
+        // vacuity floor is one arrived call: the count of arrivals is a
+        // timing claim, not a promise.
+        let count = || {
+            let Ok(bytes) = std::fs::read(&audit_path) else {
+                return 0;
+            };
+            String::from_utf8_lossy(&bytes).lines().count()
         };
-        String::from_utf8_lossy(&bytes).lines().count()
-    };
-    let mut quiet = 0;
-    for _ in 0..60 {
-        let before = count();
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        quiet = if count() == before { quiet + 1 } else { 0 };
-        if quiet >= 3 && before >= 2 {
-            break;
+        let mut quiet = 0;
+        for _ in 0..60 {
+            let before = count();
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            quiet = if count() == before { quiet + 1 } else { 0 };
+            if quiet >= 3 && before >= 2 {
+                break;
+            }
+        }
+        let lines = read_lines(&audit_path);
+        let mut cut = 0;
+        let mut arrived = 0;
+        for i in (round * 8)..(round * 8 + 8) {
+            let id = format!("t-land-{i}");
+            let intents = lines
+                .iter()
+                .filter(|line| line["event"] == "land" && line["outcome"] == "intent")
+                .filter(|line| line["request_id"] == id)
+                .count();
+            if intents == 0 {
+                // The call never reached the server: nothing is owed.
+                continue;
+            }
+            arrived += 1;
+            assert_eq!(intents, 1, "one intent for {id}");
+            let answers = land_lines(&lines, &id)
+                .into_iter()
+                .filter(|line| line["outcome"] != "intent")
+                .count();
+            assert_eq!(answers, 1, "exactly one answer to {id}'s intent");
+            // Which side answers is a race with no witness: idle, the drop
+            // answers `cancelled`; on a loaded runner the job claims the
+            // call before the 1 ns cut reaches the guard, and its own line
+            // answers `deadline_exceeded`. The drop's own cancelled path is
+            // pinned without timing by `service.rs`'s
+            // a_call_aborted_before_its_job_claims_it_answers_cancelled_and_records_nothing.
+            if land_lines(&lines, &id).iter().any(|line| {
+                line["outcome"] == "failed"
+                    && (line["why"] == "cancelled" || line["why"] == "deadline_exceeded")
+            }) {
+                cut += 1;
+            }
+        }
+        assert!(arrived >= 1, "no call reached the server: {arrived}");
+        arrived_total += arrived;
+        if cut >= 1 {
+            cut_round = Some(round);
+            break 'rounds;
         }
     }
-    let lines = read_lines(&audit_path);
-    let mut cut = 0;
-    let mut arrived = 0;
-    for i in 0..8 {
-        let id = format!("t-land-{i}");
-        let intents = lines
-            .iter()
-            .filter(|line| line["event"] == "land" && line["outcome"] == "intent")
-            .filter(|line| line["request_id"] == id)
-            .count();
-        if intents == 0 {
-            // The call never reached the server: nothing is owed.
-            continue;
-        }
-        arrived += 1;
-        assert_eq!(intents, 1, "one intent for {id}");
-        let answers = land_lines(&lines, &id)
-            .into_iter()
-            .filter(|line| line["outcome"] != "intent")
-            .count();
-        assert_eq!(answers, 1, "exactly one answer to {id}'s intent");
-        // Which side answers is a race with no witness: idle, the drop
-        // answers `cancelled`; on a loaded runner the job claims the
-        // call before the 1 ns cut reaches the guard, and its own line
-        // answers `deadline_exceeded`. The drop's own cancelled path is
-        // pinned without timing by `service.rs`'s
-        // a_call_aborted_before_its_job_claims_it_answers_cancelled_and_records_nothing.
-        if land_lines(&lines, &id).iter().any(|line| {
-            line["outcome"] == "failed"
-                && (line["why"] == "cancelled" || line["why"] == "deadline_exceeded")
-        }) {
-            cut += 1;
-        }
-    }
-    assert!(arrived >= 1, "no call reached the server: {arrived}");
-    assert!(cut >= 1, "the 1 ns deadline cut a land");
+    let cut_round = cut_round.unwrap_or_else(|| {
+        panic!(
+            "{rounds} rounds of 8 calls at a 1 ns deadline never cut one: \
+             every one of the {arrived_total} arrived calls' lands finished \
+             before the cut, which the timing of a loaded runner allows; \
+             the exactly-one-answer promise held for each of them"
+        )
+    });
+    println!("a land was cut in round {}", cut_round + 1);
     stop.send(()).unwrap();
 }
 

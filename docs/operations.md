@@ -1197,28 +1197,35 @@ checking out through a cache and a daemon beside it.
 | Runner | the hosted runner class, by its public label and spec |
 | Repetitions | 2 per cell; the table reports the cell's whole run, and the run's raw samples are the workflow run's `capacity.csv` artifact |
 
-| backend | writers | readers | lands/min | land p99 ms | checkout p50 ms | checkout p99 ms | errors | server RSS MiB | store KiB per 1k lands |
-|---|---|---|---|---|---|---|---|---|---|
-| sqlite | 2 | 0 | - | - | - | - | - | - | - |
-| sqlite | 2 | 5 | - | - | - | - | - | - | - |
-| sqlite | 2 | 20 | - | - | - | - | - | - | - |
-| sqlite | 50 | 0 | - | - | - | - | - | - | - |
-| sqlite | 50 | 5 | - | - | - | - | - | - | - |
-| sqlite | 50 | 20 | - | - | - | - | - | - | - |
-| sqlite | 200 | 0 | - | - | - | - | - | - | - |
-| sqlite | 200 | 5 | - | - | - | - | - | - | - |
-| sqlite | 200 | 20 | - | - | - | - | - | - | - |
-| postgres | 2 | 0 | - | - | - | - | - | - | - |
-| postgres | 2 | 5 | - | - | - | - | - | - | - |
-| postgres | 2 | 20 | - | - | - | - | - | - | - |
-| postgres | 50 | 0 | - | - | - | - | - | - | - |
-| postgres | 50 | 5 | - | - | - | - | - | - | - |
-| postgres | 50 | 20 | - | - | - | - | - | - | - |
-| postgres | 200 | 0 | - | - | - | - | - | - | - |
-| postgres | 200 | 5 | - | - | - | - | - | - | - |
-| postgres | 200 | 20 | - | - | - | - | - | - | - |
+| backend | writers | readers | land p99 ms | checkout p50 ms | checkout p99 ms | timeouts | errors | server RSS MiB | landed | blob store KiB per 1k lands | database KiB per 1k lands |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| sqlite | 2 | 0 | - | - | - | - | - | - | - | - | - |
+| sqlite | 2 | 5 | - | - | - | - | - | - | - | - | - |
+| sqlite | 2 | 20 | - | - | - | - | - | - | - | - | - |
+| sqlite | 50 | 0 | - | - | - | - | - | - | - | - | - |
+| sqlite | 50 | 5 | - | - | - | - | - | - | - | - | - |
+| sqlite | 50 | 20 | - | - | - | - | - | - | - | - | - |
+| sqlite | 200 | 0 | - | - | - | - | - | - | - | - | - |
+| sqlite | 200 | 5 | - | - | - | - | - | - | - | - | - |
+| sqlite | 200 | 20 | - | - | - | - | - | - | - | - | - |
+| postgres | 2 | 0 | - | - | - | - | - | - | - | - | - |
+| postgres | 2 | 5 | - | - | - | - | - | - | - | - | - |
+| postgres | 2 | 20 | - | - | - | - | - | - | - | - | - |
+| postgres | 50 | 0 | - | - | - | - | - | - | - | - | - |
+| postgres | 50 | 5 | - | - | - | - | - | - | - | - | - |
+| postgres | 50 | 20 | - | - | - | - | - | - | - | - | - |
+| postgres | 200 | 0 | - | - | - | - | - | - | - | - | - |
+| postgres | 200 | 5 | - | - | - | - | - | - | - | - | - |
+| postgres | 200 | 20 | - | - | - | - | - | - | - | - | - |
 
-The cells with `-` are the ones no run has filled yet. The errors column
+The cells with `-` are the ones no run has filled yet. Every cell
+runs on a store the cell's own import made: on SQLite a data directory
+the cell created, on Postgres a database the cell dropped and
+recreated, so a cell's numbers are the store's at its own size, and
+the growth column is the cell's own lands' bytes. The timeouts column
+counts reader attempts the 60-second checkout timeout killed; it is
+its own column because a hang is a finding, not noise. The errors
+column
 is part of the data, not a failure of the run: the envelope's edge IS
 where errors start, so a cell whose clients failed is recorded with its
 error count and stands in the table. The edge, the point where a cell
@@ -1227,12 +1234,16 @@ stops being an answer: a checkout p99 over 5 seconds, a land p99 over
 in the table, that is a cell with errors above 0. A reader who wants a
 different edge applies it to the run's `capacity.csv` artifact, which
 the footer's workflow run keeps. A cell whose bench died names no land
-percentile (`-` there); its lands per minute still come from the
-server's counter.
+percentile (`-` there).
 
-The store growth column is the SQLite store's only; the Postgres cells
-name no store growth, because the database's disk is its service
-container's, not a file tree the script can measure. RSS is the server's
+The growth splits into two columns, both divided by the lands the
+server's counter measured - a cell that lost lands reports its own
+bytes over its own lands, never the plan's. The blob store column
+measures the cell's data directory; the database column measures the
+database the cell reset (`pg_database_size`), so a Postgres row cannot
+look complete while the rows it grew sit unmeasured in the service
+container. SQLite has no separate database, so its database column is
+"-". RSS is the server's
 at the end of the cell: a capacity cell is minutes long, not the hours a
 warm-up would need, so it is a level, not a leak bound - the leak bound
 is the soak's.
