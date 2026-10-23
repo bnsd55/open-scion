@@ -171,11 +171,10 @@ jobs:
           ulimit -v 6291456
           # shellcheck disable=SC1090
           source <(cargo llvm-cov show-env --sh)
-          # The disk hypothesis under test on this branch: the default
-          # measure spawns thousands of processes, one .profraw each;
-          # the %4m pool folds them into four files per test binary.
-          # The gate's merge globs *.profraw, so the pool is invisible
-          # to the report.
+          # One .profraw per test process made thousands per job, and
+          # the runner was lost four runs in a row with no log (#565).
+          # The %4m pool folds them into four files per test binary.
+          # The gate merges *.profraw, so the report does not change.
           export LLVM_PROFILE_FILE="$PWD/target/coverage/sqlite-%4m.profraw"
           nice -n 19 cargo nextest run --workspace --no-fail-fast \
             | tee measure.log
