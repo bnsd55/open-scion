@@ -1,4 +1,4 @@
-- The scripts own what they start: common.sh's `start` runs every
+The scripts own what they start: common.sh's `start` runs every
   server in a process group of its own, records the pid, the group and
   the command line in the run's work directory, and the exit traps stop
   the group — TERM, then KILL — so a script that dies by error,

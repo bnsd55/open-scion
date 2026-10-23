@@ -1,4 +1,4 @@
-- The supply-chain job now runs cargo-deny in every fuzz
+The supply-chain job now runs cargo-deny in every fuzz
   sub-workspace, each of which holds its own Cargo.lock the root check
   never read — the gap that let RUSTSEC-2026-0382 sit in three fuzz
   lockfiles while the root stayed clean. Each fuzz workspace carries
