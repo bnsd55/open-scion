@@ -369,10 +369,15 @@ jobs:
           # show-env plus a plain build provide them, the two measures'
           # profiles carry the counts, and the report step merges every
           # profile in the target dir into the number the gate checks.
-          # The proof below reads its printed list.
+          # The proof below reads its printed list. The target dirs are
+          # pinned after show-env, absolute, so the merge looks where the
+          # download put the profiles and nowhere else.
           # shellcheck disable=SC1090
           source <(cargo llvm-cov show-env --sh)
+          export CARGO_LLVM_COV_TARGET_DIR="$PWD/target/coverage"
+          export CARGO_TARGET_DIR="$PWD/target/coverage"
           nice -n 19 cargo build --workspace --tests
+          ls target/coverage | head -3
           cargo llvm-cov report --summary-only --fail-under-lines 80 \
             ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
             | tee target/coverage/report-summary.txt
