@@ -90,9 +90,12 @@ fi
 # off until the 72-hour hosting decision (D10) says where Postgres
 # lives. SCION_FAULT_PG_CMD is the restart command itself, for example
 # `docker restart soak-pg`.
-PGFLAGS=()
+# The Postgres URL reaches every scion-server this script raises
+# (serve, import, gc, fsck) through the env, which decides the backend;
+# the argv form is deprecated and serve no longer takes it (capacity.sh
+# does the same).
 if [ -n "${SCION_PG_URL:-}" ]; then
-  PGFLAGS=(--postgres-url "$SCION_PG_URL")
+  export SCION_POSTGRES_URL=$SCION_PG_URL
 fi
 
 # classifies LOG: 0 if every failure LINE in LOG is one this load
@@ -166,7 +169,7 @@ SLOW_EXPECTED=$("$TIMEOUT" 60 "$BIN/scn" --server "$SERVER" cat "$SLOW_FILE" | w
 # through a live tier.
 start_server() {
   start server serving "$BIN/scion-server" --data "$WORK/server" \
-    "${PGFLAGS[@]+"${PGFLAGS[@]}"}" serve \
+    serve \
     --listen "127.0.0.1:$SERVER_PORT" \
     --ticket-key "$WORK/ticket.key" \
     --metrics-listen "127.0.0.1:$SERVER_METRICS_PORT"
@@ -253,7 +256,7 @@ importer() {
   while [ "$(date +%s)" -lt "$END" ]; do
     n=$((n + 1))
     "$TIMEOUT" 300 "$BIN/scion-server" --data "$WORK/server" \
-      "${PGFLAGS[@]+"${PGFLAGS[@]}"}" import \
+      import \
       --rev main "$WORK/src.git" \
       >> "$WORK/import-soak.log" 2>&1 || echo "import $n failed" >> "$WORK/import-fail.log"
     sleep 60
@@ -266,10 +269,10 @@ gcer() {
   while [ "$(date +%s)" -lt "$END" ]; do
     n=$((n + 1))
     "$TIMEOUT" 120 "$BIN/scion-server" --data "$WORK/server" \
-      "${PGFLAGS[@]+"${PGFLAGS[@]}"}" gc --dry-run >> "$WORK/gc.log" 2>&1 \
+      gc --dry-run >> "$WORK/gc.log" 2>&1 \
       || echo "gc-dry $n failed" >> "$WORK/gc-fail.log"
     "$TIMEOUT" 120 "$BIN/scion-server" --data "$WORK/server" \
-      "${PGFLAGS[@]+"${PGFLAGS[@]}"}" gc >> "$WORK/gc.log" 2>&1 \
+      gc >> "$WORK/gc.log" 2>&1 \
       || echo "gc $n failed" >> "$WORK/gc-fail.log"
     sleep 120
   done
@@ -329,7 +332,7 @@ check_ledger() {
 # (release-smoke.sh runs it the same way).
 fsck_ok() {
   "$TIMEOUT" 300 "$BIN/scion-server" --data "$WORK/server" \
-    "${PGFLAGS[@]+"${PGFLAGS[@]}"}" fsck >> "$WORK/fsck.log" 2>&1
+    fsck >> "$WORK/fsck.log" 2>&1
 }
 
 # pg_restart: the optional Postgres fault. SCION_FAULT_PG_CMD runs the
@@ -347,21 +350,12 @@ pg_restart() {
   done
 }
 
-# served_backend DATA_DIR: what the store the server ran on really is,
-# read from the data directory (backend.rs writes the `backend` marker
-# only for Postgres; SQLite leaves no marker). C50: a soak's summary
-# names its backend, so a run that asked for one store and got another
-# cannot pass as the store it was asked for.
-served_backend() {
-  local line
-  line=$(head -n 1 "$1/backend" 2> /dev/null || true)
-  case $line in
-    postgres) echo postgres ;;
-    *) echo sqlite ;;
-  esac
-}
-
 note "fault-soaking for $RUN_MINUTES minutes, ${#KILL_AT[@]} kills"
+# Every check below, from the du samples in the fault loop to the
+# bounds, ORs into this one flag; it starts at 0 once, before the loop
+# (a du failure inside the loop must survive to the end: #561 review
+# F1 caught fail=0 reseting it after the loop).
+fail=0
 mkdir -p "$WORK/read" "$WORK/cancel" "$WORK/ledger" "$WORK/seed"
 END=$(($(date +%s) + RUN_MINUTES * 60))
 T0=$(date +%s)
@@ -373,12 +367,12 @@ writers() {
   done
   wait
 }
-writers & echo $! > "$WORK/soak-writers.pid"
+loop_bg soak-writers writers
 loop_bg soak-readers readers
 loop_bg soak-importer importer
 loop_bg soak-gcer gcer
-canceller & echo $! > "$WORK/soak-canceller.pid"
-slow_reader & echo $! > "$WORK/soak-slow.pid"
+loop_bg soak-canceller canceller
+loop_bg soak-slow slow_reader
 
 # The fault loop. SEG is the restart segment's number; the metrics CSV
 # carries it, and the ceilings are checked per segment. The third
@@ -488,8 +482,6 @@ if [ "$((RUN_MINUTES * 60))" -lt "$SOAK_WARM_SECONDS" ]; then
 else
   short_run=0
 fi
-
-fail=0
 
 # C2, the whole ledger, against one full walk of main's history.
 if ! check_ledger 0; then
@@ -629,11 +621,13 @@ row "samples" "$rows"
 # New rows go at the end of the summary (the owner's report template
 # reads the lines above; C50).
 row "kills planned -> done" "$planned_kills -> $done_kills"
-# The backend the run really served, from the data dir, against the one
-# the run asked for (SCION_FAULT_PG): a soak asked for Postgres that
-# ran on SQLite fails, and the summary names what ran either way.
+# The backend the run really served, from the data dir, against the
+# one the run asked for: the server runs Postgres when SCION_PG_URL is
+# set (SCION_PG_URL decides, the same test as the export above), whatever SCION_FAULT_PG
+# says (#561 review F2). A soak asked for one store that ran on
+# another fails, and the summary names what ran either way.
 asked_backend=sqlite
-[ "${SCION_FAULT_PG:-0}" = "1" ] && asked_backend=postgres
+[ -n "${SCION_PG_URL:-}" ] && asked_backend=postgres
 served=$(served_backend "$WORK/server")
 row "backend (asked -> data dir)" "$asked_backend -> $served"
 if [ "$served" != "$asked_backend" ]; then

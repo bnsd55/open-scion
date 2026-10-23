@@ -60,6 +60,22 @@ need() {
   [ -x /usr/bin/time ] || die "needs /usr/bin/time (Debian, Ubuntu: apt install time)"
 }
 
+# served_backend DATA_DIR: what the store the server ran on really is,
+# read from the data directory. backend.rs writes the `backend` marker
+# only for Postgres, so no marker file means SQLite; a marker file with
+# any other first line is damage, not SQLite, and reads as unknown:<line>
+# — the caller fails on it rather than passing a damaged store off as
+# either backend (#561 review F3).
+served_backend() {
+  local dir=$1 line f="$1/backend"
+  [ -f "$f" ] || { echo sqlite; return 0; }
+  line=$(head -n 1 "$f" 2> /dev/null || true)
+  case $line in
+    postgres) echo postgres ;;
+    *) echo "unknown:$line" ;;
+  esac
+}
+
 # du_sample CSV DATA_DIR NOW: append the store's size as `NOW,size`.
 # du walks the live store: a temp file the server makes and deletes
 # while du reads vanishes, du reports it on stderr and exits 1 (the
@@ -137,7 +153,8 @@ fetch_dataset() {
 # sets $COMMITS. Its times are in $WORK/import.log.
 import_dataset() {
   note "importing"
-  /usr/bin/time -p "$BIN/scion-server" --data "$WORK/server" import --rev main "$WORK/src.git" \
+  /usr/bin/time -p "$BIN/scion-server" --data "$WORK/server" \
+    "${PGFLAGS[@]+"${PGFLAGS[@]}"}" import --rev main "$WORK/src.git" \
     > "$WORK/import.out" 2> "$WORK/import.log" || {
     tail -n 20 "$WORK/import.log" >&2
     die "import failed"
@@ -242,11 +259,25 @@ OWNED_CLEANUP_DONE=
 owned_cleanup() {
   [ -n "$OWNED_CLEANUP_DONE" ] && return 0
   OWNED_CLEANUP_DONE=1
-  local f
+  local f n live
   [ -n "${WORK:-}" ] && [ -d "$WORK/owned" ] || return 0
   for f in "$WORK"/owned/*; do
     [ -e "$f" ] || continue
     owned_stop_one "$f"
+  done
+  # A member that reparented when its loop shell died is invisible to
+  # the parentage probes in owned_stop_one, but every client this
+  # script raised carries a path under $WORK in its command line (the
+  # socket, the data dir, an output file). Sweep them, bounded, then
+  # KILL what remains: the rm that follows cannot lose to a writer it
+  # cannot name (#561's rm: Directory not empty).
+  n=0
+  while [ "$n" -lt 10 ]; do
+    live=$(pgrep -f "$WORK/" 2> /dev/null || true)
+    [ -z "$live" ] && break
+    pkill -KILL -f "$WORK/" 2> /dev/null || true
+    sleep 0.5
+    n=$((n + 1))
   done
 }
 
@@ -268,6 +299,7 @@ owned_cleanup() {
 # the pidfile.
 owned_stop_one() {
   local f=$1 pid pgid job have n stopped
+  local leader_live=0 group_live=0 children_live=0
   pid=$(sed -n 's/^pid=//p' "$f")
   pgid=$(sed -n 's/^pgid=//p' "$f")
   job=$(sed -n 's/^job=//p' "$f")
@@ -291,22 +323,30 @@ owned_stop_one() {
   # The member wait, only for a record the kill ran on: a skipped
   # record is not ours, and its pid must not be touched. The kill
   # bounds the leader, and a member it missed would race the rm that
-  # follows the cleanup. Wait them out, KILL on each live round, then
-  # release the record.
+  # follows the cleanup. Wait them out, KILL each target only while
+  # its own probe says it is live (the leader may be dead and its
+  # number reused while the group lives), then release the record.
   [ -n "$stopped" ] || { rm -f "$f"; return 0; }
   n=0
   while [ "$n" -lt 10 ]; do
-    if ! kill -0 "$pid" 2> /dev/null \
-      && ! { [ -n "$pgid" ] && kill -0 "-$pgid" 2> /dev/null; } \
-      && ! pgrep -P "$pid" > /dev/null 2>&1; then
-      break
+    leader_live=0
+    group_live=0
+    children_live=0
+    kill -0 "$pid" 2> /dev/null && leader_live=1
+    if [ -n "$pgid" ]; then
+      kill -0 "-$pgid" 2> /dev/null && group_live=1
     fi
-    [ -n "$pgid" ] && kill -KILL "-$pgid" 2> /dev/null
-    kill -KILL "$pid" 2> /dev/null
-    pkill -KILL -P "$pid" 2> /dev/null
+    pgrep -P "$pid" > /dev/null 2>&1 && children_live=1
+    [ "$leader_live" = 0 ] && [ "$group_live" = 0 ] && [ "$children_live" = 0 ] && break
+    [ "$leader_live" = 1 ] && kill -KILL "$pid" 2> /dev/null
+    [ "$group_live" = 1 ] && kill -KILL "-$pgid" 2> /dev/null
+    [ "$children_live" = 1 ] && pkill -KILL -P "$pid" 2> /dev/null
     sleep 0.5
     n=$((n + 1))
   done
+  if [ "$leader_live" = 1 ] || [ "$group_live" = 1 ] || [ "$children_live" = 1 ]; then
+    echo "owned: $(basename "$f"): pid $pid${pgid:+ group -$pgid} survived the cleanup after 5 s" >&2
+  fi
   rm -f "$f"
   wait "$job" 2> /dev/null || true
 }
@@ -351,6 +391,7 @@ start_scion() {
   fi
   start server serving "$BIN/scion-server" --data "$WORK/server" serve \
     --listen "127.0.0.1:$SERVER_PORT" \
+    "${PGFLAGS[@]+"${PGFLAGS[@]}"}" \
     --ticket-key "$WORK/ticket.key" \
     --metrics-listen "127.0.0.1:$SERVER_METRICS_PORT"
   start cache serving "$BIN/scion-cache" --listen "127.0.0.1:$CACHE_PORT" \

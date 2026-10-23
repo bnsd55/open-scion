@@ -176,6 +176,9 @@ latency() {
 }
 
 note "soaking for $RUN_MINUTES minutes"
+# Every check below, from the du samples in the load loop to the
+# bounds, ORs into this one flag; it starts at 0 once, before the loop.
+fail=0
 mkdir -p "$WORK/read" "$WORK/cancel"
 loop_bg soak-writers writers
 loop_bg soak-readers readers
@@ -302,18 +305,10 @@ fi
 row "store size first -> last" "$(sed -n 1p "$WORK/metrics-store.csv" | cut -d, -f2) KB -> \
 $(tail -n 1 "$WORK/metrics-store.csv" | cut -d, -f2) KB"
 row "p99 early -> late" "${early:-?} ms -> ${late:-?} ms"
-# The backend the run really served, from the data dir, against the one
-# the run asked for (the soak serves the default store; C50): a run
+# The backend the run really served, from the data dir, against the
+# one the run asked for (the soak serves the default store): a run
 # asked for one store that got another fails, and the summary names
-# what ran either way.
-served_backend() {
-  local line
-  line=$(head -n 1 "$1/backend" 2> /dev/null || true)
-  case $line in
-    postgres) echo postgres ;;
-    *) echo sqlite ;;
-  esac
-}
+# what ran either way. served_backend comes from common.sh.
 asked_backend=sqlite
 served=$(served_backend "$WORK/server")
 row "backend (asked -> data dir)" "$asked_backend -> $served"

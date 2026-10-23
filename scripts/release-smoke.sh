@@ -19,6 +19,8 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=common.sh source-path=SCRIPTDIR
+. "$(dirname "$0")/common.sh"
 case ${CARGO_TARGET_DIR:-} in
   "") BIN=$ROOT/target/release ;;
   /*) BIN=$CARGO_TARGET_DIR/release ;;
@@ -159,17 +161,9 @@ run_story() {
   step fsck "$BIN/scion-server" --data "$WORK/server" fsck
 
   # The backend the run really served, from the data dir, against the
-  # one the run asked for (the smoke serves the default store; C50): a
-  # run asked for one store that got another fails, and the summary
-  # names what ran either way.
-  served_backend() {
-    local line
-    line=$(head -n 1 "$1/backend" 2> /dev/null || true)
-    case $line in
-      postgres) echo postgres ;;
-      *) echo sqlite ;;
-    esac
-  }
+  # one the run asked for (the smoke serves the default store): a run
+  # asked for one store that got another fails, and the summary names
+  # what ran either way. served_backend comes from common.sh.
   asked_backend=sqlite
   served=$(served_backend "$WORK/server")
   note "backend (asked -> data dir): $asked_backend -> $served"
