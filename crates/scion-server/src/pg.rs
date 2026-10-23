@@ -2978,7 +2978,8 @@ impl MetaTx for PgTx<'_> {
         // indexed first-parent rows (cs, n = 0), so every hop is one index
         // lookup, and the join keeps only the rows that carry a stored
         // value. Every fetched changeset is an ancestor of `start`, so no
-        // repo filter is needed.
+        // repo filter is needed. The reply is in walk order: newest
+        // first, from the asked node, the way first_parent_page orders.
         let version = i64::from(version);
         let rows = self.c.query(
             "WITH RECURSIVE walk(id, depth) AS (
@@ -2991,7 +2992,8 @@ impl MetaTx for PgTx<'_> {
              )
              SELECT d.cs, d.value FROM walk
              JOIN derived d ON d.cs = walk.id
-             WHERE d.kind = $3 AND d.version = $4",
+             WHERE d.kind = $3 AND d.version = $4
+             ORDER BY walk.depth",
             &[
                 P::bytes(id_bytes(start.as_bytes()).as_slice()),
                 P::i64(limit),

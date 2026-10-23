@@ -634,7 +634,9 @@ impl MetaTx for SqliteTx<'_> {
         // One statement for the whole chain: the recursive term follows the
         // indexed first-parent rows (cs, n = 0), and the join keeps the
         // rows that carry a stored value. Every fetched changeset is an
-        // ancestor of `start`, so no repo filter is needed.
+        // ancestor of `start`, so no repo filter is needed. The reply is
+        // in walk order: newest first, from the asked node, the way
+        // first_parent_page orders.
         let mut stmt = self
             .0
             .prepare_cached(
@@ -648,7 +650,8 @@ impl MetaTx for SqliteTx<'_> {
              )
              SELECT d.cs, d.value FROM walk
              JOIN derived d ON d.cs = walk.id
-             WHERE d.kind = ?3 AND d.version = ?4",
+             WHERE d.kind = ?3 AND d.version = ?4
+             ORDER BY walk.depth",
             )
             .map_err(crate::error::from_sqlite)?;
         let rows = stmt
