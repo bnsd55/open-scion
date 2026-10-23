@@ -60,6 +60,19 @@ need() {
   [ -x /usr/bin/time ] || die "needs /usr/bin/time (Debian, Ubuntu: apt install time)"
 }
 
+# kib_per_1k START END LANDS: the growth in KiB per 1,000 lands, from
+# the lands that actually happened, not the lands a plan asked for.
+# A cell whose counter grew by 0 has no per-land growth: it prints "-"
+# rather than a division by zero or a number the plan invented.
+kib_per_1k() {
+  local start=$1 end=$2 lands=$3
+  if [ "$lands" -gt 0 ]; then
+    echo $(( (end - start) * 1000 / lands ))
+  else
+    echo "-"
+  fi
+}
+
 # served_backend DATA_DIR: what the store the server ran on really is,
 # read from the data directory. backend.rs writes the `backend` marker
 # only for Postgres, so no marker file means SQLite; a marker file with
@@ -580,4 +593,16 @@ cpu() { awk '($1 == "user" || $1 == "sys") && NF == 2 { s += $2 } END { printf "
 # the find(1) tests.
 file_bytes() {
   find "$@" -type f -exec wc -c {} + | awk '$2 != "total" { s += $1 } END { print s + 0 }'
+}
+
+# The reader log's outcome counts: the lines the reader loop writes name
+# their event, but not at the line's start, so the greps match the event
+# text anywhere in the line.
+count_reader_timeouts() {
+  [ -f "$1" ] || { echo 0; return; }
+  grep -c "timeout after 60s" "$1" || true
+}
+count_reader_failures() {
+  [ -f "$1" ] || { echo 0; return; }
+  grep -c "checkout failed rc=" "$1" || true
 }
