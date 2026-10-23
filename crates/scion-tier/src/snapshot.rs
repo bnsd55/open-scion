@@ -24,14 +24,24 @@ use crate::store::{DiskStore, RECORD, Store as _, parse_record, push_record};
 pub const MAGIC: &[u8; 9] = b"scnsnap1\n";
 
 /// The file name of `repo`'s snapshot: `REPO.scnsnap`, with each byte other
-/// than an ASCII letter, a digit, `-`, `_` or a `.` after the first byte
-/// written as `%XX`. So any repo name gives one plain name in the snapshot
-/// directory: `team/app` gives `team%2Fapp.scnsnap`.
+/// than an ASCII lowercase letter, a digit, `-`, `_` or a `.` after the
+/// first byte written as `%XX` with uppercase hex digits. The capitals
+/// are escaped like any other byte, so the output holds lowercase
+/// literal letters only and a capital appears only as a hex digit right
+/// after a `%` — and since `%` itself is escaped, the escapes line up
+/// and two names that a case-insensitive disk would fold into one file
+/// cannot both give the same name. `MAIN` gives `%4D%41%49%4E.scnsnap`,
+/// `team/app` gives `team%2Fapp.scnsnap`.
 #[must_use]
 pub fn file_name(repo: &str) -> String {
     let mut name = String::with_capacity(repo.len() + 8);
     for (i, byte) in repo.bytes().enumerate() {
-        if byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || (byte == b'.' && i > 0) {
+        if byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || byte == b'-'
+            || byte == b'_'
+            || (byte == b'.' && i > 0)
+        {
             name.push(char::from(byte));
         } else {
             // Writing to a `String` does not fail.
@@ -266,6 +276,32 @@ mod tests {
     }
 
     #[test]
+    fn a_record_with_a_bad_op_is_the_damaged_mark_and_the_report_covers_it() {
+        // The input the fuzzer found (run 39683323899, artifact kept out
+        // of the repo until this fix): a valid header and repo name, then
+        // a full 37-byte head whose op byte is 'a' - not an object
+        // record's - and a torn 8-byte tail. `seed` must answer calmly:
+        // one damaged mark for the bad record, nothing after it counted,
+        // no panic, nothing stored.
+        let mut data = Vec::new();
+        data.extend_from_slice(MAGIC);
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.push(b'r');
+        data.extend_from_slice(b"a");
+        data.extend_from_slice(&[0x8b, 0, 0, 0]);
+        data.extend_from_slice(&[0u8; 43]);
+        let dir = private_dir();
+        let path = dir.path().join("r.scnsnap");
+        fs::write(&path, &data).unwrap();
+        let store = DiskStore::open(&dir.path().join("data"), usize::MAX).unwrap();
+        let seeded = seed(&store, &path).unwrap().unwrap();
+        assert_eq!(seeded.repo, "r");
+        assert_eq!((seeded.stored, seeded.skipped), (0, 0));
+        assert!(seeded.damaged);
+        assert_eq!(seeded.bytes, 0);
+    }
+
+    #[test]
     fn a_cold_store_starts_with_the_snapshot_and_a_warm_one_ignores_it() {
         let dir = private_dir();
         let (objects, path, _) = snapshot_in(dir.path());
@@ -418,6 +454,96 @@ mod tests {
         let store = DiskStore::open(&dir.path().join("three"), 1 << 20).unwrap();
         let err = seed(&store, &path).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData, "{err}");
+    }
+
+    /// The wire pass, B7's property, on every OS: a fold-blind reader
+    /// (a case-insensitive disk) must not see two different repos in
+    /// one snapshot file, so two names whose file names are equal under
+    /// ASCII case folding must be one name. The pairs are built, not
+    /// drawn: `b` is `a` with a random case-flip mask over its ASCII
+    /// letters — the only bytes two names of one repo could differ by
+    /// and still fold on a disk. Independent random pairs almost never
+    /// fold, so a random `b` proves nothing; the flip mask finds what
+    /// the fixed table below misses.
+    #[test]
+    fn two_names_with_one_folded_file_name_are_one_name() {
+        proptest::proptest!(|(name in "[a-zA-Z0-9%._/-\u{e9}\u{301}]{0,12}", mask in "[-]{0,12}")| {
+            // One coin per character of `name`: the mask's `-` at that
+            // position says flip the letter's case, where a flip is the
+            // only difference a disk folds and the name algebra must
+            // survive.
+            let flipped: String = name
+                .chars()
+                .enumerate()
+                .map(|(i, c)| {
+                    let flip = mask.as_bytes().get(i).is_some();
+                    match c {
+                        'a'..='z' if flip => c.to_ascii_uppercase(),
+                        'A'..='Z' if flip => c.to_ascii_lowercase(),
+                        other => other,
+                    }
+                })
+                .collect();
+            let (fa, fb) = (file_name(&name), file_name(&flipped));
+            if fa.eq_ignore_ascii_case(&fb) {
+                assert_eq!(
+                    name, flipped,
+                    "{name:?} and {flipped:?} fold into one file: {fa:?}"
+                );
+            }
+        });
+    }
+
+    /// The fixed shapes the flip mask cannot draw: the escape mark next
+    /// to hex digits, the first-byte `.` rule, and the empty name.
+    #[test]
+    fn the_folded_shapes_of_the_name_table_are_one_name() {
+        let candidates = [
+            "main", "MAIN", "Main", "mAiN", "%25", "%2f", "%4D", "%4d", "a.b", "a%2Eb", ".a",
+            "team/app", "TEAM/APP", "",
+        ];
+        for a in &candidates {
+            for b in &candidates {
+                let (fa, fb) = (file_name(a), file_name(b));
+                if fa.eq_ignore_ascii_case(&fb) {
+                    assert_eq!(a, b, "{a:?} and {b:?} fold into one snapshot file: {fa:?}");
+                }
+            }
+        }
+    }
+
+    /// The wire pass, B7: on a case-insensitive disk (the macOS
+    /// default), two repos whose names differ only in case write their
+    /// snapshots to one file, and the second write silently replaces
+    /// the first — the first repo's snapshot is gone, and the operator
+    /// sees no refusal. The fix is in `file_name`: the capitals are
+    /// escaped, so the output holds lowercase literal letters only and
+    /// no case fold can put two names on one file (non-ASCII bytes were
+    /// already escaped, so only ASCII case could ever fold). Runs where
+    /// the fold is real.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn two_repos_that_fold_to_one_name_do_not_overwrite_one_snapshot() {
+        let dir = private_dir();
+        let a = blob(b"alpha");
+        let b = blob(b"beta");
+        let main = dir.path().join(file_name("main"));
+        write(&main, "main", std::slice::from_ref(&a)).unwrap();
+        let folded = dir.path().join(file_name("MAIN"));
+        // The names differ now: MAIN's file name escapes its capitals.
+        assert_ne!(main, folded, "MAIN's snapshot must have a name of its own");
+        write(&folded, "MAIN", std::slice::from_ref(&b)).unwrap();
+        // Both files hold what their own repo wrote.
+        let store = DiskStore::open(&dir.path().join("data"), 1 << 20).unwrap();
+        let seeded = seed(&store, &main).unwrap().unwrap();
+        assert_eq!(seeded.repo, "main");
+        assert_eq!((seeded.stored, seeded.skipped), (1, 0));
+        assert_eq!(store.get(a.0, a.1.len()).unwrap(), Some(a.1));
+        let store = DiskStore::open(&dir.path().join("data-2"), 1 << 20).unwrap();
+        let seeded = seed(&store, &folded).unwrap().unwrap();
+        assert_eq!(seeded.repo, "MAIN");
+        assert_eq!((seeded.stored, seeded.skipped), (1, 0));
+        assert_eq!(store.get(b.0, b.1.len()).unwrap(), Some(b.1));
     }
 
     #[test]

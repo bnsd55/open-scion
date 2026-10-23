@@ -184,9 +184,16 @@ fn every_proof_line_names_a_test_that_exists() {
             continue;
         };
         proofs += 1;
-        let (file, fun) = proof
-            .rsplit_once("::")
-            .unwrap_or_else(|| panic!("Proof: {proof} is not path::function"));
+        let named = proof
+            .split(" (")
+            .next()
+            .unwrap_or(proof)
+            .split_whitespace()
+            .next()
+            .unwrap_or(proof);
+        let Some((file, fun)) = named.rsplit_once("::") else {
+            panic!("Proof: {proof} is not path::function");
+        };
         let source = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join(file);
@@ -201,6 +208,224 @@ fn every_proof_line_names_a_test_that_exists() {
         proofs >= 4,
         "the guide's Proof lines shrank: only {proofs} found"
     );
+}
+
+/// Every `Proof:` line in the operations guide either names a test
+/// that drives its section's command block through the shared
+/// `runbook_block` helper, or says why it cannot: a `(drill)` proof
+/// names the recorded drill, a `(behaviour, no command)` proof names
+/// the behaviour its test holds when the runbook's steps are operator
+/// actions, a `(measured, no command)` proof names a measured time the
+/// section's workflow takes, not a shell command,
+/// the behaviour its test holds when the runbook's steps are operator
+/// actions rather than shell commands, and a proof still converting
+/// sits in `NOT_YET_DRIVING`. Anything else fails here, and so does a
+/// stale row: the list must match the guide exactly, so no proof is
+/// exempt silently and no finished conversion keeps its exemption.
+#[test]
+fn every_proof_runs_the_guides_command_or_says_why() {
+    let doc = doc();
+    let mut heading = String::new();
+    let mut proofs = 0;
+    let mut drivers = 0;
+    let mut pending: Vec<(String, String)> = Vec::new();
+    for line in doc.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("### ") || trimmed.starts_with("## ") {
+            heading = trimmed.trim_start_matches('#').trim().to_owned();
+            continue;
+        }
+        let Some(proof) = trimmed.strip_prefix("Proof: ") else {
+            continue;
+        };
+        proofs += 1;
+        if proof.contains("(drill)")
+            || proof.contains("(behaviour, no command")
+            || proof.contains("(measured, no command")
+        {
+            continue;
+        }
+        let named = proof
+            .split(" (")
+            .next()
+            .unwrap_or(proof)
+            .split_whitespace()
+            .next()
+            .unwrap_or(proof);
+        let Some((file, fun)) = named.rsplit_once("::") else {
+            panic!("Proof: {proof} is not path::function");
+        };
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(file);
+        let text = std::fs::read_to_string(&source)
+            .unwrap_or_else(|_| panic!("the proof file {file} is not in the repo"));
+        // The call may wrap its arguments across lines: read the file
+        // as one whitespace-collapsed line before matching, as the
+        // alert anchors do for YAML.
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let runs_block = [
+            "runbook_block",
+            "runbook_block_with",
+            "run_guide_block",
+            "run_guide_block_async",
+            "run_guide_block_with",
+            "start_on",
+            "spawn_on",
+            "guide_argv",
+        ]
+        .iter()
+        .any(|helper| {
+            flat.match_indices(helper).any(|(at, _)| {
+                let rest = &flat[at + helper.len()..];
+                let rest = rest.trim_start();
+                rest.starts_with('(') && {
+                    let rest = rest[1..].trim_start();
+                    rest.starts_with(&format!("\"{heading}\""))
+                }
+            })
+        });
+        if runs_block {
+            drivers += 1;
+            continue;
+        }
+        assert!(
+            NOT_YET_DRIVING.contains(&(heading.as_str(), fun)),
+            "the proof of \"{heading}\" names {file}::{fun}, which does not run the section's own command block through runbook_block; convert the test, mark the Proof line with (behaviour, no command) and a reason, or add a NOT_YET_DRIVING row and list it in the PR body"
+        );
+        pending.push((heading.clone(), fun.to_owned()));
+    }
+    // The list is exactly the pending set: no stale rows, no missing
+    // ones.
+    let mut listed: Vec<(String, String)> = NOT_YET_DRIVING
+        .iter()
+        .map(|(h, f)| ((*h).to_owned(), (*f).to_owned()))
+        .collect();
+    listed.sort();
+    pending.sort();
+    pending.dedup();
+    assert_eq!(
+        listed, pending,
+        "NOT_YET_DRIVING must name exactly the proofs that do not yet run their section's block"
+    );
+    assert!(
+        proofs >= 17,
+        "the guide's Proof lines shrank: only {proofs} found"
+    );
+    assert!(
+        drivers >= 3,
+        "the proofs that drive the guide's own blocks shrank: only {drivers}"
+    );
+}
+
+/// The proofs whose tests still run the guide's commands their own
+/// way, not through the shared `runbook_block` helper. Every row is
+/// work to delete: convert the test to the helper, or move the proof
+/// to a Proof-line marker - the list must match the guide exactly, so
+/// a stale row fails the check. This list, mirrored in the PR body,
+/// is today's honest state: no proof is exempt silently.
+/// The proofs whose tests still run the guide's commands their own
+/// way, not through the shared `runbook_block` helper. Every proof
+/// runs its section's command block or carries its marker now, so the
+/// list is empty: a new proof must drive the block or say why it
+/// cannot, and a stale row or a silent exemption fails the check.
+const NOT_YET_DRIVING: &[(&str, &str)] = &[];
+
+/// The alerts' responses point at the operations guide, and every
+/// pointer resolves: a `docs/operations.md#anchor` names a heading of
+/// the guide (GitHub's slug of it), a `section N` names the guide's
+/// `## N.` heading. The reference lives in deploy/prometheus/*.yml,
+/// whose files the alert rules and their test expectations both are.
+#[test]
+fn every_alert_response_anchor_resolves() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/prometheus");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).expect("deploy/prometheus opens") {
+        let path = entry.expect("entry reads").path();
+        if path.extension().is_none_or(|e| e != "yml") {
+            continue;
+        }
+        // The YAML folds its prose: a reference may wrap mid-phrase, so
+        // the file reads as one line before the pointers are matched.
+        let text = std::fs::read_to_string(&path).expect("the alert file opens");
+        let text = text.replace('\n', " ");
+        for (at, _) in text.match_indices("docs/operations.md") {
+            {
+                let rest = &text[at + "docs/operations.md".len()..];
+                let rest = rest.trim_start_matches(['(', ' ']);
+                if let Some(anchor) = rest.strip_prefix('#') {
+                    let slug: String = anchor
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                        .collect();
+                    assert!(
+                        headings(&doc()).iter().any(|h| h == &slug),
+                        "the alert file {} points at docs/operations.md#{}, but no heading of the guide has that slug",
+                        path.display(),
+                        slug
+                    );
+                } else if let Some(rest) = rest.strip_prefix("sections ") {
+                    for part in rest.split(" and ") {
+                        let section: String = part
+                            .trim_start()
+                            .chars()
+                            .take_while(char::is_ascii_digit)
+                            .collect();
+                        assert!(
+                            !section.is_empty() && doc().contains(&format!("## {section}.")),
+                            "the alert file {} points at docs/operations.md section {}, but the guide has no such section",
+                            path.display(),
+                            section
+                        );
+                        checked += 1;
+                    }
+                    continue;
+                } else if let Some(rest) = rest.strip_prefix("section") {
+                    let section: String = rest
+                        .trim_start()
+                        .chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect();
+                    assert!(
+                        !section.is_empty() && doc().contains(&format!("## {section}.")),
+                        "the alert file {} points at docs/operations.md section {}, but the guide has no such section",
+                        path.display(),
+                        section
+                    );
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert!(
+        checked >= 20,
+        "the alerts' guide references shrank: only {checked} found"
+    );
+}
+
+/// Every heading of the guide, as GitHub slugs it: lowercased, spaces
+/// and dots to dashes, other punctuation dropped.
+fn headings(doc: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in doc.lines() {
+        let Some(heading) = line.strip_prefix("#") else {
+            continue;
+        };
+        let heading = heading.trim_start_matches('#').trim();
+        let mut slug = String::new();
+        for c in heading.chars() {
+            if c.is_ascii_alphanumeric() {
+                slug.extend(c.to_lowercase());
+            } else if c == ' ' || c == '.' {
+                slug.push('-');
+            }
+        }
+        while slug.ends_with('-') {
+            slug.pop();
+        }
+        out.push(slug);
+    }
+    out
 }
 
 /// The command-line extractor: continuations join, other tools pass,

@@ -26,7 +26,7 @@ use crate::land::{
     EXPIRE_PER_LAND, LAND_RETENTION_SECS, LandOutcome, LandRequest, LandState, decode_paths,
     encode_paths,
 };
-use crate::meta::{FsckDerivedRow, MetaTx, RefState, RepoChangeset, RepoId};
+use crate::meta::{FsckDerivedRow, MetaTx, RefState, RepoChangeset, RepoId, StaleLand};
 
 #[cfg(test)]
 thread_local! {
@@ -190,6 +190,34 @@ impl MetaTx for SqliteTx<'_> {
     /// # Errors
     ///
     /// [`Error::NotFound`] if a parent is not in `repo`.
+    /// Turns the importer's changeset batching on or off. SQLite writes
+    /// every row as its statement anyway (one write connection, so a
+    /// batch buys no round trips), so this holds nothing.
+    fn set_changeset_batching(&mut self, _on: bool) {}
+
+    fn preload_derived_chain(
+        &mut self,
+        _kind: &str,
+        _version: u32,
+        _start: ChangesetId,
+        _limit: i64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn changeset_batching(&self) -> bool {
+        false
+    }
+
+    /// Writes what the batching held back: nothing, on SQLite.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    fn flush_changeset_rows(&mut self, _repo: RepoId) -> Result<()> {
+        Ok(())
+    }
+
     fn insert_changeset(&mut self, repo: RepoId, cs: &Changeset) -> Result<ChangesetId> {
         let (body, id) = cs.encode_with_id();
         let mut parent_gen = 0;
@@ -247,6 +275,19 @@ impl MetaTx for SqliteTx<'_> {
             .map_err(crate::error::from_sqlite)
     }
 
+    /// The blobs of the list that the repo does not have. A loop over
+    /// [`repo_has_blob`](Self::repo_has_blob) is fine here: the check is
+    /// local, so a list of any length costs no round trips.
+    fn repo_missing_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<Vec<BlobId>> {
+        let mut missing = Vec::new();
+        for blob in blobs {
+            if !self.repo_has_blob(repo, *blob)? {
+                missing.push(*blob);
+            }
+        }
+        Ok(missing)
+    }
+
     /// Reads a changeset that `repo` may see and checks it against its ID.
     ///
     /// # Errors
@@ -288,6 +329,56 @@ impl MetaTx for SqliteTx<'_> {
             .map_err(crate::error::from_sqlite)?
             .exists(params![repo.0, id.as_bytes()])
             .map_err(crate::error::from_sqlite)
+    }
+
+    /// One page of the first-parent chain, one statement: the recursive
+    /// term follows the indexed first-parent rows (cs, n = 0), and the
+    /// join carries the generation and the body. Every fetched changeset
+    /// is an ancestor of `start`, so the repo check rides the start row,
+    /// as `get_changeset` checks it.
+    fn first_parent_page(
+        &mut self,
+        repo: RepoId,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, i64, Vec<u8>)>> {
+        let mut stmt = self
+            .0
+            .prepare_cached(
+                "WITH RECURSIVE walk(id, depth) AS (
+                     SELECT id, 0 FROM changesets JOIN repo_changesets ON cs = id
+                     WHERE repo_id = ?1 AND id = ?2
+                     UNION ALL
+                     SELECT cp.parent, w.depth + 1 FROM walk w
+                     JOIN changeset_parents cp ON cp.cs = w.id AND cp.n = 0
+                     WHERE w.depth < ?3
+                 )
+                 SELECT c.id, c.gen, c.body FROM walk
+                 JOIN changesets c ON c.id = walk.id
+                 ORDER BY walk.depth",
+            )
+            .map_err(crate::error::from_sqlite)?;
+        let rows = stmt
+            .query_map(params![repo.0, start.as_bytes(), limit], |row| {
+                let cs: Vec<u8> = row.get(0)?;
+                let generation: i64 = row.get(1)?;
+                let body: Vec<u8> = row.get(2)?;
+                Ok((cs, generation, body))
+            })
+            .map_err(crate::error::from_sqlite)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(crate::error::from_sqlite)?;
+        if rows.is_empty() {
+            return Err(Error::NotFound(format!("changeset {start}")));
+        }
+        rows.into_iter()
+            .map(|(cs, generation, body)| {
+                let id = ChangesetId::try_from(cs.as_slice()).map_err(|_| {
+                    Error::Corrupt("a changeset row's id is not a changeset id".to_owned())
+                })?;
+                Ok((id, generation, body))
+            })
+            .collect()
     }
 
     /// The generation of a changeset that `repo` may see: 1 for a root, else 1 +
@@ -375,6 +466,17 @@ impl MetaTx for SqliteTx<'_> {
             Ok((parent, parent_gen))
         })
         .collect()
+    }
+
+    fn parents_many(
+        &mut self,
+        merges: &[(ChangesetId, i64)],
+    ) -> Result<Vec<Vec<(ChangesetId, i64)>>> {
+        // Local, no round trip: one prepared statement over the batch.
+        merges
+            .iter()
+            .map(|&(id, id_gen)| self.parents(id, id_gen))
+            .collect()
     }
 
     /// Whether `ancestor` is `descendant` or reachable from it through parents.
@@ -496,6 +598,76 @@ impl MetaTx for SqliteTx<'_> {
             .query_row(params![kind, version, cs.as_bytes()], |row| row.get(0))
             .optional()
             .map_err(crate::error::from_sqlite)
+    }
+
+    fn get_derived_batch(
+        &mut self,
+        kind: &str,
+        version: u32,
+        ids: &[ChangesetId],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        // One prepared statement reused over the batch, inside the caller's
+        // one transaction: a land between two ids of the batch cannot mix
+        // two states.
+        let mut stmt = self
+            .0
+            .prepare_cached(
+                "SELECT value FROM derived WHERE kind = ?1 AND version = ?2 AND cs = ?3",
+            )
+            .map_err(crate::error::from_sqlite)?;
+        ids.iter()
+            .map(|cs| {
+                stmt.query_row(params![kind, version, cs.as_bytes()], |row| row.get(0))
+                    .optional()
+                    .map_err(crate::error::from_sqlite)
+            })
+            .collect()
+    }
+
+    fn get_derived_chain(
+        &mut self,
+        kind: &str,
+        version: u32,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, Vec<u8>)>> {
+        // One statement for the whole chain: the recursive term follows the
+        // indexed first-parent rows (cs, n = 0), and the join keeps the
+        // rows that carry a stored value. Every fetched changeset is an
+        // ancestor of `start`, so no repo filter is needed.
+        let mut stmt = self
+            .0
+            .prepare_cached(
+                "WITH RECURSIVE walk(id, depth) AS (
+                 SELECT ?1, 0
+                 UNION ALL
+                 SELECT cp.parent, w.depth + 1
+                 FROM walk w
+                 JOIN changeset_parents cp ON cp.cs = w.id AND cp.n = 0
+                 WHERE w.depth < ?2
+             )
+             SELECT d.cs, d.value FROM walk
+             JOIN derived d ON d.cs = walk.id
+             WHERE d.kind = ?3 AND d.version = ?4",
+            )
+            .map_err(crate::error::from_sqlite)?;
+        let rows = stmt
+            .query_map(params![start.as_bytes(), limit, kind, version], |row| {
+                let cs: Vec<u8> = row.get(0)?;
+                let value: Vec<u8> = row.get(1)?;
+                Ok((cs, value))
+            })
+            .map_err(crate::error::from_sqlite)?;
+        rows.map(|row| {
+            let (cs, value) = row.map_err(crate::error::from_sqlite)?;
+            Ok((
+                ChangesetId::try_from(cs.as_slice()).map_err(|_| {
+                    Error::Corrupt("a derived row's changeset is not a changeset id".to_owned())
+                })?,
+                value,
+            ))
+        })
+        .collect()
     }
 
     /// Records a derived value. A second write must agree with the first:
@@ -686,6 +858,25 @@ impl MetaTx for SqliteTx<'_> {
         load_tree(self.0, id).map(|(tree, _)| tree)
     }
 
+    /// The stored bytes of the trees the ids name, in the order asked.
+    /// SQLite has one write connection: the existing per-id read, in a
+    /// loop, is the batch.
+    fn get_trees(&mut self, ids: &[TreeId]) -> Result<Vec<Option<Vec<u8>>>> {
+        let mut bodies = Vec::with_capacity(ids.len());
+        let mut stmt = self
+            .0
+            .prepare_cached("SELECT body FROM trees WHERE id = ?1")
+            .map_err(crate::error::from_sqlite)?;
+        for id in ids {
+            let body = stmt
+                .query_row([id.as_bytes()], |row| row.get(0))
+                .optional()
+                .map_err(crate::error::from_sqlite)?;
+            bodies.push(body);
+        }
+        Ok(bodies)
+    }
+
     /// Reads a tree's stored `TreeV1` bytes and checks them against its ID. The
     /// strict decoder accepts only canonical bytes, so they are sent as they are.
     ///
@@ -800,22 +991,26 @@ impl MetaTx for SqliteTx<'_> {
     }
 
     /// The pending lands that started more than `stale_secs` ago.
-    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<(RepoId, i64, String)>> {
+    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<StaleLand>> {
         let mut stmt = self
             .0
             .prepare_cached(
-                "SELECT repo_id, land_id, target_ref FROM lands
-             WHERE state = 'pending' AND created_at > 0
-                 AND created_at < unixepoch() - ?1",
+                "SELECT l.repo_id, l.land_id, l.target_ref, l.caller, l.request_key, r.name
+                 FROM lands l JOIN repos r ON r.repo_id = l.repo_id
+                 WHERE l.state = 'pending' AND l.created_at > 0
+                     AND l.created_at < unixepoch() - ?1",
             )
             .map_err(crate::error::from_sqlite)?;
         let rows = stmt
             .query_map(params![stale_secs], |row| {
-                Ok((
-                    RepoId(row.get(0)?),
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
+                Ok(StaleLand {
+                    repo: RepoId(row.get(0)?),
+                    land_id: row.get(1)?,
+                    target_ref: row.get(2)?,
+                    caller: row.get(3)?,
+                    request_key: row.get(4)?,
+                    repo_name: row.get(5)?,
+                })
             })
             .map_err(crate::error::from_sqlite)?
             .collect::<Result<Vec<_>, _>>()
@@ -889,9 +1084,11 @@ impl MetaTx for SqliteTx<'_> {
             .transpose()
             .map_err(|e| Error::Corrupt(format!("land {land_id} result: {e}")))?;
         Ok(LandOutcome {
+            moved: false,
             land_id,
             state: LandState::parse(&state)?,
             result,
+            previous: None,
             detail,
             conflict_paths: decode_paths(&paths)
                 .ok_or_else(|| Error::Corrupt(format!("land {land_id} conflict paths")))?,
@@ -911,8 +1108,8 @@ impl MetaTx for SqliteTx<'_> {
         let updated = self
             .0
             .prepare_cached(
-                "UPDATE lands SET state = ?3, result_cs = ?4, detail = ?5, conflict_paths = ?6,
-                     finished_at = unixepoch()
+                "UPDATE lands SET state = ?3, result_cs = ?4, detail = ?5,
+                     conflict_paths = ?6, finished_at = unixepoch()
                  WHERE repo_id = ?1 AND land_id = ?2 AND state = 'pending'",
             )
             .map_err(crate::error::from_sqlite)?
@@ -931,9 +1128,11 @@ impl MetaTx for SqliteTx<'_> {
             )));
         }
         Ok(LandOutcome {
+            moved: false,
             land_id,
             state,
             result,
+            previous: None,
             detail,
             conflict_paths,
         })
@@ -949,6 +1148,15 @@ impl MetaTx for SqliteTx<'_> {
             .map_err(crate::error::from_sqlite)?
             .execute(params![repo.0, SHA1, commit.as_slice(), cs.as_bytes()])
             .map_err(crate::error::from_sqlite)?;
+        Ok(())
+    }
+
+    /// Records that the git commits became the changesets. SQLite has
+    /// one write connection: the existing per-row statement, in a loop.
+    fn put_git_imports(&mut self, repo: RepoId, pairs: &[(ObjectId, ChangesetId)]) -> Result<()> {
+        for (oid, cs) in pairs {
+            self.put_git_import(repo, *oid, *cs)?;
+        }
         Ok(())
     }
 
@@ -1123,16 +1331,25 @@ impl MetaTx for SqliteTx<'_> {
             .map_err(crate::error::from_sqlite)
     }
 
-    /// The body of changeset `cs`, or `None` when it is not stored.
-    fn stored_changeset_body(&mut self, cs: &[u8]) -> Result<Option<Vec<u8>>> {
-        let body: Option<Vec<u8>> = self
+    /// The bodies of the changesets the ids name, as `(id, body)` for
+    /// every id that has a stored body. SQLite has one write connection:
+    /// the existing per-id statement, in a loop, is the batch.
+    fn stored_changeset_bodies(&mut self, ids: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut rows = Vec::new();
+        let mut stmt = self
             .0
             .prepare_cached("SELECT body FROM changesets WHERE id = ?1")
-            .map_err(crate::error::from_sqlite)?
-            .query_row(params![cs], |row| row.get(0))
-            .optional()
             .map_err(crate::error::from_sqlite)?;
-        Ok(body)
+        for id in ids {
+            if let Some(body) = stmt
+                .query_row(params![id], |row| row.get(0))
+                .optional()
+                .map_err(crate::error::from_sqlite)?
+            {
+                rows.push((id.clone(), body));
+            }
+        }
+        Ok(rows)
     }
 
     /// The blobs that `repo` may name, all of them.
@@ -1155,6 +1372,15 @@ impl MetaTx for SqliteTx<'_> {
             .map_err(crate::error::from_sqlite)?
             .execute(params![repo.0, blob])
             .map_err(crate::error::from_sqlite)?;
+        Ok(())
+    }
+
+    /// Removes the rows that name any of `blobs` for `repo`. SQLite has
+    /// one write connection: the existing per-row statement, in a loop.
+    fn delete_repo_blobs(&mut self, repo: RepoId, blobs: &[Vec<u8>]) -> Result<()> {
+        for blob in blobs {
+            self.delete_repo_blob(repo, blob)?;
+        }
         Ok(())
     }
 

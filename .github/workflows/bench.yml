@@ -71,6 +71,7 @@ jobs:
         image: postgres:17.11
         env:
           POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
           POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 5432:5432

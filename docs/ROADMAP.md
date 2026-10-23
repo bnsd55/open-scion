@@ -23,10 +23,11 @@ Make the project safe to install anywhere it claims to work.
   matrix over ubuntu-24.04 and macos-15, since [#326](https://github.com/bnsd55/openscion/pull/326).
 - No known flaky test: nothing watches the full suite on a schedule —
   only the nightly soak and the nightly version matrix run on a clock;
-  the suite runs per push and per pull request. One suspected flake is
-  open: scn's `failed printing to stdout: Broken pipe` in the release
-  smoke, which [#341](https://github.com/bnsd55/openscion/pull/341)
-  likely fixed, not yet confirmed by green runs.
+  the suite runs per push and per pull request. The one suspected
+  flake, scn's `failed printing to stdout: Broken pipe` in the release
+  smoke, is confirmed fixed: [#341](https://github.com/bnsd55/openscion/pull/341)
+  landed the fix, and none of the 57 CI runs on `main` from its merge
+  to 2026-10-21 shows a `Broken pipe` in the release smoke.
 - [Ubuntu's umask 002 and user private groups trip the group-writable
   checks](https://github.com/bnsd55/openscion/issues/302): open, the
   last item of this gate.
@@ -62,8 +63,9 @@ Make the pieces trustworthy together, and the data safe to lose.
   [#239](https://github.com/bnsd55/openscion/issues/239) closed with
   the matrix green on `main`, the soak running nightly
   ([#320](https://github.com/bnsd55/openscion/issues/320); its last
-  scheduled run failed on the RSS warm-up, the fix is open in
-  [#365](https://github.com/bnsd55/openscion/pull/365)), and the last
+  scheduled run failed on the RSS warm-up before
+  [#365](https://github.com/bnsd55/openscion/pull/365) landed the fix,
+  and the first scheduled run after it confirms it), and the last
   missing operating metric (gc's) a textfile
   ([#327](https://github.com/bnsd55/openscion/issues/327)).
 - The fault and recovery matrix: disk full, EIO, a Postgres restart,
@@ -77,14 +79,16 @@ Prove the one-machine server under real load.
 
 - A 72-hour soak and fault job runs against one server, with resource
   ceilings named in advance, and its raw numbers published in
-  [benchmarks](benchmarks.md): open. What exists is a 120-minute
-  nightly soak ([#320](https://github.com/bnsd55/openscion/issues/320)),
-  whose only scheduled run on `main` failed (the RSS baseline is the
-  first sample after the warm-up window; the fix is open in
-  [#365](https://github.com/bnsd55/openscion/pull/365)). The fault job
-  does not exist yet. No 72-hour run has happened: it will run on a
-  rented VM as a one-job self-hosted runner (D10). No soak numbers are
-  in [benchmarks](benchmarks.md) yet.
+  [benchmarks](benchmarks.md): open. The 12-hour fault soak (Run B)
+  ran and passed; its numbers are in
+  [benchmarks](benchmarks.md#fault-soak-run-b). The 72-hour soak (Run
+  A) runs on an owner machine since 2026-10-21, and its report comes
+  on [#399](https://github.com/bnsd55/openscion/issues/399). A
+  120-minute
+  nightly soak ([#320](https://github.com/bnsd55/openscion/issues/320))
+  runs scheduled on `main`; its RSS warm-up failure was fixed in
+  [#365](https://github.com/bnsd55/openscion/pull/365), and the
+  scheduled run of 2026-10-21 passed.
 - [The checkout benchmark stands against `git clone`](https://github.com/bnsd55/openscion/issues/6):
   done, the comparison and its numbers are in
   [benchmarks](benchmarks.md).
@@ -160,8 +164,21 @@ Make one server routine to run.
 - `docs/operations.md` has runbooks for install, upgrade, rollback,
   backup, restore, key and certificate rotation, disk full, EIO, a
   Postgres restart, a failed migration, an `fsck` failure and garbage
-  collection.
-- Each runbook has a CI test or a recorded release drill.
+  collection: done - the disk-full and failing-disk runbooks
+  ([#448](https://github.com/bnsd55/openscion/pull/448)), the
+  Postgres-restart runbook
+  ([#453](https://github.com/bnsd55/openscion/pull/453)), the
+  failed-migration and fsck-failure runbooks
+  ([#454](https://github.com/bnsd55/openscion/pull/454)), and the
+  first-boot (the install runbook) and certificate-rotation runbooks
+  ([#457](https://github.com/bnsd55/openscion/pull/457)).
+- Each runbook has a CI test or a recorded release drill: done, with
+  each runbook's `Proof:` line held by the docs_ops registry, except
+  one arm: rollback's run-the-old-binary arm, whose drill is #431 (the
+  pre-upgrade backup restores and serves under the N-1 binary). The
+  restore arm is proven
+  ([#454](https://github.com/bnsd55/openscion/pull/454)'s
+  `a_newer_schema_refuses_the_open_and_a_restore_serves`).
 - Readiness, liveness and graceful drain have end-to-end tests.
   Readiness goes false before the server drains in-flight calls.
 - Prometheus alert rules and the log fields they use are versioned and
@@ -187,7 +204,8 @@ Make releases repeatable without one person's machine or account.
 - Each artifact has a checksum, an SPDX or CycloneDX SBOM and
   verifiable provenance. From this release, the binaries and SBOMs get
   GitHub artifact attestations (D18). The recorded release workflow is
-  assessed against SLSA Build L3, as `docs/slsa.md` (planned) records.
+  assessed against SLSA Build L3, as [docs/slsa.md](slsa.md)
+  records.
 - Production code has at least 80 percent statement coverage, measured
   with a pinned tool, with the exclusions checked in (D15).
 - Required tests have no hidden retry. The scheduled full suite passes

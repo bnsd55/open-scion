@@ -17,10 +17,13 @@ use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::store::Store;
 
 /// The stated size of the measured store: repos and changesets per repo.
-const REPOS: u8 = 20;
-const CHANGESETS_PER_REPO: u8 = 50;
+/// Big enough that the per-byte and per-changeset costs of a restore
+/// show past the fixed costs (a store of tens of MiB restores in a
+/// fraction of a second, which tells an operator nothing).
+const REPOS: u8 = 40;
+const CHANGESETS_PER_REPO: u16 = 300;
 /// The content bytes of each changeset's own file.
-const FILE_BYTES: usize = 32 * 1024;
+const FILE_BYTES: usize = 64 * 1024;
 /// A restore of this size past this bound means something changed in the
 /// restore path, not in the machine.
 const RESTORE_BOUND_SECS: u64 = 600;
@@ -43,9 +46,30 @@ fn a_restore_of_a_stated_store_takes_a_stated_time() {
         // version they saw, as a client's land does.
         let mut ref_version: Option<i64> = None;
         for step in 0..CHANGESETS_PER_REPO {
-            let bytes = vec![b'a' + (step % 26); FILE_BYTES];
+            // Distinct, incompressible content per blob: an LCG stream
+            // seeded by the repo and the step. A repeating pattern would
+            // both deduplicate (two blobs of one ID) and compress (a
+            // 64 KiB file of one repeated block stores tens of bytes),
+            // and the restore would move a fraction of the raw bytes.
+            let mut seed = (u64::from(repo) << 32) ^ u64::from(step);
+            // The stream: the LCG's middle bits, truncated to a byte on
+            // purpose (clippy::cast_possible_truncation is fine here: the
+            // top 31 bits ARE the stream).
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "the top 31 bits of the LCG state are the stream"
+            )]
+            let next = |seed: &mut u64| -> u8 {
+                *seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (*seed >> 33) as u8
+            };
+            let bytes = (0..FILE_BYTES)
+                .map(|_| next(&mut seed))
+                .collect::<Vec<u8>>();
             let blob = store.blobs().put(&bytes).unwrap();
-            blob_bytes += bytes.len() as u64;
+            blob_bytes += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
             let cs = chain_changeset(&name, step, blob, parent);
             let id = store
                 .write(|c| {
@@ -68,11 +92,8 @@ fn a_restore_of_a_stated_store_takes_a_stated_time() {
     // serves), then the blob files.
     let backup = tempfile::tempdir().unwrap();
     let snapshot = backup.path().join("scion.db");
-    let live = rusqlite::Connection::open(dir.path().join("scion.db")).unwrap();
-    live.execute(&format!("VACUUM INTO '{}'", snapshot.display()), [])
-        .unwrap();
-    drop(live);
-    copy_tree(&dir.path().join("objects"), &backup.path().join("objects"));
+    // The snapshot and the blob copy are the runbook's own lines.
+    take_the_guides_backup(dir.path(), backup.path(), &snapshot);
 
     // The restore, timed end to end: the metadata and the blob files of
     // the backup into a fresh directory, then `fsck`, then an open and a
@@ -84,6 +105,11 @@ fn a_restore_of_a_stated_store_takes_a_stated_time() {
         &backup.path().join("objects"),
         &restored_dir.path().join("objects"),
     );
+    // Durability inside the timer: an operator's restore is done when a
+    // crash cannot lose what was restored, so the copied files and the
+    // directories holding them are fsynced before the clock stops.
+    fsync_tree(&restored_dir.path().join("objects"));
+    fsync_dir(restored_dir.path());
     let restored = from_store(Store::open(restored_dir.path()).unwrap());
     let report = fsck::run(&restored, 1, &mut |_| {}).unwrap();
     assert!(
@@ -95,12 +121,37 @@ fn a_restore_of_a_stated_store_takes_a_stated_time() {
     drop(restored);
     let restore = restore_started.elapsed();
 
-    // The line the docs quote, with the stated size beside it.
+    // The lines the docs quote: the size, the time, and the rate they
+    // imply, so an operator of a bigger store can scale the number. The
+    // bytes on disk are the restore's real payload, stated beside the
+    // raw content bytes: they are the same only while nothing
+    // deduplicates.
+    let on_disk = bytes_on_disk(&restored_dir.path().join("objects"));
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "byte and changeset counts stay far below 2^53"
+    )]
+    let raw_mib = blob_bytes as f64 / (1024.0 * 1024.0);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "byte and changeset counts stay far below 2^53"
+    )]
+    let disk_mib = on_disk as f64 / (1024.0 * 1024.0);
     println!(
         "restore: {:.1} s (build {:.1} s) for {REPOS} repos, {changesets} changesets, \
-         {blob_bytes} raw blob bytes in files of about {FILE_BYTES} bytes",
+         {blob_bytes} raw blob bytes ({raw_mib:.0} MiB) in files of about {FILE_BYTES} bytes;          {on_disk} bytes ({disk_mib:.0} MiB) on disk after the restore",
         restore.as_secs_f64(),
         build.as_secs_f64(),
+    );
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "byte and changeset counts stay far below 2^53"
+    )]
+    let changeset_rate = changesets as f64 / restore.as_secs_f64().max(0.001);
+    println!(
+        "restore rate: {:.0} MiB/s on disk, {:.0} changesets/s (ubuntu-24.04, one sample, fsync included)",
+        disk_mib / restore.as_secs_f64().max(0.001),
+        changeset_rate,
     );
     assert!(
         restore.as_secs() < RESTORE_BOUND_SECS,
@@ -109,9 +160,82 @@ fn a_restore_of_a_stated_store_takes_a_stated_time() {
     );
 }
 
+/// The backup the runbook's own lines take: the metadata snapshot
+/// (`VACUUM INTO`) first, then the blob copy (`cp -R ... objects`), each
+/// with the stated store's directory and the backup folder in place of
+/// the documented ones.
+fn take_the_guides_backup(store_dir: &Path, backup: &Path, snapshot: &Path) {
+    use scion_server::test_support::docs::run_guide_block_with;
+    let _stdout = run_guide_block_with(
+        "The durability point",
+        "VACUUM INTO",
+        &[
+            ("/srv/scion", store_dir.to_str().unwrap()),
+            ("/backups/scion.db", snapshot.to_str().unwrap()),
+        ],
+    );
+    let _stdout = run_guide_block_with(
+        "The durability point",
+        "objects",
+        &[
+            ("/srv/scion", store_dir.to_str().unwrap()),
+            ("/backups/scion-$(date +%F)", backup.to_str().unwrap()),
+        ],
+    );
+}
+
+/// The byte size of every file under `root`: the restore's real payload.
+fn bytes_on_disk(root: &Path) -> u64 {
+    walk(root)
+        .iter()
+        .filter(|p| p.is_file())
+        .filter_map(|p| fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// fsyncs every file under `root`, then the directories on the way down.
+fn fsync_tree(root: &Path) {
+    let mut dirs = Vec::new();
+    for entry in walk(root) {
+        if entry.is_dir() {
+            dirs.push(entry);
+        } else {
+            let _ = fs::File::open(&entry).and_then(|f| f.sync_all());
+        }
+    }
+    for dir in dirs.iter().rev() {
+        let _ = fs::File::open(dir).and_then(|f| f.sync_all());
+    }
+    let _ = fs::File::open(root).and_then(|f| f.sync_all());
+}
+
+fn fsync_dir(dir: &Path) {
+    let _ = fs::File::open(dir).and_then(|f| f.sync_all());
+}
+
+/// Every path under `root`, files and directories, depth first.
+fn walk(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_owned()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path.clone());
+            }
+            out.push(path);
+        }
+    }
+    out
+}
+
 /// The changeset `step` of a chain in `name`: one file backed by `blob`,
 /// on `parent`, with a message that names it.
-fn chain_changeset(name: &str, step: u8, blob: BlobId, parent: Option<ChangesetId>) -> Changeset {
+fn chain_changeset(name: &str, step: u16, blob: BlobId, parent: Option<ChangesetId>) -> Changeset {
     Changeset::new(
         parent.into_iter().collect(),
         IdentityTime::new(name.as_bytes().to_vec(), b"bench@x".to_vec(), 0, 0)
@@ -132,7 +256,7 @@ fn chain_changeset(name: &str, step: u8, blob: BlobId, parent: Option<ChangesetI
 
 /// Every file under `from`, copied to the same path under `to`.
 fn copy_tree(from: &Path, to: &Path) {
-    let mut stack = vec![from.to_path_buf()];
+    let mut stack = vec![from.to_owned()];
     while let Some(d) = stack.pop() {
         for entry in fs::read_dir(&d).unwrap() {
             let entry = entry.unwrap().path();

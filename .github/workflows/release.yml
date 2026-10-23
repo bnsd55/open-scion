@@ -18,8 +18,8 @@ on:
         description: "Build, compare and attest; publish nothing."
         type: boolean
         default: true
-      tag:
-        description: "The tag to build (dry-run), e.g. v0.1.0-rc1."
+      commit:
+        description: "The commit SHA to build (dry-run); an ancestor of main."
         required: true
 
 permissions:
@@ -37,6 +37,13 @@ jobs:
   # The tag's identity, proven without the owner's key: GitHub verified
   # the SSH signature at push time with the key on the owner's account;
   # the API hands back that verdict.
+  # The tag's identity, proven without the owner's key: GitHub verified
+  # the SSH signature at push time with the key on the owner's account;
+  # the API hands back that verdict. The verdicts live in
+  # scripts/release-verify-tag.sh, fed canned answers by
+  # scripts/test-release-verify-tag.sh — no CI run holds a signed tag.
+  # A dry-run dispatch proves the rest of the pipeline against a plain
+  # commit of main's history instead.
   verify-tag:
     runs-on: ubuntu-24.04
     outputs:
@@ -44,37 +51,51 @@ jobs:
       tag: ${{ steps.tag.outputs.tag }}
     env:
       GH_TOKEN: ${{ github.token }}
+      # Input never touches the shell directly (a template injection
+      # would read as code here): the commit comes through env, and it
+      # must be a 40-hex-digit SHA before anything else runs; the tag
+      # name too, for a tag name may hold $( ) ; and backticks.
+      DRY_RUN_COMMIT: ${{ inputs.commit }}
+      RELEASE_TAG: ${{ github.ref_name }}
     steps:
       - id: tag
         run: |
           set -euo pipefail
           dry="${{ inputs.dry_run && 'true' || 'false' }}"
-          tag="${{ inputs.dry_run && inputs.tag || github.ref_name }}"
+          if [ "$dry" = true ]; then
+            # SHORTCUT: the dry-run skips the tag-object read and the
+            # signature check entirely — verify-tag's signature path
+            # first runs on the real tag. Upgrade: a scratch signed tag
+            # in a fork, if that ever breaks.
+            case "${DRY_RUN_COMMIT}" in
+              [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+              *) echo "the commit must be a full 40-hex SHA"; exit 1 ;;
+            esac
+            commit="$DRY_RUN_COMMIT"
+            # A dry run proves only what could be tagged: the commit is
+            # an ancestor of main (or main itself).
+            status="$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$commit" --jq .status)"
+            [ "$status" = behind ] || [ "$status" = identical ] || {
+              echo "the commit is not an ancestor of main"; exit 1; }
+            echo "peeled=$commit" >> "$GITHUB_OUTPUT"
+            echo "tag=$commit" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tag="$RELEASE_TAG"
           # An annotated tag only: a lightweight tag has no tag object,
           # so it cannot carry a signature (D18).
-          ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag")"
-          [ "$(echo "$ref" | jq -r .object.type)" = tag ] || {
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" \
+            > ref-answer.json
+          [ "$(jq -r .object.type ref-answer.json)" = tag ] || {
             echo "a release needs an annotated tag, not a lightweight one"; exit 1; }
-          sha="$(echo "$ref" | jq -r .object.sha)"
-          object="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha")"
-          if [ "$dry" != true ]; then
-            v="$(echo "$object" | jq -r '.verification.verified | tostring')"
-            r="$(echo "$object" | jq -r '.verification.reason')"
-            [ "$v" = true ] && [ "$r" = valid ] || {
-              echo "the tag is not verified: reason=$r (D18: sign it)"; exit 1; }
-            [ "$(echo "$object" | jq -r .tagger.email)" = bnsd55@gmail.com ] || {
-              echo "the tagger is not the owner"; exit 1; }
-          fi
-          # For a real release, the tagged commit is on main: comparing
-          # main to it must say the tag is behind (an ancestor), not
-          # ahead or diverged. A dry-run proves the pipeline on a branch
-          # and skips this check with the signature checks.
-          peeled="$(echo "$object" | jq -r .object.sha)"
-          if [ "$dry" != true ]; then
-            status="$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$peeled" --jq .status)"
-            [ "$status" = behind ] || [ "$status" = identical ] || {
-              echo "the tagged commit is not on main"; exit 1; }
-          fi
+          tagsha="$(jq -r .object.sha ref-answer.json)"
+          gh api "repos/$GITHUB_REPOSITORY/git/tags/$tagsha" \
+            > tag-answer.json
+          # The verdicts are the script's; the compare needs the API.
+          peeled="$(scripts/release-verify-tag.sh check ref-answer.json tag-answer.json)"
+          status="$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$peeled" --jq .status)"
+          [ "$status" = behind ] || [ "$status" = identical ] || {
+            echo "the tagged commit is not on main"; exit 1; }
           echo "peeled=$peeled" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
