@@ -460,10 +460,13 @@ impl Drop for Server {
 /// flock tears down when the kernel reaps the process. The wait takes
 /// the real condition, bounded at 10 s, and retries ONLY the holder
 /// refusal, one line per try with the elapsed time; any other exit
-/// fails at once.
-pub(crate) fn start_after_kill(data: &Path, log: &Path) -> Server {
+/// fails at once. Returns the server and the number of holder refusals
+/// it retried: a test that must prove the wait happened asserts on the
+/// count.
+pub(crate) fn start_after_kill(data: &Path, log: &Path) -> (Server, u64) {
     let start = Instant::now();
     let deadline = start + Duration::from_secs(10);
+    let mut retried = 0_u64;
     loop {
         let mark = usize::try_from(fs::metadata(log).map_or(0, |m| m.len()))
             .expect("the log's length fits usize");
@@ -497,15 +500,16 @@ pub(crate) fn start_after_kill(data: &Path, log: &Path) -> Server {
             std::thread::sleep(Duration::from_millis(10));
         }
         if listening {
-            return server;
+            return (server, retried);
         }
         assert!(
             Instant::now() < deadline,
             "the store lock of {} was never released within 10 s",
             data.display()
         );
+        retried += 1;
         eprintln!(
-            "start_after_kill: the store lock is still held by the killed              server's session, retrying at {} ms",
+            "start_after_kill: the killed server's store lock is still held, retrying at {} ms",
             start.elapsed().as_millis()
         );
         std::thread::sleep(Duration::from_millis(20));
