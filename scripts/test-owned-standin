@@ -1,0 +1,9 @@
+#!/bin/bash
+# The stand-in for a long-running server in the owned-process test: it
+# prints the serving line the start helper waits for, then sleeps, so
+# the test needs no build. It waits two seconds first, so a start
+# helper whose readiness count is broken (one that starts the READY
+# countdown at zero, say) fails this test instead of a real run.
+sleep 2
+echo "serving listen=127.0.0.1:0"
+sleep 300

@@ -151,7 +151,7 @@ for backend in sqlite postgres; do
           rm -rf "$WORK/reads/$n"
         done
       }
-      readers & echo $! > "$WORK/capacity-readers.pid"
+      loop_bg capacity-readers readers
       # The server's Land counter at the cell's start: lands served is
       # the counter's growth over the cell, so a cell whose bench dies
       # still reports what its writers got through.
@@ -178,8 +178,7 @@ for backend in sqlite postgres; do
         done
         rep=$((rep + 1))
       done
-      kill "$(cat "$WORK/capacity-readers.pid")" 2> /dev/null || true
-      wait "$(cat "$WORK/capacity-readers.pid")" 2> /dev/null || true
+      stop capacity-readers
       rss_end=$(ps -o rss= -p "$SERVER_PID" | tr -d ' ')
       # Lands served, from the server's counter, while it still serves:
       # the counter counts what the writers got through, whether bench
