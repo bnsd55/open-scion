@@ -2218,10 +2218,14 @@ mod tests {
         // The owner's walk stops at a step boundary past its deadline, with
         // the last changesets still missing. The gate walks it one derive
         // at a time: the second pair of releases goes out only once the
-        // waiter has joined the walk's flight and the deadline, built
-        // here, has passed - the state decides the order, not a clock's
-        // mercy to thread starts.
-        let owner_deadline = Deadline::new(Instant::now() + Duration::from_millis(50));
+        // waiter has joined the walk's flight and the deadline has
+        // expired - the state decides the order, not a clock. The
+        // deadline is open-ended and the test expires it on purpose
+        // (`test_expire`): a 50 ms budget built here can lose to the
+        // owner thread's start, whose first deadline check would then
+        // fire before any derive, and the walk would reach no gate at
+        // all (main CI 39948200919's flake).
+        let owner_deadline = Deadline::new(Instant::now() + Duration::from_secs(60));
         std::thread::scope(|scope| {
             let _gate = gate_closed();
             let owner = scope.spawn(|| get_by::<Cold<1>>(&store, repo, tip, &owner_deadline));
@@ -2232,18 +2236,19 @@ mod tests {
                 let deadline = Deadline::new(Instant::now() + Duration::from_secs(5));
                 get_by::<Cold<1>>(&store, repo, ids[1], &deadline).unwrap()
             });
-            // The waiter is provably on the flight, and the owner's
-            // deadline has provably passed, before the walk is let on.
+            // The waiter is provably on the flight before the walk is let
+            // on; the expiry of the deadline is the test's next act.
             for _ in 0..2_000 {
-                if joined_on(&store, repo) >= 3 && Instant::now() >= owner_deadline.at() {
+                if joined_on(&store, repo) >= 3 {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
             assert!(
-                joined_on(&store, repo) >= 3 && Instant::now() >= owner_deadline.at(),
+                joined_on(&store, repo) >= 3,
                 "the waiter never joined the flight"
             );
+            owner_deadline.test_expire();
             gate_release(2);
             gate_release(2);
             // A waiter of a changeset the stopped walk DID store: it wakes
@@ -2278,31 +2283,40 @@ mod tests {
         // wakes when the walk ends, finds its value still missing, and owns
         // the next walk itself: it walks only what is left, and every
         // changeset is derived once, never redone.
-        let owner_deadline = Deadline::new(Instant::now() + Duration::from_millis(50));
+        // The owner's walk stops at a step boundary when its deadline passes;
+        // the rows it stored stay. A waiter that joined the walk mid-flight
+        // wakes when the walk ends, finds its value still missing, and owns
+        // the next walk itself: it walks only what is left, and every
+        // changeset is derived once, never redone. The deadline is
+        // open-ended and the test expires it on purpose once the waiter
+        // has joined (test_expire): a clock budget built here can lose to
+        // the owner thread's start, and the walk would reach no gate at
+        // all (the same flake the first flight test fixes).
+        let owner_deadline = Deadline::new(Instant::now() + Duration::from_secs(60));
         std::thread::scope(|scope| {
             let _gate = gate_closed();
             let owner = scope.spawn(|| get_by::<Cold<1>>(&store, repo, tip, &owner_deadline));
             wait_entered(1);
             // The waiter joins the walk while it is still in flight, so
             // the walk's end is what wakes it. The test waits for the
-            // waiter's Arc to be on the flight, and for the deadline to
-            // have passed, before it lets the walk on: a waiter that
-            // arrived after the walk ended would join nothing and check
-            // something else.
+            // waiter's Arc to be on the flight, then expires the deadline
+            // before it lets the walk on: a waiter that arrived after the
+            // walk ended would join nothing and check something else.
             let waiter = scope.spawn(|| {
                 let deadline = Deadline::new(Instant::now() + Duration::from_secs(5));
                 get_by::<Cold<1>>(&store, repo, tip, &deadline).unwrap()
             });
             for _ in 0..2_000 {
-                if joined_on(&store, repo) >= 3 && Instant::now() >= owner_deadline.at() {
+                if joined_on(&store, repo) >= 3 {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
             assert!(
-                joined_on(&store, repo) >= 3 && Instant::now() >= owner_deadline.at(),
+                joined_on(&store, repo) >= 3,
                 "the waiter never joined the flight"
             );
+            owner_deadline.test_expire();
             gate_release(2);
             gate_release(2);
             let owner = owner.join().unwrap();
