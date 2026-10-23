@@ -2,8 +2,11 @@
 //! a cell marked `supported` must name a job that exists in the
 //! workflow file it names, and that job must run on the cell's OS and
 //! architecture (`runs-on`), with the cell's Postgres major in its
-//! services. A `best effort` or `unsupported` cell must name no job.
-//! The reverse holds too: every CI job that runs a platform suite
+//! services. A `best effort` or `experimental` cell may name the
+//! scheduled job that still runs it — the check then holds that job to
+//! the same platform fit, so a renamed or retargeted scheduled job
+//! fails here too — and an `unsupported` cell must name no job. The
+//! reverse holds too: every CI job that runs a platform suite
 //! (`test*`, `nfs-mount`, `power-loss`) must be claimed by at least one
 //! row, so a renamed job fails here instead of silently leaving the
 //! matrix.
@@ -93,12 +96,14 @@ fn every_supported_cell_runs_natively_and_every_platform_job_is_claimed() {
                 }
                 claimed.push(name);
             }
-            "best effort" | "unsupported" => {
+            "experimental" | "best effort" => {
+                claim_scheduled_job(row, &cell, &jobs, &mut claimed);
+            }
+            "unsupported" => {
                 assert!(
                     row.job.is_none(),
-                    "`{cell}` is {status} but claims a job; only a native job \
-                     makes a cell supported",
-                    status = row.status
+                    "`{cell}` is unsupported but claims a job; only a native job \
+                     makes a cell supported"
                 );
             }
             other => panic!("`{cell}` has an unknown status {other:?}"),
@@ -231,6 +236,22 @@ fn parse_jobs(text: &str) -> Vec<(String, Job)> {
                 "version" if v.trim().starts_with('[') => {
                     matrix_versions = list(v);
                 }
+                // A conditional matrix: the versions the job can run are
+                // the union of the lists its `fromJSON` alternatives
+                // name, so a row that names a major the scheduled list
+                // carries still resolves.
+                "version" if v.contains("fromJSON") => {
+                    let mut versions = Vec::new();
+                    for expr in v.split("fromJSON").skip(1) {
+                        if let (Some(open), Some(close)) = (
+                            expr.find('['),
+                            expr[expr.find('[').unwrap_or(0)..].find(']'),
+                        ) {
+                            versions.extend(list(&expr[open..=open + close]));
+                        }
+                    }
+                    matrix_versions = versions;
+                }
                 _ => {}
             }
             if indent <= 4 && k.trim() != "image" && k.trim() != "services" && in_services {
@@ -307,6 +328,40 @@ struct Row {
     status: String,
     job: Option<(String, String)>,
     why: String,
+}
+
+/// A scheduled job may carry a best-effort or experimental cell: the
+/// row names it, and the same platform check holds (the job exists and
+/// runs the cell's OS, architecture and Postgres major). Only a job
+/// that runs per push makes the cell supported, which is a claim of
+/// the support policy, not of this check.
+fn claim_scheduled_job(
+    row: &Row,
+    cell: &str,
+    jobs: &BTreeMap<String, Job>,
+    claimed: &mut Vec<String>,
+) {
+    let Some((file, name)) = &row.job else {
+        return;
+    };
+    let key = format!("{file}:{name}");
+    let job = jobs
+        .get(&key)
+        .unwrap_or_else(|| panic!("`{cell}` names {key}, which no workflow defines"));
+    assert!(
+        job.runs_on_matches(&row.os, &row.arch),
+        "`{cell}` names {key}, which runs on `{}`, not on {} {}",
+        job.runs_on,
+        row.os,
+        row.arch
+    );
+    if let Some(major) = &row.postgres {
+        assert!(
+            job.runs_postgres(major),
+            "`{cell}` names {key}, whose services do not run postgres {major}"
+        );
+    }
+    claimed.push(name.to_owned());
 }
 
 /// The matrix rows of docs/support.md: the table under "## Platform
