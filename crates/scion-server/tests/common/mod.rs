@@ -453,6 +453,69 @@ impl Drop for Server {
     }
 }
 
+/// Starts a server on `data` right after a kill. The killed server's
+/// store lock outlives the SIGKILL by a moment: on Postgres the
+/// advisory lock dies with the killed server's session, when the
+/// database gets around to ending that backend, and on SQLite the
+/// flock tears down when the kernel reaps the process. The wait takes
+/// the real condition, bounded at 10 s, and retries ONLY the holder
+/// refusal, one line per try with the elapsed time; any other exit
+/// fails at once. Returns the server and the number of holder refusals
+/// it retried: a test that must prove the wait happened asserts on the
+/// count.
+pub(crate) fn start_after_kill(data: &Path, log: &Path) -> (Server, u64) {
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(10);
+    let mut retried = 0_u64;
+    loop {
+        let mark = usize::try_from(fs::metadata(log).map_or(0, |m| m.len()))
+            .expect("the log's length fits usize");
+        let mut server = Server::spawn(data, log);
+        let mut listening = false;
+        loop {
+            if server.listens(log) {
+                listening = true;
+                break;
+            }
+            if let Some(status) = server.try_wait() {
+                let text = fs::read_to_string(log).unwrap_or_default();
+                let fresh = &text[mark..];
+                // Postgres refuses with the holder message of the
+                // advisory lock; SQLite with the one of the flock.
+                let holder = fresh.contains("another server holds this store")
+                    || fresh.contains("is in use by another server");
+                assert!(
+                    holder,
+                    "the server exited with {status}:
+{fresh}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the server never listened within 10 s:
+{}",
+                fs::read_to_string(log).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if listening {
+            return (server, retried);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the store lock of {} was never released within 10 s",
+            data.display()
+        );
+        retried += 1;
+        eprintln!(
+            "start_after_kill: the killed server's store lock is still held, retrying at {} ms",
+            start.elapsed().as_millis()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 impl Server {
     /// Freezes the server, and waits until the kernel says it stopped:
     /// SIGSTOP takes effect on the child's own schedule, and a cut that
@@ -1296,6 +1359,20 @@ pub(crate) async fn wait_until(what: &str, ready: impl Fn() -> bool) {
         );
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
+}
+
+/// Waits until `ready` holds, for at most 10 s, and says whether it
+/// ever held. For a wait whose miss is not a failure: the caller logs
+/// the skip and moves on, where `wait_until` panics.
+pub(crate) async fn wait_until_or_timeout(_what: &str, ready: impl Fn() -> bool) -> bool {
+    let give_up = Instant::now() + Duration::from_secs(10);
+    while !ready() {
+        if Instant::now() >= give_up {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    true
 }
 
 /// The environment variable `name` as a number, or `default`.

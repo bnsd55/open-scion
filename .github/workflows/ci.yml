@@ -53,6 +53,7 @@ jobs:
       pg: ${{ steps.files.outputs.pg }}
       macos: ${{ steps.files.outputs.macos }}
       workflows: ${{ steps.files.outputs.workflows }}
+      deps: ${{ steps.files.outputs.deps }}
     steps:
       - id: files
         env:
@@ -67,6 +68,7 @@ jobs:
           pg=false
           macos=false
           workflows=false
+          deps=false
           while IFS= read -r line; do
             [ -z "$line" ] && continue
             status=${line%% *}
@@ -121,12 +123,25 @@ jobs:
             case "$file" in
               .github/workflows/*|scripts/release*) workflows=true ;;
             esac
+            # A dependency surface: any manifest, any lockfile (the
+            # root's or a fuzz workspace's), the deny configuration a
+            # lockfile is checked against, and the coverage script
+            # that keeps every lockfile checked. cargo-deny runs for
+            # the pull request that touches one, so an advisory or a
+            # bad license fails before the merge, not on main after it.
+            case "$file" in
+              Cargo.toml|*/Cargo.toml|\
+              Cargo.lock|*/Cargo.lock|\
+              deny.toml|*/deny.toml|\
+              scripts/check-deny-coverage.sh) deps=true ;;
+            esac
           done <<< "$files"
           {
             echo "docs_only=$docs_only"
             echo "pg=$pg"
             echo "macos=$macos"
             echo "workflows=$workflows"
+            echo "deps=$deps"
           } >> "$GITHUB_OUTPUT"
 
   lint:
@@ -207,8 +222,14 @@ jobs:
 
   supply-chain:
     name: cargo-deny
-    # The slow tier: main, the nightly and a dispatch only.
-    if: github.event_name != 'pull_request'
+    needs: tier
+    # The slow tier: main, the nightly and a dispatch only -- plus a
+    # pull request that touches a dependency surface (a manifest, a
+    # lockfile, a deny.toml or the coverage script), so an advisory or
+    # a bad license fails on the pull request instead of on main after
+    # the merge. A draft skips every job, this one included.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.deps == 'true')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -310,7 +331,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["16.15", "17.11", "18.6"]
+        # Every Postgres cell is experimental in v0.1.0. Postgres 17 is
+        # the one major that runs per push (on data-path changes, through
+        # the tier rule above); the 16 and 18 cells are best effort and
+        # run nightly and on a release candidate's dispatch.
+        version: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && fromJSON('["16.15", "17.11", "18.6"]') || fromJSON('["17.11"]') }}
     services:
       postgres:
         image: postgres:${{ matrix.version }}
@@ -466,6 +491,9 @@ jobs:
   # are proven there, and one platform carries that evidence.
   test-arm64:
     name: test (linux arm64)
+    # The arm64 cells are best effort until v0.8: the nightly and a
+    # release candidate's dispatch prove them, a push does not.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 40
     steps:
@@ -491,6 +519,9 @@ jobs:
   # suite running on xfs at all.
   test-xfs:
     name: test (xfs)
+    # The xfs cell is best effort until v0.8: the nightly and a release
+    # candidate's dispatch prove it, a push does not.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
