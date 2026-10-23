@@ -306,6 +306,9 @@ impl PgServer {
     /// the test names the wait that never ended. (A lock of the
     /// schema's own key that the test's harness holds between rounds
     /// is not this server's, and must not hold the wait.)
+    /// Both waits read a count, not a row probe: a concurrent server
+    /// whose name or schema matches the same pattern makes two rows,
+    /// and a one-row probe turns that concurrency into a panic.
     fn kill_and_wait(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait(); // needs &mut: the kill rides it
@@ -313,14 +316,15 @@ impl PgServer {
         let start = Instant::now();
         loop {
             let sessions = client
-                .query_opt(
-                    "SELECT 1 FROM pg_stat_activity \
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity \
                      WHERE (application_name = $1 OR application_name = $2) \
                        AND pid <> pg_backend_pid()",
                     &[&self.name, &self.schema],
                 )
                 .expect("the session query answers")
-                .is_some();
+                .get::<_, i64>(0)
+                > 0;
             if !sessions {
                 return;
             }
@@ -347,12 +351,13 @@ impl Drop for PgServer {
         let start = Instant::now();
         loop {
             let sessions = client
-                .query_opt(
-                    "SELECT 1 FROM pg_stat_activity WHERE application_name = $1",
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1",
                     &[&self.name],
                 )
                 .expect("the session query answers")
-                .is_some();
+                .get::<_, i64>(0)
+                > 0;
             if !sessions {
                 return;
             }
