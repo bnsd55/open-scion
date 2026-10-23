@@ -353,11 +353,10 @@ impl Drop for PgServer {
         let mut client = raw(&pg_url());
         let start = Instant::now();
         loop {
-            let sessions = match client
-                .query_one(
-                    "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1",
-                    &[&self.name],
-                ) {
+            let sessions = match client.query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1",
+                &[&self.name],
+            ) {
                 Ok(row) => row.get::<_, i64>(0) > 0,
                 Err(e) => {
                     eprintln!("crash_pg: the drop's session query failed: {e}");
