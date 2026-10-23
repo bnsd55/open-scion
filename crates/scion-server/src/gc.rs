@@ -346,7 +346,14 @@ fn prune_rows(
                 // chunk's memory is the budget plus one body. A missing
                 // body is skipped, as the walk reads it: `fsck` reports
                 // it.
-                let lengths = c.stored_changeset_body_lengths(&unseen)?;
+                // The lengths, in row chunks of [`DERIVED_BATCH`]: ids
+                // and lengths only, 40 bytes a row, so holding them is
+                // fine; the statement must not grow with the repo (the
+                // C62 sweep class).
+                let mut lengths = Vec::new();
+                for ids in unseen.chunks(crate::meta::DERIVED_BATCH) {
+                    lengths.extend(c.stored_changeset_body_lengths(ids)?);
+                }
                 let mut fresh = BTreeSet::new();
                 for ids in bytes_chunks(&lengths, prune_body_budget()) {
                     #[cfg(any(test, feature = "test-hooks"))]
