@@ -32,7 +32,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 tower = "0.5"
 blake3 = "1.8"
 clap = { version = "4.6", features = ["derive", "env"] }
-gix = "0.89"
+gix = "0.90"
 hashlink = "0.12"
 nfsserve = "0.11"
 prost = "0.14"

@@ -45,7 +45,7 @@ The Postgres 17 evidence rides on one job family:
 | Requirement | What it says | Evidence today | Verdict |
 | --- | --- | --- | --- |
 | (a) the contract test on Postgres 17 | The end-to-end contract flow (import, serve, land, read, export) answers the same on Postgres 17 | `crates/scion-server/tests/contract.rs` branches on the backend (`is_pg`, `contract.rs:277`; the git side gets `SCION_POSTGRES_URL` at `contract.rs:352`) and runs inside `test (postgres 17.11)`'s whole-suite step (`ci.yml:368`) on every qualifying push, `main`, nightly and dispatch. The contract goldens of #571 (`crates/scion-server/tests/archive_golden.rs`, `audit_golden.rs`, the proto wire goldens) ride the same suite | EVIDENCE |
-| (b) the real Postgres fault rows | The fault matrix's Postgres rows are proven by tests that run on Postgres and can fail | See section 2 | EVIDENCE with three WEAK rows (F-race, soak-fault PG arm, drills) |
+| (b) the real Postgres fault rows | The fault matrix's Postgres rows are proven by tests that run on Postgres and can fail | See section 2 | EVIDENCE with three WEAK rows (the racing-puts cut, the dispatch-only soak-fault arm, the drills) |
 | (c) backup and restore on Postgres 17 | A Postgres-backed store backs up and restores whole | `crates/scion-server/tests/backup.rs:42` `a_backup_taken_while_serving_restores_whole` — a live server, a backup taken mid-write (`pg_dump` through `SCION_TEST_PG_CONTAINER`, `backup.rs:403`), the restore into a fresh store, then the equality check. Runs in `test (postgres 17.11)` per push. The operations runbook is `docs/operations.md` section 3 (`pg_dump` the database, restore the data directory, reopen) | EVIDENCE for the test; the runbook has never been walked on a real Postgres 17 install — that is requirement (d)'s trial, not a CI gap |
 | (d) the release-candidate trial on Postgres 17 | One RC serves real work for 30 days per `docs/production-trial.md`, with the trial file named before day 1 | `docs/production-trial.md` is the template only; `docs/release-notes/` holds no trial file; v0.6 has no RC yet. The drill templates (`docs/drills/operator-drill.md`, `release-drill.md`, `vulnerability-drill.md`) name no Postgres arm | MISSING — by schedule, not by neglect: the trial runs when the RC is cut. The card is in section 4 |
 
@@ -77,7 +77,7 @@ the database's own WAL, and each fault row cuts the half it names.
 | EIO / EROFS failing disk | `storage.rs` rows on Postgres in the whole-suite step; the metadata half rides the database's WAL | EVIDENCE |
 | Whole server on a real full disk (tmpfs) | `disk_full.rs` on Postgres in the tmpfs step (blob path and inodes) | EVIDENCE |
 | SIGTERM drain under load | `health.rs` runs on Postgres in the whole-suite step | EVIDENCE |
-| Soak-fault: kill -9 the server under load, on Postgres | `scripts/soak-fault.sh` has a full Postgres arm (`soak-fault.sh:25,89-100` and the `pg_restart` fault at `soak-fault.sh:338-344`) — but no CI workflow sets `SCION_FAULT_PG`, `SCION_PG_URL` or `SCION_FAULT_PG_CMD` (`.github/workflows/soak.yml` sets none of them). The arm exists; nothing arms it | WEAK — the script supports it, CI never runs it. Card 2 |
+| Soak-fault: kill -9 the server under load, on Postgres | The `soak-fault-postgres` job (`.github/workflows/soak.yml`) arms the Postgres arm of `scripts/soak-fault.sh` (`pg_restart`, `soak-fault.sh:338-344`): a dispatch-only Postgres 17 service container pinned tag@sha256, `SCION_PG_URL`, `SCION_FAULT_PG=1`, and a restart command that restarts the container between kills. The summary names the backend, the kills and the Postgres restarts, and the run fails unless every kill restarted Postgres | WEAK — dispatch-only (D10), never per push or nightly. Green: [40017979410](https://github.com/bnsd55/openscion/actions/runs/40017979410) (postgres -> postgres, 3 kills, 3 restarts); red: [40071077720](https://github.com/bnsd55/openscion/actions/runs/40071077720) (the restart command replaced by a stop: "Postgres never came back"). Promotion to EVIDENCE comes with D10's hosting decision |
 | The C60 restart-refusal row (a server restarting right after a crash refuses until Postgres reaps the dead session's lock) | Open in `docs/production-audit.md` section 2; the runbook must say the supervisor retries the open with backoff | open row of the audit, not a CI gap — feeds the trial's runbook walk |
 | Operator / release / vulnerability drills | `docs/drills/*.md` name no Postgres arm | MISSING as drills — covered by (d)'s trial if the trial runs the drills on Postgres 17. Card 4 |
 
@@ -86,7 +86,7 @@ the database's own WAL, and each fault row cuts the half it names.
 | Gap | Smallest closer | Cost |
 | --- | --- | --- |
 | faults.md staleness (two rows name evidence that moved: `crash_pg.rs` and the tmpfs step's real home) | Edit the two rows of `docs/faults.md` to name `crates/scion-server/tests/crash_pg.rs:594,734` and the `test-postgres` tmpfs step (`ci.yml:385`) | Doc-only; minutes; no new CI |
-| The soak-fault Postgres arm never runs | Add `SCION_FAULT_PG: "1"`, a `SCION_PG_URL` for a job-side Postgres container and `SCION_FAULT_PG_CMD: docker restart …` to a dispatch-only soak-fault job in `.github/workflows/soak.yml` (dispatch-only keeps D10's hosting question open) | One new job; ~10 minutes per dispatch run; the script and its checks already exist |
+| ~~The soak-fault Postgres arm never runs~~ | Closed by #585: the dispatch-only `soak-fault-postgres` job sets the three variables and pins the image; the script fails a run whose kills did not restart Postgres | Done; ~10 minutes per dispatch run |
 | The racing-puts power row skips on Postgres | Either a Postgres-shaped park hook behind `test-hooks` (an advisory-lock or statement-delay park in the blob write path) plus the row in the power job's Postgres step — or, if the park is judged too invasive, an explicit exclusion row in `docs/support.md` saying the racing-puts cut row is SQLite-proven only | Hook + row: a day of work; exclusion row: minutes. The power job's Postgres step already runs, so the run cost is zero either way |
 | The drills have no Postgres arm | The trial (below) runs the three drill templates against the Postgres 17 RC install and records the outputs in the trial file | Part of (d); no CI change |
 | The RC trial on Postgres 17 (d) | Cut the RC, name `docs/release-notes/production-trial-<version>-pg17.md` before day 1 per the template, run 30 days with the drill walk-throughs | 30 days wall clock plus one host; not CI-automatable; starts when v0.6's RC is cut |
@@ -96,9 +96,9 @@ the database's own WAL, and each fault row cuts the half it names.
 1. **faults.md row repair** (doc-only): the SIGKILL rows name
    `crash_pg.rs`; the 53100 row names the `test-postgres` tmpfs step,
    not the retired `test (postgres disk full)` job.
-2. **Arm the Postgres soak-fault arm** in a dispatch-only soak job:
-   the script is ready (`soak-fault.sh:338-344`), the workflow never
-   sets its three variables.
+2. ~~**Arm the Postgres soak-fault arm**~~ (closed by #585): the
+   dispatch-only `soak-fault-postgres` job sets the three variables;
+   the summary row and the restarts check prove the fault fired.
 3. **The racing-puts power row on Postgres**: a PG-shaped park hook
    and the row in the existing Postgres power step, or the explicit
    `support.md` exclusion. Decide before the RC, so (b) is closed by
