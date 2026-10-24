@@ -213,6 +213,13 @@ fn an_empty_file_still_commits() {
     );
 }
 
+// The ceiling pair: a 24 MiB file must stream in under a 32 MiB
+// peak. The lever test below proves the ceiling still bites: raise
+// CEILING_KB or shrink FILE_BYTES and it says the ceiling no longer
+// catches a whole-file read.
+const FILE_BYTES: usize = 24 * 1024 * 1024;
+const CEILING_KB: u64 = 32 * 1024;
+
 /// The ceiling: a commit of a 24 MiB file runs as its own process, whose
 /// peak RSS the test measures. Streaming holds about one chunk, so the
 /// ceiling sits a few MiB over the process's floor; the old whole-file
@@ -221,8 +228,6 @@ fn an_empty_file_still_commits() {
 /// would fit under it.
 #[test]
 fn a_commit_of_a_big_file_stays_under_its_rss_ceiling() {
-    const FILE_BYTES: usize = 24 * 1024 * 1024;
-    const CEILING_KB: u64 = 32 * 1024;
     let fx = Fixture::start();
     let file = fx.put_file("huge.bin", FILE_BYTES);
     let out = commit_measured(&fx, "huge.bin", &file, false);
@@ -239,6 +244,24 @@ fn a_commit_of_a_big_file_stays_under_its_rss_ceiling() {
         peak_kb <= CEILING_KB,
         "the commit's peak RSS ({peak_kb} kB) passed the ceiling ({CEILING_KB} kB); \
          a whole-file read is back"
+    );
+}
+
+/// The ceiling test's lever, run for good: the same file committed with
+/// the whole-file read forced on must blow the ceiling. If it does not,
+/// the ceiling no longer catches a whole-file read and the RSS guard
+/// proves nothing.
+#[test]
+fn the_ceiling_still_catches_a_whole_file_read() {
+    let fx = Fixture::start();
+    let file = fx.put_file("huge.bin", FILE_BYTES);
+    let out = commit_measured(&fx, "huge.bin", &file, true);
+    let peak_kb = out.peak_kb;
+    println!("the levered commit's peak RSS was {peak_kb} kB; the ceiling is {CEILING_KB} kB");
+    assert!(
+        peak_kb > CEILING_KB,
+        "the levered commit's peak RSS ({peak_kb} kB) stayed under the ceiling \
+         ({CEILING_KB} kB): the ceiling no longer catches a whole-file read"
     );
 }
 

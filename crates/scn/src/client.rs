@@ -358,6 +358,13 @@ impl Ctx {
                     ));
                 }
                 let after = f.metadata()?;
+                // SHORTCUT: the rewrite check compares mtime, so a
+                // same-size rewrite inside the filesystem's timestamp
+                // granularity (FAT/exFAT 2 s, some NFS/FUSE mounts
+                // 1 s) passes and a torn mix commits with no error;
+                // ext4 and APFS are nanosecond, so a production cell
+                // cannot hit it. Upgrade path: compare ctime too, or
+                // re-read and hash the file.
                 if after.len() != len || after.modified()? != modified {
                     return Err(changed(
                         &path,
