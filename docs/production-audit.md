@@ -23,7 +23,7 @@ document landed on.
 | Finding | Evidence | Status |
 | --- | --- | --- |
 | `scn mount --unstable-writable`: a planted parent symlink can redirect an overlay write outside the mount (final-name-only check). Ben's D24: the writable mount leaves the v1 release binary — the write path becomes a build feature, off in release | `crates/scn/src/vfs.rs:1469`, `docs/cli.md:57`, `changes/313.fixed.md` | open, closed by C54 (the write path out of the release builds) |
-| Env aliases `SCION_DATA`, `SCION_TOKEN`, `SCION_POSTGRES_URL`, `SCION_POSTGRES_URL_FILE` exist beside their flags | `crates/scion-server/src/main.rs:29,33,43` | fixed by design (each alias is the documented spelling of a flag in `docs/cli.md`; the flag list is the release surface, and the URL env exists so secrets stay off argv) |
+| Env aliases `SCION_DATA`, `SCION_TOKEN`, `SCION_POSTGRES_URL`, `SCION_POSTGRES_URL_FILE` exist beside their flags | `crates/scion-server/src/main.rs:30,36-44,1290` | fixed by design (each alias is the documented spelling of a flag in `docs/cli.md`; the flag list is the release surface, and the URL env exists so secrets stay off argv) |
 | Test hooks in release binaries: the store fault hooks and the derive test pool build only with `--features test-hooks` | `crates/scion-server/Cargo.toml:61`, `crates/scion-server/src/store.rs:920` | fixed by design (the feature is off in every release build; `release.yml` builds plain `--release`) |
 
 ## 2. Durability seams
@@ -42,8 +42,8 @@ document landed on.
 | Finding | Evidence | Status |
 | --- | --- | --- |
 | Protocol reads are length-capped before `read_to_end` | `crates/scion-proto/src/runtime/auth/mod.rs:352`, cap `MAX_CHECKED_FILE = 1 MiB` at `:278` | bounded — ceiling: 1 MiB per checked read, `cap + 1` then refused; `docs/protocol-v1.md` states the message size limits |
-| One unary reply can aggregate a whole directory or changeset past the per-object memory budget (`whole_share` charged by encoded size, the aggregate uncapped) | `crates/scion-server/src/service.rs:485` (`whole_share_of`), `:1822` (the changeset's length-only query), `:1986` (`tree_size`) | fixed (#586): the share is taken from a length-only query before the object is built, an object over `MAX_OBJECT_BYTES` is refused before any byte is read, and the share is held for the whole reply (`stream_whole_holding`); the guard is `tests/reply_budget_h2.rs` (`a_client_that_resets_its_unread_replies_frees_the_budget`, which asserts the budget binds at `bodies.len() < 40` and the served reply is whole) |
-| Slow clients can pin large unary replies outside the memory accounting | `crates/scion-server/src/reply.rs` (`REPLY_MEMORY_BUDGET`), `crates/scion-server/src/metrics.rs` (`CountingBody`) | fixed (#586): the reply-memory layer counts every in-flight reply's bytes and refuses new unary replies past the 128 MiB budget; a client that resets its unread replies frees the budget (the guard is the same `tests/reply_budget_h2.rs` test) |
+| One unary reply can aggregate a whole directory or changeset past the per-object memory budget (`whole_share` charged by encoded size, the aggregate uncapped) | `crates/scion-server/src/service.rs:485` (`whole_share_of`), `:1825` (the changeset's length-only query), `:1986` (`tree_size`) | fixed (#586): the share is taken from a length-only query before the object is built, an object over `MAX_OBJECT_BYTES` is refused before any byte is read, and the share is held for the whole reply (`stream_whole_holding`); the guard is `tests/reply_budget_h2.rs` (`a_client_that_resets_its_unread_replies_frees_the_budget`, which asserts the budget binds at `bodies.len() < 40` and the served reply is whole) |
+| Slow clients can pin large unary replies outside the memory accounting | `crates/scion-server/src/reply.rs:36` (`REPLY_MEMORY_BUDGET = 128 << 20`), `crates/scion-proto/src/runtime/metrics.rs:896` (`CountingBody`) | fixed (#586): the reply-memory layer counts every in-flight reply's bytes and refuses new unary replies past the 128 MiB budget; a client that resets its unread replies frees the budget (the guard is the same `tests/reply_budget_h2.rs` test) |
 | `gc` prune reads and deletes in batches of 1,000 rows | `crates/scion-server/src/gc.rs` (`prune_rows`) | fixed (#529 batched the reads and the deletes; the guard is `tests/gc_prune_batch.rs`) |
 | `scn commit` reads a regular file whole into RAM: the size limit is "whatever fits" | `crates/scn/src/cmd/commit.rs` | fixed (#582 streams from the file in 1 MiB chunks; the ceiling is the RSS guard, `crates/scn/tests/commit_stream.rs`, 24 MiB file under a 32 MiB ceiling) |
 | `scn` JSON output silently replaces non-UTF-8 bytes | `crates/scn/src/client.rs:328` (`lossy`), `:336` (`put_json_bytes`) | fixed (#576): the lossy text stays, and every non-UTF-8 name or message carries the exact bytes in a sibling `<field>_b64` (standard base64) so scripts can round-trip them; the guard is `crates/scn/tests/json_raw_bytes.rs` (`assert_b64` and the seed suites) |
@@ -53,8 +53,8 @@ document landed on.
 
 | Finding | Evidence | Status |
 | --- | --- | --- |
-| The Postgres writer pings the database with an autocommit `SELECT 1` while holding the writer mutex | `crates/scion-server/src/pg.rs:905` | bounded — ceiling: 1 statement per writer-idle probe (not per call); the probe's role is stated in `operations.md`'s connection-cap paragraph (the server holds 9 connections) |
-| The sweep below ran over both backends. No production site pays a statement per repository item over the wire: Postgres chunks every multi-row write (1,000 rows per `unnest` insert) or answers one `ANY($1)` statement per list, every paged read is a keyset page with a matching `ORDER BY`, and SQLite's per-item loops are local prepared statements on its one connection (no round trips), which the code names as its batch at `db.rs:276,876,1181,1372` | `db.rs:228,278,875,1193,1346,1384,1518`; `pg.rs:1330,2401,2573,2634,2979,3313,3599,3710-3910`; `fsck.rs:240,300`; `land.rs:1041,1170`; `import.rs:236` | fixed by design (chunked or local; no REPO-SIZED site) |
+| The Postgres writer pings the database with an autocommit `SELECT 1` while holding the writer mutex | `crates/scion-server/src/pg.rs:905` | bounded — ceiling: 1 statement per writer-idle probe (not per call); the probe's role is stated in `operations.md`'s connection-cap paragraph (the server holds 9 connections). Untested: the probe is a timer with no seam (the 60 s interval is a literal in the spawned thread), so no test pins its cadence |
+| The sweep below ran over both backends. No production site pays a statement per repository item over the wire: Postgres chunks every multi-row write (1,000 rows per `unnest` insert) or answers one `ANY($1)` statement per list, every paged read is a keyset page with a matching `ORDER BY`, and SQLite's per-item loops are local prepared statements on its one connection (no round trips), which the code names as its batch at `db.rs:276,876,1181,1372` | `db.rs:228,278,875,1193,1346,1384,1518`; `pg.rs:1330,2401,2573,2634,2979,3313,3599,3710-3910`; `fsck.rs:240,300`; `land.rs:1170`; `import.rs:236` | fixed by design (chunked or local; no REPO-SIZED site) |
 
 ### The sweep, per site
 
@@ -66,7 +66,7 @@ document landed on.
 | `db.rs:1193` `put_git_imports`: per-pair insert | the pairs of one import batch | 1 local INSERT per pair | BATCHED — local; Postgres inserts one `unnest` per batch (`pg.rs:3599`) |
 | `db.rs:1346` `delete_repo_blobs`: per-blob delete | the blobs gc removes | 1 local DELETE per blob | BATCHED — local; Postgres answers one `ANY($2)` statement (`pg.rs:3809`) |
 | `db.rs:1384` `changeset_bodies_after`/`tree_bodies_after`, `derived_rows_after`; `pg.rs:3710-3910` the same readers | the whole table | 1 statement per ≤ 1,000-row keyset page | BATCHED — keyset pagination, each page ordered by its key |
-| `db.rs:1518` `lands_with_missing_changesets` | two fixed columns | 2 statements | BOUNDED (2) |
+| `db.rs:1536` `lands_with_missing_changesets` | two fixed columns | 2 statements | BOUNDED (2) |
 | `fsck.rs:240,300` the check page loops | every changeset and tree | 1 statement per page | BATCHED |
 | `land.rs:1041,1170` the path index walks (`first_parent_page`) | the repo's history length | 1 statement per 1,000-change page | BATCHED — the page is one recursive CTE with `ORDER BY walk.depth` |
 | `pg.rs:1330,2401` the change flushes (`flush_history_rows`, `flush_changeset_rows`) | the transaction's pending rows | 1 `unnest` insert per 1,000 rows | BATCHED |
@@ -173,7 +173,7 @@ worker-spawn fix with the error path (EAGAIN cannot be forced
 in-process; stated in the PR).
 
 | `todo!`/`unimplemented!` in production code: none | grep across the five crates | fixed (none exist) |
-| Warn-and-continue: the import records and counts per-commit failures against the ledger; the two `eprintln!` skip lines are inside test-only helpers | `crates/scion-server/src/pg.rs:4437`, `gc.rs:1017` (both test helpers) | fixed by design (no production warn-and-continue on a correctness boundary) |
+| Warn-and-continue: the import records and counts per-commit failures against the ledger; the two `eprintln!` skip lines are inside test-only helpers | `crates/scion-server/src/pg.rs:4459`, `gc.rs:591,1154` (both test helpers) | fixed by design (no production warn-and-continue on a correctness boundary) |
 
 ## 6. Defaults
 
@@ -182,7 +182,7 @@ in-process; stated in the PR).
 | The default data directory is `scion-data` relative to the server's working directory | `crates/scion-server/src/main.rs:29` | fixed (D25): a missing data directory is refused, not created — every subcommand except restore answers "<path> does not exist; create it or pass --data" (`main.rs`, `refuse_missing_data_dir`); fsck's refusal exits 2, its "could not run" code; `tests/refuse_data_dir.rs` holds every subcommand to the refusal and asserts nothing is created |
 | Secrets on argv: `--postgres-url` is deprecated and warns; `--postgres-url-file` and `SCION_POSTGRES_URL` are the supported forms | `crates/scion-server/src/main.rs:33-43` | fixed (the warning ships; the removal is on the deprecation clock) |
 | Ticket and seed files are 0600; the access file refuses group/other writable and symlinks | `crates/scion-server/src/main.rs:1333,1433,1493` | bounded — ceiling: 0600 on every secret file, the access file refuses go-w and symlinks at the open; `operations.md` "The open checks" states the refusal |
-| Listeners default to loopback | `crates/scion-server/src/main.rs:59` (`default_value = "127.0.0.1:7878"`) | bounded — ceiling: the default bind is 127.0.0.1:7878; `docs/operations.md`'s serve examples restate it |
+| Listeners default to loopback | `crates/scion-server/src/main.rs:60` (`default_value = "127.0.0.1:7878"`) | bounded — ceiling: the default bind is 127.0.0.1:7878; `docs/operations.md`'s serve examples restate it |
 | Production state in temp dirs: the server never writes store state outside `--data`; every temp-dir user is a harness script | `crates/scion-server/src/main.rs:29` (the only store path) | fixed by design (the data dir is the only durable state; `TMPDIR` appears in no serve path) |
 
 ## 7. Compatibility
@@ -222,9 +222,9 @@ section; its fixes landed as #561. Highlights, with the C50 verdicts:
 | --- | --- | --- |
 | The soaks and the smoke never named the store they served, and soak-fault never counted its kills | `scripts/soak-fault.sh`, `scripts/soak.sh`, `scripts/release-smoke.sh` | fixed (#561: the backend row, the kills count, the no-sample segment rule) |
 | The wall-clock budget in the derived flight tests could lose to a thread start | `crates/scion-server/src/derived.rs` | fixed (#566: the tests expire the deadline on the test's word, after the state proves the order) |
-| The batch equality guards run both sides through the same flush, so a shared flush bug passes row-by-row equality | `tests/changeset_batch_eq.rs` | bounded — ceiling: 0 shared-flush coverage in the eq witness; the catching suite for quiet wrong content is the git-referenced `tests/history.rs` (NodeId::of(body) == id); the blind spot is recorded in the C50 notes |
-| Main-only jobs without dispatch proof: every harness named in the C50 table now carries a branch dispatch run id | `.github/workflows/soak.yml`, `ci.yml`, `version-matrix.yml` | fixed (dispatches 39891410810, 39923747077, 39926987173, 39949854816, 39923804727) |
-| Env-required suites that skip silently | `tests/crash_pg.rs:586`, `power.rs:80`, `dm_log_writes.rs:33`, `disk_full.rs:32` | bounded — ceiling: 0 silent skips; each prints its skip line, and the CI job that owns it sets the REQUIRE variable so a missing build fails the job |
+| The batch equality guards run both sides through the same flush, so a shared flush bug passes row-by-row equality | `tests/changeset_batch_eq.rs` | bounded — ceiling: 0 shared-flush coverage in the eq witness; the catching suites for quiet wrong content are `tests/history.rs` (the path log answers the git-referenced IDs) and `tests/audit_evidence.rs` (`a_tampered_history_node_reads_as_corrupt`, `fsck_reports_a_tampered_history_node`: a swapped history-node body answers Corrupt "does not match its ID" and fsck reports history-node-bad, both backends); the blind spot is recorded in the C50 notes |
+| Main-only jobs without dispatch proof: every harness named in the C50 table now carries a branch dispatch run id | `.github/workflows/soak.yml`, `ci.yml`, `version-matrix.yml` | fixed (dispatches 39891410810, 39926987173, 39949854816, 39923804727) |
+| Env-required suites that skip silently | `tests/crash_pg.rs:596`, `power.rs:80`, `dm_log_writes.rs:33`, `disk_full.rs:32` | bounded — ceiling: 0 silent skips; each prints its skip line, and the CI job that owns it sets the REQUIRE variable so a missing build fails the job |
 | A randomized land model as an independent oracle | the land model script (#492) | fixed |
 
 ## 9. Supply chain

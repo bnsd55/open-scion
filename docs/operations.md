@@ -304,7 +304,10 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
   server's own 9, the operator's tooling beside it (`pg_dump`, `psql`,
   a metrics scraper), and a margin. A database at its connection cap
   refuses the server's next connection, and every call that needs one
-  answers `unavailable` until one is free.
+  answers `unavailable` until one is free. While the writer is idle, its
+  connection pings the database with one autocommit `SELECT 1` a minute:
+  a lost connection or a lost fence surfaces on the probe instead of
+  hanging the next write.
 - The one-server rule and the write queue are Postgres advisory locks,
   visible as `pg_locks` rows of kind `advisory`: the one-server lock is
   a key of the schema `current_schema()` names, the migration lock is a
