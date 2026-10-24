@@ -45,7 +45,7 @@ document landed on.
 | One unary reply can aggregate a whole directory or changeset past the per-object memory budget (`whole_share` charges by encoded size, the aggregate is uncapped) | `crates/scion-server/src/service.rs:485,935` | open |
 | Slow clients can pin large unary replies outside the memory accounting | `crates/scion-server/src/service.rs` (`into_server`) | open |
 | `gc` prune reads and deletes in batches of 1,000 rows | `crates/scion-server/src/gc.rs` (`prune_rows`) | fixed (#529 batched the reads and the deletes; the guard is `tests/gc_prune_batch.rs`) |
-| `scn commit` reads a regular file whole into RAM: the size limit is "whatever fits" | `crates/scn/src/cmd/commit.rs` | open |
+| `scn commit` reads a regular file whole into RAM: the size limit is "whatever fits" | `crates/scn/src/cmd/commit.rs` | fixed (#582 streams from the file in 1 MiB chunks; the ceiling is the RSS guard, `crates/scn/tests/commit_stream.rs`, 24 MiB file under a 32 MiB ceiling) |
 | `scn` JSON output silently replaces non-UTF-8 bytes | `crates/scn/src/client.rs:326` | open |
 | Import batches are time-based per transaction and count-based for blobs | `crates/scion-server/src/import.rs:52` (`TX_BUDGET = 1 s`), `store.rs` (`BlobBatch`) | bounded — ceiling: 1 s of work or one commit per import transaction; `docs/benchmarks.md` records the measured commit size and rate the batches were tuned at |
 
