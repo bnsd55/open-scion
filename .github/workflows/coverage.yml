@@ -498,7 +498,10 @@ jobs:
           # build.rs files; the exclusions file cannot hold these
           # patterns (its guard reads tracked paths only), so they
           # live here, beside the exclusions file's regex.
-          ignore_regex="${COVERAGE_IGNORE}|/\\.cargo/registry/|/rustc/"
+          # An empty alternative in a regex matches every path, so
+          # the exclusions join only when they exist.
+          ignore_regex='/\\.cargo/registry/|/rustc/'
+          [ -n "$COVERAGE_IGNORE" ] && ignore_regex="$COVERAGE_IGNORE|$ignore_regex"
           # The machine-checked numbers come from the JSON export: its
           # fields are named and stable, unlike the text table's column
           # positions, which move with the branch columns' presence.
@@ -508,6 +511,15 @@ jobs:
             --ignore-filename-regex "$ignore_regex" \
             > target/coverage/report.json; then
             echo "the export failed"
+            exit 2
+          fi
+          # An over-wide filter would print a number over almost
+          # nothing; the workspace has hundreds of mapped files, so a
+          # report with fewer than 50 is a filter that ate the code.
+          mapped_files=$(jq -r '.data[0].files | length' target/coverage/report.json)
+          echo "mapped source files: ${mapped_files:-none} (floor 50)"
+          if [ -z "$mapped_files" ] || [ "$mapped_files" -lt 50 ]; then
+            echo "the report maps too few files; a filter ate the code"
             exit 2
           fi
           total_lines=$(jq -r '.data[0].totals.lines.percent // "none"' target/coverage/report.json)
