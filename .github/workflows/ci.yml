@@ -21,7 +21,7 @@ concurrency:
   # docs, "Control the concurrency of workflows and jobs"): one group
   # over the nightly and the pushes to main let any push replace a
   # nightly that is waiting for the runner, and a busy day could keep
-  # the nightly waiting forever. The nightly has never run is not a
+  # the nightly waiting forever. A nightly that never ran is not a
   # green night.
   group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
   # A pull_request run may cancel the run before it (same branch,
