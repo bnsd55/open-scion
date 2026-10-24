@@ -233,6 +233,7 @@ fn a_commit_of_a_big_file_stays_under_its_rss_ceiling() {
     );
     let peak_kb = out.peak_kb;
     println!("the scn commit's peak RSS was {peak_kb} kB; the ceiling is {CEILING_KB} kB");
+    assert!(peak_kb > 0, "the sampler never saw the commit");
     assert!(
         peak_kb <= CEILING_KB,
         "the commit's peak RSS ({peak_kb} kB) passed the ceiling ({CEILING_KB} kB); \
@@ -301,10 +302,11 @@ fn commit_measured(fx: &Fixture, name: &str, file: &std::path::Path) -> Measured
         let pid = child.id();
         let peak = std::thread::spawn(move || {
             // VmHWM is the process's high-water mark in kB. The sampler
-            // reads it until the process is gone, and keeps the last
-            // value it saw: the mark never falls.
+            // reads it every 5 ms until the process is gone, and keeps
+            // the last value it saw: the mark never falls.
             let status = format!("/proc/{pid}/status");
             let mut last = 0_u64;
+            let mut seen = 0_u64;
             while let Ok(text) = fs::read_to_string(&status) {
                 for line in text.lines() {
                     if let Some(kb) = line.strip_prefix("VmHWM:")
@@ -313,8 +315,10 @@ fn commit_measured(fx: &Fixture, name: &str, file: &std::path::Path) -> Measured
                         last = last.max(kb);
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                seen += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
+            assert!(seen > 0, "the sampler never saw the commit's VmHWM");
             last
         });
         let out = child.wait_with_output().unwrap();

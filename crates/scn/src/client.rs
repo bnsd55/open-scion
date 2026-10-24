@@ -315,19 +315,23 @@ impl Ctx {
             // the guard can prove it is not vacuous.
             return self.put_blob(fs::read(file)?).await;
         }
-        let before = fs::metadata(file)?;
-        let len = before.len();
-        let modified = before.modified()?;
         let path = file.to_path_buf();
         // Two chunks in flight, so the reader never runs far past the
         // network drain.
         let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
         // The read's verdict, after its last chunk or its refusal.
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<std::io::Result<()>>();
         std::thread::spawn(move || {
-            take_put_pause();
             let read = (|| -> std::io::Result<()> {
+                // The size and mtime come from the handle, so the
+                // numbers belong to the file that was read.
                 let mut f = fs::File::open(&path)?;
+                let before = f.metadata()?;
+                let len = before.len();
+                let modified = before.modified()?;
+                // The torn-read tests truncate the file here, between
+                // the metadata read and the first chunk.
+                take_put_pause();
                 let mut left = len;
                 loop {
                     // The last chunk is the short one; CHUNK_BYTES fits
@@ -352,7 +356,7 @@ impl Ctx {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, "grew"),
                     ));
                 }
-                let after = fs::metadata(&path)?;
+                let after = f.metadata()?;
                 if after.len() != len || after.modified()? != modified {
                     return Err(changed(
                         &path,
@@ -366,16 +370,16 @@ impl Ctx {
             let _ = done_tx.send(read);
         });
         let mut first = Some(self.repo.clone());
-        let requests = ReceiverStream::new(rx).filter_map(move |chunk| {
-            Some(PutBlobRequest {
-                repo: first.take().unwrap_or_default(),
-                data: chunk,
-            })
+        let requests = ReceiverStream::new(rx).map(move |chunk| PutBlobRequest {
+            repo: first.take().unwrap_or_default(),
+            data: chunk,
         });
         // The reply decides with the read: a refusal of the read names
         // the file, whatever the server answered about the parts.
         let reply = self.client.put_blob(requests).await;
-        if let Err(e) = done_rx.recv().unwrap_or(Ok(())) {
+        // The reader always answers, even when the call died first; if
+        // it died itself, the call's own error tells the story.
+        if let Ok(Err(e)) = done_rx.await {
             return Err(e.into());
         }
         let reply = reply?.into_inner();
