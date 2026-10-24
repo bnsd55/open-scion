@@ -1,0 +1,71 @@
+name: soak-72h
+# The 72-hour soak (issue #239's run-length decision), for the day a VM
+# is rented for it. Dispatch-only: it never runs on a schedule, a pull
+# request, or a push. It needs one self-hosted runner that carries the
+# scion-soak label and no other job does; scripts/soak-runner-setup.md
+# registers it and deletes the VM after.
+on:
+  workflow_dispatch:
+
+# Every third-party action is pinned to the commit SHA its version tag
+# named, as soak.yml does. The token is good for 24 hours, so the long
+# job does nothing with it after its checkout: the samples stream to
+# files on the runner while it runs, and a separate short job - fresh
+# token - uploads them. The fault job of #371 is a nightly of its own
+# and is not part of this run: one uninterrupted 72-hour soak, nothing
+# else.
+permissions:
+  contents: read
+
+jobs:
+  soak-72h:
+    name: soak-72h
+    runs-on: [self-hosted, scion-soak]
+    # 4400 minutes = 73 h 20 min: the 72 h of load, and the build, the
+    # checks and the teardown share the rest.
+    timeout-minutes: 4400
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - name: run the 72-hour soak
+        env:
+          # 72 hours = 4320 minutes. The warm-up window and the ceilings
+          # are soak.yml's; after 30 min of warm-up the bound watches
+          # 71.5 hours of RSS.
+          RUN_MINUTES: "4320"
+          SOAK_WARM_SECONDS: "1800"
+          SOAK_RSS_PCT: "150"
+          SOAK_FD_GROWTH: "100"
+          SOAK_P99_FACTOR: "2"
+          # The samples and the logs stream into this directory while the
+          # run goes; the upload job reads it from the same runner disk.
+          # The runner is registered for this one rental and removed
+          # after (scripts/soak-runner-setup.md), so a fixed path is
+          # safe. NOT --ephemeral: the workflow's two jobs both need the
+          # runner, and an ephemeral one de-registers after the first.
+          RUNNER_TEMP: /home/runner/soak-72h
+        run: |
+          # The soak's own cap: 260000 s ≈ 72.2 h covers the 4320 min of
+          # load; the build and the teardown live in the job's remaining
+          # margin. GITHUB_TOKEN is 24 h old and dead by the end, so this
+          # step calls nothing that needs it.
+          timeout 260000 scripts/soak.sh
+  upload:
+    name: upload the samples and the logs
+    runs-on: [self-hosted, scion-soak]
+    needs: soak-72h
+    if: always()
+    timeout-minutes: 30
+    steps:
+      # A fresh job, a fresh token: upload-artifact works here even
+      # though it would be dead in the 72-hour job that produced the
+      # files. The directory is on this runner's disk; with one
+      # scion-soak runner, `needs` puts this job on the same machine.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: soak-72h-artifacts
+          path: /home/runner/soak-72h/soak-artifacts/
+          if-no-files-found: error

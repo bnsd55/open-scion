@@ -24,8 +24,21 @@
 # Nothing else changes.
 set -euo pipefail
 
+usage() {
+    echo "usage: scripts/merge-changelog.sh --check | <release>   e.g. v0.1.0" >&2
+}
+
+# One argument: --check, or a release name the changelog can hold
+# (semver with an optional pre-release). Anything else - a flag nobody
+# reads ("--dry-run" merged 142 fragments under "## [--dry-run]"), a
+# word, an empty string - must never become the release's heading.
 if [ "$#" -ne 1 ]; then
-    echo "usage: scripts/merge-changelog.sh [--check] <release>   e.g. v0.1.0" >&2
+    usage
+    exit 2
+fi
+if [ "$1" != "--check" ] &&
+    ! [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+    usage
     exit 2
 fi
 

@@ -171,8 +171,9 @@ Freeze the surfaces users need, not the implementation.
 - Tickets and snapshots follow the N and N-1 mixed-version window.
 - The version matrix runs the supported client, server, cache, daemon
   and store pairs.
-- A store written by every tagged release opens and upgrades. Rollback
-  restores the pre-upgrade backup.
+- A store written by the newest 8 tagged releases opens and upgrades
+  (an older tag is named in a warning, not built). Rollback restores the
+  pre-upgrade backup.
 - A full repository exports to a versioned logical archive. CI verifies
   and restores the archive.
 - Postgres 17 is promoted to production (D23) when all of it holds:
