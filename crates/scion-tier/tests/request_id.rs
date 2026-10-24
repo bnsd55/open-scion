@@ -226,12 +226,17 @@ async fn chain(fake: &Fake) -> (ObjectsClient<tonic::transport::Channel>, TempDi
 
     let daemon_dir = TempDir::new().unwrap();
     fs::set_permissions(daemon_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    // The daemon refuses a data directory that does not exist; this
+    // test's store is a real one, so it exists (and is private) first.
+    let daemon_data = daemon_dir.path().join("data");
+    std::fs::create_dir_all(&daemon_data).unwrap();
+    std::fs::set_permissions(&daemon_data, std::fs::Permissions::from_mode(0o700)).unwrap();
     let daemon_log = logs.path().join("daemon.log");
     let daemon_bin = spawn(
         env!("CARGO_BIN_EXE_scion-daemon"),
         &[
             "--data",
-            &daemon_dir.path().join("data").display().to_string(),
+            &daemon_data.display().to_string(),
             "--upstream",
             &format!("http://{cache_addr}"),
             "--token",

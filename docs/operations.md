@@ -190,9 +190,14 @@ cache with `scn checkout --server http://SERVER:7878 --objects http://CACHE:7879
 ### Server, cache, and a daemon per user
 
 ```sh
+mkdir -p ~/.scion-daemon
 SCION_TOKEN=<USER_TOKEN> SCION_UPSTREAM_TOKEN=<CACHE_TOKEN> \
   ./scion-daemon --data ~/.scion-daemon --upstream http://CACHE:7879
 ```
+
+The daemon refuses a data directory that does not exist, like the
+server does: a typo must not make a new empty store and serve from
+it.
 
 The daemon's data directory must be private to its user (mode 0700, not a
 shared path such as `/tmp`); it serves on a 0600 Unix socket in it

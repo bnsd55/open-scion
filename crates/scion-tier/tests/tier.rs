@@ -1630,6 +1630,11 @@ async fn a_daemon_killed_mid_fill_serves_no_torn_object_after_its_restart() {
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("daemon.sock");
     let data = dir.path().join("data");
+    // The daemon refuses a data directory that does not exist, and one
+    // that is open to other users; this test's store is a real one, so
+    // it exists and is private before the start.
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     let (mut child, url) = start_daemon(&data, &socket, &upstream, limit).await;
     let fill_task = spawn_get(&url, &fake, &fill).await;

@@ -3,6 +3,7 @@
 //! credential: every user of the daemon may read its repo whole.
 
 use std::io::BufRead as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::Command;
 
@@ -22,6 +23,17 @@ fn snapshot_of(dir: &Path) -> std::path::PathBuf {
     let path = dir.join("r.scnsnap");
     snapshot::write(&path, "r", &objects).unwrap();
     path
+}
+
+/// A data directory that exists and is private, as an operator makes
+/// before the daemon starts: the daemon refuses a missing one (that is
+/// `refuse_data_dir`'s business), and the seed tests exercise the seed,
+/// not the refusal.
+fn real_data(dir: &Path) -> std::path::PathBuf {
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    data
 }
 
 /// Runs `scion-daemon` with `--seed`, with `--seed-full-repo` when asked.
@@ -50,13 +62,19 @@ fn daemon(data: &Path, snapshot: &Path, flag: bool) -> std::process::Output {
 fn seeding_without_the_flag_is_refused() {
     let dir = TempDir::new().unwrap();
     let snapshot = snapshot_of(dir.path());
-    let out = daemon(&dir.path().join("data"), &snapshot, false);
+    let out = daemon(&real_data(dir.path()), &snapshot, false);
     assert!(!out.status.success(), "{out:?}");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("--seed-full-repo"), "{err}");
     assert!(err.contains("full-repo credential"), "{err}");
-    // Refused before anything was stored: no data directory was created.
-    assert!(!dir.path().join("data").exists(), "{err}");
+    // Refused before anything was stored: the directory holds no store.
+    assert!(
+        std::fs::read_dir(dir.path().join("data"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "{err}"
+    );
 }
 
 /// `--seed-full-repo` alone seeds nothing either: it says something about
@@ -94,9 +112,10 @@ fn the_flag_without_a_seed_is_refused() {
 fn the_flag_lets_a_seed_through() {
     let dir = TempDir::new().unwrap();
     let snapshot = snapshot_of(dir.path());
+    let data = real_data(dir.path());
     let mut child = Command::new(env!("CARGO_BIN_EXE_scion-daemon"))
         .arg("--data")
-        .arg(dir.path().join("data"))
+        .arg(&data)
         .arg("--upstream")
         .arg("http://127.0.0.1:1")
         .arg("--token")

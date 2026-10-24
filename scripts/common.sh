@@ -427,6 +427,7 @@ start_scion() {
     --upstream "$SERVER" \
     --ticket-public-key "$(cat "$WORK/ticket.pub")" \
     --metrics-listen "127.0.0.1:$CACHE_METRICS_PORT"
+  mkdir -p "$WORK/daemon"
   start daemon serving "$BIN/scion-daemon" --data "$WORK/daemon" --socket "$SOCKET" \
     --upstream "http://127.0.0.1:$CACHE_PORT"
 }
