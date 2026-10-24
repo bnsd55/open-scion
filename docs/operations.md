@@ -65,11 +65,15 @@ Proof: crates/scion-server/tests/first_boot.rs::a_first_boot_serves_probes_and_r
 ### One server
 
 ```sh
+install -d -m 0700 /srv/scion
 SCION_TOKEN=<TOKEN> ./scion-server --data /srv/scion serve
 ```
 
 That is the whole deployment: clients talk to `127.0.0.1:7878` (or `--listen`
-HOST:PORT). The data directory holds every blob and every row, so keep it
+HOST:PORT). `install -d -m 0700` makes the directory the mode it says, whatever
+the umask is - under umask 002 (Ubuntu's user private groups) a plain `mkdir`
+makes a group-writable directory, and the server refuses it; the error names
+the chmod that fixes it. The data directory holds every blob and every row, so keep it
 mode 0700 and owned by the user the server runs as: the server refuses one
 that group or others can write, or that sits under a directory another user
 can change. Without `--ticket-key` no object is readable, so a real server
