@@ -24,7 +24,7 @@ trap 'rm -rf "$work"' EXIT
 
 git init -q "$work/repo"
 mkdir "$work/repo/scripts"
-cp ./store-upgrade.sh "$work/repo/scripts/"
+cp ./store-upgrade.sh ./drill-lib.sh "$work/repo/scripts/"
 git -C "$work/repo" commit -q --allow-empty -m base
 for i in 1 2 3 4 5 6 7 8 9; do
   git -C "$work/repo" commit -q --allow-empty -m "r$i"

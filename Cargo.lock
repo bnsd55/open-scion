@@ -2570,6 +2570,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.4.3",
  "gix",
+ "h2",
  "hashlink",
  "http",
  "http-body",

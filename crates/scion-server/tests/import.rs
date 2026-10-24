@@ -321,17 +321,19 @@ fn path(p: &str) -> RepoPath {
 
 /// The root directory entry at `name`.
 fn root_entry(store: &Backend, cs: ChangesetId, name: &str) -> Option<Entry> {
-    read::list_dir(
+    let root = read::root_tree(
         store,
         "r",
         cs,
-        None,
         &Deadline::new(Instant::now() + Duration::from_secs(300)),
     )
-    .unwrap()
-    .entries()
-    .get(&PathElem::new(name).unwrap())
-    .copied()
+    .unwrap();
+    store
+        .read(|c| c.get_tree(root))
+        .unwrap()
+        .entries()
+        .get(&PathElem::new(name).unwrap())
+        .copied()
 }
 
 #[test]

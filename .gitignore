@@ -7,3 +7,4 @@ target/
 /scion-data/
 /docker/certs/
 /docker/work/
+/.scn-drills/

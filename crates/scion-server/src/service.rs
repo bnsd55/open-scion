@@ -231,6 +231,10 @@ pub struct ServeOptions {
     /// The audit log. Every server has one; the caller opens it (or
     /// passes the off handle of the tests) and records its start line.
     pub audit: crate::audit::Audit,
+    /// The bytes of unary replies the server holds at once. The tests
+    /// shrink it, so a small store can exercise the budget; the default
+    /// is the shipped [`crate::reply::REPLY_MEMORY_BUDGET`].
+    pub reply_memory_budget: usize,
 }
 
 /// Serves the API on `listener` within `options`, until `shutdown` resolves,
@@ -245,6 +249,9 @@ pub struct ServeOptions {
 /// # Errors
 ///
 /// Transport errors.
+// The service wiring reads best inline: the layers wrap one another in
+// the order a reply travels, and splitting it hides that order.
+#[allow(clippy::too_many_lines)]
 pub async fn serve(
     store: Backend,
     listener: TcpListener,
@@ -260,6 +267,7 @@ pub async fn serve(
         land_stale_secs,
         tls,
         metrics,
+        reply_memory_budget,
         data,
         audit,
     } = options;
@@ -329,27 +337,25 @@ pub async fn serve(
         audit.clone(),
         stop_rx,
     ));
-    // Outside the access rules, so a refused call counts too. The layer
-    // only wraps replies in a counting body; the handlers stay as they are.
-    let scion = MetricsLayer::new(Arc::clone(&metrics)).layer(InterceptedService::new(
-        ScionService::new(
-            worker.clone(),
-            Arc::clone(&access),
-            lands,
-            quotas.clone(),
-            Arc::clone(&metrics),
-            audit.clone(),
-        )
-        .into_server(),
-        crate::audit::AuditedAuth::new(auth.clone(), Arc::clone(&meter)),
-    ));
-    // No token interceptor on `objects`: `GetObjects` authenticates by
-    // ticket alone, and the service's other calls check the token
-    // themselves. So a tier needs no token of the server to fetch objects.
-    // The counting layer wraps it all the same, outside the ticket checks.
-    let objects = MetricsLayer::new(Arc::clone(&metrics)).layer(
-        ObjectsService::new(worker, access, quotas, tickets, Arc::clone(&metrics)).into_server(),
+    let reply_memory =
+        crate::reply::ReplyMemoryLayer::with_budget(reply_memory_budget, Arc::clone(&metrics));
+    let scion = reply_memory.clone().layer(
+        MetricsLayer::new(Arc::clone(&metrics)).layer(InterceptedService::new(
+            ScionService::new(
+                worker.clone(),
+                Arc::clone(&access),
+                lands,
+                quotas.clone(),
+                Arc::clone(&metrics),
+                audit.clone(),
+            )
+            .into_server(),
+            crate::audit::AuditedAuth::new(auth.clone(), Arc::clone(&meter)),
+        )),
     );
+    let objects = reply_memory.layer(MetricsLayer::new(Arc::clone(&metrics)).layer(
+        ObjectsService::new(worker, access, quotas, tickets, Arc::clone(&metrics)).into_server(),
+    ));
     // The health service answers `grpc.health.v1.Check` and `Watch` on the
     // same port, without a token: a probe carries none. The store opens
     // before this call, so the server starts serving. A fence trip
@@ -472,19 +478,30 @@ impl Drop for LandAnswer {
 impl ScionService {
     /// Sends `data` in parts of up to `CHUNK_BYTES`, as `ReadFile` sends a
     /// file. Holds the whole bytes, so the share is their size.
-    async fn stream_whole<T: Send + 'static>(
-        &self,
+    /// The budget share a whole-object reply needs: the object's own
+    /// bytes, taken BEFORE the object is read and built, so the count
+    /// of replies in flight bounds the memory they hold. An object over
+    /// the cap is refused here, before any of its bytes are read.
+    async fn whole_share_of(&self, size: usize) -> Result<OwnedSemaphorePermit, Status> {
+        if size > MAX_OBJECT_BYTES {
+            return Err(Status::resource_exhausted(format!(
+                "the object is {size} bytes, over the {MAX_OBJECT_BYTES}-byte reply cap"
+            )));
+        }
+        Arc::clone(&self.reads)
+            .acquire_many_owned(u32::try_from(size).expect("the cap asserts u32 fit"))
+            .await
+            .map_err(|_| Status::unavailable("server is shutting down"))
+    }
+
+    /// Sends `data` in parts, holding `share` for the whole reply.
+    fn stream_whole_holding<T: Send + 'static>(
         call: Call,
         data: Vec<u8>,
+        share: OwnedSemaphorePermit,
         stalled: Option<scion_proto::runtime::listen::Stalled>,
         make: fn(Vec<u8>) -> T,
-    ) -> Result<Response<ReceiverStream<Part<T>>>, Status> {
-        // Taken after the bytes are read, so a call that waits holds a
-        // budget share for memory that another reply may need sooner.
-        let share = Arc::clone(&self.reads)
-            .acquire_many_owned(whole_share(data.len()))
-            .await
-            .map_err(|_| Status::unavailable("server is shutting down"))?;
+    ) -> Response<ReceiverStream<Part<T>>> {
         let (tx, rx) = mpsc::channel(2);
         tokio::spawn(send_parts(
             Parts::Whole {
@@ -498,7 +515,7 @@ impl ScionService {
             stalled,
             make,
         ));
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Response::new(ReceiverStream::new(rx))
     }
 
     fn new(
@@ -760,6 +777,40 @@ impl Worker {
     }
 }
 
+/// Marks a unary reply so the reply-memory layer counts its
+/// parked bytes: the handler knows the encoded size here, before
+/// the response returns, which the encoded body never reveals.
+pub(crate) fn count_reply<M: prost::Message>(response: Response<M>) -> Response<M> {
+    let mut response = response;
+    let size = response.get_ref().encoded_len();
+    response
+        .extensions_mut()
+        .insert(crate::reply::ReplySize(size));
+    response
+}
+
+/// Marks a committed write's reply so the reply-memory layer never
+/// refuses it: the write has landed, and the client must read the
+/// truth, not a retryable error. The layer sends it uncounted when
+/// the budget is spent, with a warn line.
+pub(crate) fn count_committed_reply<M: prost::Message>(response: Response<M>) -> Response<M> {
+    let mut response = count_reply(response);
+    response
+        .extensions_mut()
+        .insert(crate::reply::ReplyMustDeliver);
+    response
+}
+
+/// Marks a streaming reply so the reply-memory layer knows its bytes
+/// are counted elsewhere: the read-budget share it took before the
+/// object was built. The layer's test seam panics on a reply with
+/// neither mark, so a new handler that forgets both fails a test.
+pub(crate) fn mark_stream<T>(response: Response<T>) -> Response<T> {
+    let mut response = response;
+    response.extensions_mut().insert(crate::reply::ReplyStreams);
+    response
+}
+
 pub(crate) use scion_proto::runtime::check::id as parse_id;
 
 pub(crate) fn check_name(what: &str, value: &str) -> Result<(), Status> {
@@ -922,18 +973,6 @@ const fn read_share(size: usize) -> usize {
     } else {
         READER_BYTES + 2 * CHUNK_BYTES
     }
-}
-
-/// The share of `READ_BUDGET_BYTES` that a reply holds for `size` bytes that
-/// are all in memory at once, as a `ListDir` or `GetChangeset` reply's object
-/// is. `ReadFile` reads its blob part by part, but these replies have the
-/// whole object in one buffer, so the share is its whole size.
-// SHORTCUT: a reply holds its object even when its share is capped at the
-// budget, so a directory whose bytes are over the budget holds what the
-// budget cannot pay for. The budget bounds how many such replies run at
-// once, not their size. Cap the encoded size if that ever matters.
-fn whole_share(size: usize) -> u32 {
-    u32::try_from(size.clamp(1, READ_BUDGET_BYTES)).unwrap_or(u32::MAX)
 }
 
 /// Where a reply's parts come from.
@@ -1493,9 +1532,9 @@ impl Scion for ScionService {
             })
             .await;
         let id = written??;
-        Ok(Response::new(PutBlobResponse {
+        Ok(count_committed_reply(Response::new(PutBlobResponse {
             blob_id: id.as_bytes().to_vec(),
-        }))
+        })))
     }
 
     async fn create_changeset(
@@ -1591,9 +1630,11 @@ impl Scion for ScionService {
             })
             .await;
         let id = outcome??;
-        Ok(Response::new(CreateChangesetResponse {
-            changeset_id: id.as_bytes().to_vec(),
-        }))
+        Ok(count_committed_reply(Response::new(
+            CreateChangesetResponse {
+                changeset_id: id.as_bytes().to_vec(),
+            },
+        )))
     }
 
     async fn land(
@@ -1720,7 +1761,7 @@ impl Scion for ScionService {
             })
             .await;
         match ran {
-            Ok(Ok(outcome)) => Ok(Response::new(land_response(outcome))),
+            Ok(Ok(outcome)) => Ok(count_committed_reply(Response::new(land_response(outcome)))),
             Ok(Err(status)) => {
                 self.metrics.land(code_label(status.code()));
                 Err(status)
@@ -1746,7 +1787,7 @@ impl Scion for ScionService {
             .worker
             .run(move |store| land::get_land(&store, &caller, &repo, land_id))
             .await?;
-        Ok(Response::new(land_response(outcome)))
+        Ok(count_reply(Response::new(land_response(outcome))))
     }
 
     async fn resolve_ref(
@@ -1755,7 +1796,7 @@ impl Scion for ScionService {
     ) -> Result<Response<ResolveRefResponse>, Status> {
         resolve_ref(&self.worker, &self.access, &self.quotas, request)
             .await
-            .map(Response::new)
+            .map(|r| count_reply(Response::new(r)))
     }
 
     async fn get_changeset(
@@ -1769,15 +1810,37 @@ impl Scion for ScionService {
         let stalled = scion_proto::runtime::listen::Stalled::of(&request);
         let req = request.into_inner();
         check_whole_reader(&self.access, &caller, &req.repo)?;
-        let id = parse_id(&req.changeset_id, "changeset_id")?;
+        let id: ChangesetId = parse_id(&req.changeset_id, "changeset_id")?;
+        // The share is taken before the object is built, sized from the
+        // stored body's length: the count of replies in flight bounds
+        // the memory they hold, and an over-cap object is refused
+        // before any of its bytes are read.
+        let size = self
+            .worker
+            .run(move |store| {
+                let stored =
+                    store.read(|c| c.stored_changeset_body_lengths(&[id.as_bytes().to_vec()]))?;
+                let len = stored
+                    .iter()
+                    .find(|(stored_id, _)| *stored_id == id.as_bytes())
+                    .map_or(0, |(_, len)| usize::try_from(*len).unwrap_or(0));
+                // A missing object surfaces in the build below, with
+                // its real error.
+                Ok(len)
+            })
+            .await?;
+        let share = self.whole_share_of(size).await?;
         let data = self
             .worker
             .run(move |store| Ok(read::get_changeset(&store, &req.repo, id)?.encode()))
             .await?;
-        self.stream_whole(call, data, stalled, |data| GetChangesetResponse {
-            changeset: data,
-        })
-        .await
+        Ok(mark_stream(Self::stream_whole_holding(
+            call,
+            data,
+            share,
+            stalled,
+            |data| GetChangesetResponse { changeset: data },
+        )))
     }
 
     type ReadFileStream = ReadFileStream;
@@ -1858,7 +1921,7 @@ impl Scion for ScionService {
             )
             .instrument(tracing::Span::current()),
         );
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(mark_stream(Response::new(ReceiverStream::new(rx))))
     }
 
     async fn list_dir(
@@ -1891,24 +1954,51 @@ impl Scion for ScionService {
             }
             None => None,
         };
-        let data = self
+        // One worker pass resolves the root and the path (a view root
+        // is not cheap, so it is resolved once), and returns the
+        // directory's id with its stored body's length: the body IS
+        // the reply's bytes, so the length is exact. The share is
+        // taken from that length, before the build reads the row it
+        // already named; a changeset-pinned tree cannot change between
+        // the two reads.
+        let (dir_id, size) = self
             .worker
             .run(move |store| {
-                let tree = match &view {
+                let root = match &view {
                     Some((digest, prefixes, live)) => {
                         let repo_id = store.read(|c| c.repo_id(&req.repo))?;
-                        let root = views::view_root(
+                        views::view_root(
                             &store, repo_id, digest, id, prefixes, live, &metrics, &deadline,
-                        )?;
-                        read::list_dir_at(&store, root, path.as_ref())?
+                        )?
                     }
-                    None => read::list_dir(&store, &req.repo, id, path.as_ref(), &deadline)?,
+                    None => read::root_tree(&store, &req.repo, id, &deadline)?,
                 };
-                Ok(tree.encode())
+                let dir_id = store.read(|c| match path.as_ref() {
+                    None => Ok(root),
+                    Some(path) => match crate::tree::lookup(c, root, path)? {
+                        Some(scion_core::Entry::Dir(dir_id)) => Ok(dir_id),
+                        Some(scion_core::Entry::File(_)) => {
+                            Err(crate::Error::InvalidArgument(format!("{path:?} is a file")))
+                        }
+                        None => Err(crate::Error::NotFound(format!("path {path:?}"))),
+                    },
+                })?;
+                let size = store.read(|c| c.tree_size(dir_id))?;
+                Ok((dir_id, size))
             })
             .await?;
-        self.stream_whole(call, data, stalled, |data| ListDirResponse { tree: data })
-            .await
+        let share = self.whole_share_of(size).await?;
+        let data = self
+            .worker
+            .run(move |store| Ok(store.read(|c| c.get_tree(dir_id))?.encode()))
+            .await?;
+        Ok(mark_stream(Self::stream_whole_holding(
+            call,
+            data,
+            share,
+            stalled,
+            |data| ListDirResponse { tree: data },
+        )))
     }
 
     async fn log(&self, request: Request<LogRequest>) -> Result<Response<LogStream>, Status> {
@@ -1951,7 +2041,7 @@ impl Scion for ScionService {
         };
         let (tx, rx) = mpsc::channel(2);
         tokio::spawn(log_parts(walk, page, tx).instrument(tracing::Span::current()));
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(mark_stream(Response::new(ReceiverStream::new(rx))))
     }
 
     async fn blame(&self, request: Request<BlameRequest>) -> Result<Response<BlameStream>, Status> {
@@ -2040,7 +2130,7 @@ impl Scion for ScionService {
         };
         let (tx, rx) = mpsc::channel(2);
         tokio::spawn(blame_parts(send, tx).instrument(tracing::Span::current()));
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(mark_stream(Response::new(ReceiverStream::new(rx))))
     }
 
     async fn merge_base(
@@ -2059,9 +2149,9 @@ impl Scion for ScionService {
                 read::merge_base(store, &req.repo, a, b, deadline)
             })
             .await?;
-        Ok(Response::new(MergeBaseResponse {
+        Ok(count_reply(Response::new(MergeBaseResponse {
             changeset_ids: bases.iter().map(|id| id.as_bytes().to_vec()).collect(),
-        }))
+        })))
     }
 
     async fn is_ancestor(
@@ -2080,7 +2170,9 @@ impl Scion for ScionService {
                 read::is_ancestor(store, &req.repo, ancestor, descendant, deadline)
             })
             .await?;
-        Ok(Response::new(IsAncestorResponse { is_ancestor }))
+        Ok(count_reply(Response::new(IsAncestorResponse {
+            is_ancestor,
+        })))
     }
 
     async fn diff(&self, request: Request<DiffRequest>) -> Result<Response<DiffResponse>, Status> {
@@ -2137,11 +2229,11 @@ impl Scion for ScionService {
                 }
             })
             .collect();
-        Ok(Response::new(DiffResponse {
+        Ok(count_reply(Response::new(DiffResponse {
             entries,
             next_after: path_bytes(page.next_after),
             renames_incomplete: page.renames_incomplete,
-        }))
+        })))
     }
 }
 
@@ -2377,7 +2469,7 @@ mod tests {
     #[tokio::test]
     async fn a_whole_reply_splits_at_chunk_bytes_and_stays_whole() {
         let data = content(3);
-        let budget = whole_share(data.len()) as usize;
+        let budget = data.len();
         let (task, mut rx, reads) =
             whole_reply(data.clone(), budget, Duration::from_secs(60)).await;
         let mut sent = Vec::new();
@@ -2397,7 +2489,7 @@ mod tests {
     #[tokio::test]
     async fn a_whole_reply_whose_client_stops_mid_reply_frees_its_share() {
         let data = content(3);
-        let budget = whole_share(data.len()) as usize;
+        let budget = data.len();
         let (task, mut rx, reads) =
             whole_reply(data.clone(), budget, Duration::from_secs(60)).await;
 

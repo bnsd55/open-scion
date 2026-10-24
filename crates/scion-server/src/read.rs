@@ -8,9 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 
-use scion_core::{
-    BlobId, Changeset, ChangesetId, Entry, FileState, PathElem, RepoPath, Tree, TreeId,
-};
+use scion_core::{BlobId, Changeset, ChangesetId, Entry, FileState, PathElem, RepoPath, TreeId};
 
 use crate::backend::Backend;
 use crate::deadline::Deadline;
@@ -113,36 +111,6 @@ pub fn file_blob_at(store: &Backend, root: TreeId, path: &RepoPath) -> Result<Bl
 ///
 /// [`Error::NotFound`] if nothing is at `path`. [`Error::InvalidArgument`] if
 /// `path` is a file.
-pub fn list_dir(
-    store: &Backend,
-    repo: &str,
-    cs: ChangesetId,
-    path: Option<&RepoPath>,
-    deadline: &Deadline,
-) -> Result<Tree> {
-    let root = root_tree(store, repo, cs, deadline)?;
-    list_dir_at(store, root, path)
-}
-
-/// The tree at `path` below the root tree `root`, which a partial reader's
-/// view may name instead of the changeset's real root.
-///
-/// # Errors
-///
-/// As [`list_dir`].
-pub fn list_dir_at(store: &Backend, root: TreeId, path: Option<&RepoPath>) -> Result<Tree> {
-    store.read(|c| {
-        let Some(path) = path else {
-            return c.get_tree(root);
-        };
-        match tree::lookup(c, root, path)? {
-            Some(Entry::Dir(id)) => c.get_tree(id),
-            Some(Entry::File(_)) => Err(Error::InvalidArgument(format!("{path:?} is a file"))),
-            None => Err(Error::NotFound(format!("path {path:?}"))),
-        }
-    })
-}
-
 /// Most entries that a `Log` reply holds. Each entry reads one changeset
 /// while the call holds one read connection.
 pub const MAX_SCAN: usize = 1000;
