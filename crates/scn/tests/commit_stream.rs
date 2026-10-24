@@ -224,10 +224,7 @@ fn a_commit_of_a_big_file_stays_under_its_rss_ceiling() {
     const CEILING_KB: u64 = 32 * 1024;
     let fx = Fixture::start();
     let file = fx.put_file("huge.bin", FILE_BYTES);
-    // PROOF-INJECTION: the lever flipped for the child, the whole-file
-    // read must fail the ceiling and print its peak. The next commit
-    // reverts this.
-    let out = commit_measured(&fx, "huge.bin", &file, true);
+    let out = commit_measured(&fx, "huge.bin", &file, false);
     assert!(
         out.status.success(),
         "commit failed: {}{}",
@@ -237,17 +234,6 @@ fn a_commit_of_a_big_file_stays_under_its_rss_ceiling() {
     let peak_kb = out.peak_kb;
     println!("the scn commit's peak RSS was {peak_kb} kB; the ceiling is {CEILING_KB} kB");
     assert!(peak_kb > 0, "the sampler never saw the commit");
-    // Both peaks (lever off and on) land in the run's summary when CI
-    // runs, so the guard's numbers are CI's own, not a local machine's.
-    if let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY")
-        && let Ok(mut f) = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(path)
-    {
-        use std::io::Write as _;
-        let _ = writeln!(f, "commit-stream peak (lever=true): {peak_kb} kB");
-    }
     assert!(
         peak_kb <= CEILING_KB,
         "the commit's peak RSS ({peak_kb} kB) passed the ceiling ({CEILING_KB} kB); \
