@@ -728,3 +728,77 @@ fn a_served_store_without_its_marker_refuses_a_fresh_directory() {
     };
     assert!(error.to_string().contains("carries no marker"), "{error}");
 }
+
+/// The runbook's re-pairing: a served store whose marker was lost
+/// accepts a marker written back exactly as operations.md says (the
+/// `printf` command shape, the 32 hex digits the refusal text names),
+/// and serves again. A marker written in the wrong format is read as
+/// absent, so the refusal stands and the store stays closed.
+#[test]
+fn a_lost_marker_written_back_as_the_runbook_says_reopens_the_store() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let db = Throwaway::new("marker_repair");
+    let mut admin = postgres::Client::connect(&db.url, postgres::NoTls).unwrap();
+    admin.batch_execute("CREATE SCHEMA a;").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let served = Backend::open(dir.path(), Some(&db.url_riding(Some("a"))), None)
+        .expect("the first open mints");
+    served.write(|c| c.create_repo("r").map(|_| ())).unwrap();
+    drop(served);
+    std::fs::remove_file(dir.path().join("backend")).unwrap();
+    let Err(error) = Backend::open(dir.path(), Some(&db.url_riding(Some("a"))), None) else {
+        panic!("a served store refuses without its marker");
+    };
+    let message = error.to_string();
+    assert!(message.contains("carries no marker"), "{message}");
+    // The runbook: the UUID comes from the error text - the 32 hex
+    // digits it names - and the marker is the printf of two lines.
+    let start = message
+        .find("names the store ")
+        .expect("the refusal names the store")
+        + "names the store ".len();
+    let uuid = &message[start..start + 32];
+    assert!(uuid.bytes().all(|b| b.is_ascii_hexdigit()), "{message}");
+    // A marker whose UUID line is not 32 hex digits counts as no UUID
+    // at all: the open refuses again with the same message, exactly as
+    // it did without the file. The runbook's write is the only one that
+    // reopens the store.
+    let dashed = format!(
+        "postgres\n{}-{}-{}-{}-{}\n",
+        &uuid[..8],
+        &uuid[8..12],
+        &uuid[12..16],
+        &uuid[16..20],
+        &uuid[20..]
+    );
+    std::fs::write(dir.path().join("backend"), &dashed).unwrap();
+    let Err(still) = Backend::open(dir.path(), Some(&db.url_riding(Some("a"))), None) else {
+        panic!("a marker whose UUID line is not 32 hex digits opens a store");
+    };
+    assert!(still.to_string().contains("carries no marker"), "{still}");
+    let marker = dir.path().join("backend");
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "printf 'postgres\\n{}\\n' > {}",
+            uuid,
+            marker.display()
+        ))
+        .status()
+        .expect("the runbook's printf runs");
+    assert!(out.success(), "the runbook's printf wrote the marker");
+    let bytes = std::fs::read(&marker).unwrap();
+    assert_eq!(
+        bytes,
+        format!("postgres\n{uuid}\n").into_bytes(),
+        "the marker's bytes are the two lines the runbook says"
+    );
+    let again = Backend::open(dir.path(), Some(&db.url_riding(Some("a"))), None)
+        .expect("the marker the runbook wrote reopens the store");
+    assert!(
+        again.read(|c| c.repo_id("r")).is_ok(),
+        "the repo the store served is still there"
+    );
+}

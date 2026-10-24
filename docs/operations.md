@@ -318,7 +318,7 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
   client calls: the check runs on the server's own session, through the
   same queue as every statement, never on a second connection.
 - A start after an unclean kill can refuse its open with "another
-  server holds this database": the dead server's session is still in
+  server holds this store" (the refusal's exact text): the dead server's session is still in
   the database, and the one-server lock dies only when Postgres ends
   that session. On the same host that is at once - the kernel closes a
   dead process's sockets - so the service manager's restart
@@ -335,6 +335,24 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
 - The SQLite store has none of this: one file is opened by one process at
   the kernel level, so there is no lock to lose and no fence. The notes
   above that name the one-server lock and the fence are Postgres only.
+- Re-pairing a lost marker: if an open refuses with "this database names
+  the store ..., but the data directory carries no marker of it" and the
+  directory IS the one this database was served with — its blob files
+  are there — the `backend` marker file was lost and can be written
+  back. The marker is two lines: `postgres`, then the 32 hex digits the
+  error text names (lowercase, no dashes). Write it exactly:
+
+  ```sh
+  printf 'postgres\n<uuid-from-the-error>\n' > /srv/scion/backend
+  ```
+
+  then start the server. Do NOT do this for a directory the database
+  was never served with: its blob files are missing, and the correct
+  move is a different directory (`--data`), not a marker. A UUID line
+  that is not 32 hex digits counts as no UUID at all - the open refuses
+  again with the same "carries no marker" message - so check what you
+  wrote (for example `od -c /srv/scion/backend`) before you conclude
+  the re-pairing failed.
 
 Backup and restore of a Postgres-backed server: `pg_dump` the database
 first, then copy the data directory. A changeset in the dump names only
