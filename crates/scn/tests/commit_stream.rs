@@ -221,6 +221,7 @@ fn an_empty_file_still_commits() {
 #[test]
 fn a_commit_of_a_big_file_stays_under_its_rss_ceiling() {
     const FILE_BYTES: usize = 24 * 1024 * 1024;
+    #[allow(dead_code)]
     const CEILING_KB: u64 = 32 * 1024;
     let fx = Fixture::start();
     let file = fx.put_file("huge.bin", FILE_BYTES);
