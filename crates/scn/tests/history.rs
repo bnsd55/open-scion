@@ -565,3 +565,56 @@ fn log_continues_after_a_reply_cut_by_its_byte_budget() {
         assert_eq!(log_ids(&server, &args), expected, "{args:?}");
     }
 }
+
+/// An ID copied from the human output resolves: `scn log` and `scn blame`
+/// print changeset IDs the REV parser accepts back (`scn show`), not
+/// abbreviations nothing reads.
+#[test]
+fn an_id_copied_from_human_output_resolves() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
+    let ids = chain(
+        &store,
+        vec![
+            (
+                b"one\n".to_vec(),
+                vec![("f", regular(store.blobs().put(b"one\n").unwrap()))],
+            ),
+            (
+                b"two\n".to_vec(),
+                vec![("f", regular(store.blobs().put(b"two\n").unwrap()))],
+            ),
+        ],
+    );
+    let server = Server::start(data, store);
+    let tip = ids[1].to_string();
+    let log_line = server.run(&["log", "-n", "1", &tip]);
+    let id = log_line
+        .lines()
+        .next()
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        id,
+        ids[1].to_string(),
+        "scn log prints the full changeset ID: {log_line}"
+    );
+    server.run(&["show", &id]);
+    let blame_line = server.run(&["blame", &format!("{tip}:f")]);
+    let blame_id = blame_line
+        .lines()
+        .next()
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        blame_id, tip,
+        "scn blame prints the full changeset ID: {blame_line}"
+    );
+    server.run(&["show", &blame_id]);
+}

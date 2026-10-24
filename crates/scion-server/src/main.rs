@@ -1306,7 +1306,11 @@ fn load_access(
         .count();
     anyhow::ensure!(
         given == 1,
-        "give --token, --token-file or --access, not two"
+        if given == 0 {
+            "give --token-file, SCION_TOKEN or --access: serve has no token source"
+        } else {
+            "give --token, --token-file or --access, not two"
+        }
     );
     if let Some(file) = token_file {
         let token = secret_file(&file)?;
@@ -1540,6 +1544,22 @@ mod access_file_tests {
         std::fs::write(&file, text).unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
         file
+    }
+
+    /// With no token source at all, the refusal says what is missing;
+    /// with two sources, it keeps "not two".
+    #[test]
+    fn serve_without_a_token_source_says_what_is_missing() {
+        let err = load_access(None, None, None).unwrap_err().to_string();
+        assert!(
+            err.contains("--token-file, SCION_TOKEN or --access")
+                && err.contains("no token source"),
+            "{err}"
+        );
+        let err = load_access(Some("t".into()), Some(PathBuf::from("k")), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not two"), "{err}");
     }
 
     #[test]

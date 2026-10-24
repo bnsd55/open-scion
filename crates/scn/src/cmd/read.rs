@@ -175,12 +175,7 @@ pub async fn log(ctx: &mut Ctx, rev: &str, path: Option<&RepoPath>, limit: u32) 
             .split(|&b| b == b'\n')
             .next()
             .unwrap_or_default();
-        outln!(
-            "{} {} {}",
-            &id.to_string()[..12],
-            lossy(cs.author().name()),
-            lossy(subject)
-        );
+        outln!("{} {} {}", id, lossy(cs.author().name()), lossy(subject));
     }
     Ok(())
 }

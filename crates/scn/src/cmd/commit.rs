@@ -149,6 +149,10 @@ fn arg_edits(args: &CommitArgs) -> Result<BTreeMap<RepoPath, Edit>> {
     let mut edits = BTreeMap::new();
     let puts = args.puts.iter().map(|(path, file)| (path, Some(file)));
     for (path, file) in puts.chain(args.deletes.iter().map(|path| (path, None))) {
+        ensure!(
+            !path.starts_with('/'),
+            "bad path {path:?}: repo paths are relative to the repository root, not to this machine"
+        );
         let path = RepoPath::new(path.as_str()).with_context(|| format!("bad path {path:?}"))?;
         ensure!(
             !edits.contains_key(&path),
@@ -205,6 +209,30 @@ mod tests {
         let (name, email) = parse_author("Ada Lovelace <ada@example.com>").unwrap();
         assert_eq!(name, b"Ada Lovelace");
         assert_eq!(email, b"ada@example.com");
+    }
+
+    /// An absolute repo path names a file on this machine, not in the
+    /// repo: the refusal says repo paths are relative, and names the
+    /// path, instead of `RepoPath`'s "empty part".
+    #[test]
+    fn an_absolute_repo_path_says_repo_paths_are_relative() {
+        let args = CommitArgs {
+            base: "main".into(),
+            message: "m".into(),
+            puts: vec![("/tmp/hello.txt".into(), "hello.txt".into())],
+            executable: false,
+            deletes: vec![],
+            author: "scn <scn@localhost>".into(),
+            from_mount: None,
+        };
+        let err = match arg_edits(&args) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("an absolute repo path was accepted"),
+        };
+        assert!(
+            err.contains("repo paths are relative") && err.contains("/tmp/hello.txt"),
+            "{err}"
+        );
     }
 
     #[test]

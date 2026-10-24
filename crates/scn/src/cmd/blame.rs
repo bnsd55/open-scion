@@ -195,7 +195,7 @@ fn print_text(
         let text = lossy(text);
         outln!(
             "{}{source_path} ({name} {secs} {:>width$}) {}",
-            &id.to_string()[..12],
+            id,
             n + 1,
             text.strip_suffix('\n').unwrap_or(&text)
         );
