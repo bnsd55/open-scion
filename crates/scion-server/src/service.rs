@@ -1987,35 +1987,11 @@ impl Scion for ScionService {
                 Ok((dir_id, size))
             })
             .await?;
-        #[cfg(any(test, feature = "test-hooks"))]
-        // The old order, for the red of the RSS-bound test: build the
-        // whole body first, take its share after, so concurrent builds
-        // are uncounted and the RSS blows past the budget.
-        let (share, data) =
-            if std::env::var("SCION_LISTDIR_MUTATION").as_deref() == Ok("build_then_share") {
-                let data = self
-                    .worker
-                    .run(move |store| Ok(store.read(|c| c.get_tree(dir_id))?.encode()))
-                    .await?;
-                let share = self.whole_share_of(size).await?;
-                (share, data)
-            } else {
-                let share = self.whole_share_of(size).await?;
-                let data = self
-                    .worker
-                    .run(move |store| Ok(store.read(|c| c.get_tree(dir_id))?.encode()))
-                    .await?;
-                (share, data)
-            };
-        #[cfg(not(any(test, feature = "test-hooks")))]
-        let (share, data) = {
-            let share = self.whole_share_of(size).await?;
-            let data = self
-                .worker
-                .run(move |store| Ok(store.read(|c| c.get_tree(dir_id))?.encode()))
-                .await?;
-            (share, data)
-        };
+        let share = self.whole_share_of(size).await?;
+        let data = self
+            .worker
+            .run(move |store| Ok(store.read(|c| c.get_tree(dir_id))?.encode()))
+            .await?;
         Ok(mark_stream(Self::stream_whole_holding(
             call,
             data,

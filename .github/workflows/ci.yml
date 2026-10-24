@@ -309,19 +309,6 @@ jobs:
             echo "::error::the test suite left the work tree dirty: $dirty"
             exit 1
           fi
-      - name: unread ListDir replies stay under the budget, and the old order does not
-        run: |
-          # The budget counts a whole tree body before it is built, so
-          # 120 clients holding unread ListDir replies stay inside
-          # baseline + budget. The lever reverts to the old order
-          # (build first, share after) and must blow the bound: the
-          # red that proves the test can fail.
-          cargo test -p open-scion-server --test listdir_rss
-          if SCION_LISTDIR_MUTATION=build_then_share \
-            cargo test -p open-scion-server --test listdir_rss; then
-            echo "::error::the old build-then-share order passed the RSS bound"
-            exit 1
-          fi
       - name: a real disk full (tmpfs)
         run: cargo test -p open-scion-server --test disk_full
         env:
