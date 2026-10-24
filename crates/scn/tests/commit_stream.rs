@@ -224,10 +224,10 @@ fn a_commit_of_a_big_file_stays_under_its_rss_ceiling() {
     const CEILING_KB: u64 = 32 * 1024;
     let fx = Fixture::start();
     let file = fx.put_file("huge.bin", FILE_BYTES);
-    // PROOF-INJECTION: the lever flipped, the whole-file read must fail
-    // the ceiling and print its peak. The next commit reverts this.
-    open_scion::client::set_whole_file_mutation(true);
-    let out = commit_measured(&fx, "huge.bin", &file);
+    // PROOF-INJECTION: the lever flipped for the child, the whole-file
+    // read must fail the ceiling and print its peak. The next commit
+    // reverts this.
+    let out = commit_measured(&fx, "huge.bin", &file, true);
     assert!(
         out.status.success(),
         "commit failed: {}{}",
@@ -237,6 +237,14 @@ fn a_commit_of_a_big_file_stays_under_its_rss_ceiling() {
     let peak_kb = out.peak_kb;
     println!("the scn commit's peak RSS was {peak_kb} kB; the ceiling is {CEILING_KB} kB");
     assert!(peak_kb > 0, "the sampler never saw the commit");
+    // Both peaks (lever off and on) land in the run's summary when CI
+    // runs, so the guard's numbers are CI's own, not a local machine's.
+    if let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY") {
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(path) {
+            use std::io::Write as _;
+            let _ = writeln!(f, "commit-stream peak (lever=true): {peak_kb} kB");
+        }
+    }
     assert!(
         peak_kb <= CEILING_KB,
         "the commit's peak RSS ({peak_kb} kB) passed the ceiling ({CEILING_KB} kB); \
@@ -257,7 +265,17 @@ struct Measured {
     peak_kb: u64,
 }
 
-fn commit_measured(fx: &Fixture, name: &str, file: &std::path::Path) -> Measured {
+/// The child's env when the lever is flipped: the whole-file read.
+fn lever_env(lever: bool) -> impl Iterator<Item = (&'static str, &'static str)> {
+    lever.then_some(("SCION_TEST_COMMIT_MUTATION", "whole_file")).into_iter()
+}
+
+fn commit_measured(
+    fx: &Fixture,
+    name: &str,
+    file: &std::path::Path,
+    lever: bool,
+) -> Measured {
     let args = [
         "--server",
         &fx.url,
@@ -276,6 +294,7 @@ fn commit_measured(fx: &Fixture, name: &str, file: &std::path::Path) -> Measured
             .args(args)
             .arg(&put)
             .env("SCION_TOKEN", TOKEN)
+            .envs(lever_env(lever))
             .output()
             .expect("/usr/bin/time exists on macOS");
         let text = String::from_utf8_lossy(&out.stderr);
@@ -298,6 +317,7 @@ fn commit_measured(fx: &Fixture, name: &str, file: &std::path::Path) -> Measured
             .args(args)
             .arg(&put)
             .env("SCION_TOKEN", TOKEN)
+            .envs(lever_env(lever))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()

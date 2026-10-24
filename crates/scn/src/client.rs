@@ -148,14 +148,6 @@ fn mutation_whole_file() -> bool {
     }) || ON.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Flips the whole-file mutation lever, the way the env var does, for a
-/// test that cannot set the process's env safely.
-#[cfg(any(test, feature = "test-hooks"))]
-pub fn set_whole_file_mutation(on: bool) {
-    static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    ON.store(on, std::sync::atomic::Ordering::SeqCst);
-}
-
 /// The `Objects` client of `url`, for the tests, with a 10s timeout.
 ///
 /// # Panics
