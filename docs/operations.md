@@ -1222,31 +1222,31 @@ checking out through a cache and a daemon beside it.
 
 | | |
 |---|---|
-| Commit | fcb947e6bdd16fbab303cbc9bbe79c21c04f3ba8 the run's own HEAD, at [run 40119721010](https://github.com/bnsd55/openscion/actions/runs/40119721010) |
+| Commit | ab6bfdc92314fc41d2a8c5dca0f0a13bd39b5612 the main commit the run measured (the run's own HEAD, fcb947e6, adds the grid's database name only), at [run 40119721010](https://github.com/bnsd55/openscion/actions/runs/40119721010) |
 | Runner | the hosted runner class, by its public label and spec |
 | Filesystem | the filesystem the run measured, from the run's `machine.txt` artifact (`df -T` on the work directory); the `ubuntu-24.04` class's root disk is ext4 ([support.md](support.md)) |
 | Repetitions | 2 per cell; the table reports the cell's whole run, and the run's raw samples are the workflow run's `capacity.csv` artifact |
 
 | backend | writers | readers | land p99 ms | checkout p50 ms | checkout p99 ms | timeouts | errors | server RSS MiB | landed | blob store KiB per 1k lands | database KiB per 1k lands |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| sqlite | 2 | 0 | 15 | - | - | 0 | 0 | 24 | 2000 | 56 | - |
-| sqlite | 2 | 5 | 31 | 172 | 238 | 0 | 0 | 31 | 2000 | 56 | - |
-| sqlite | 2 | 20 | 103 | 683 | 827 | 0 | 0 | 32 | 2000 | 56 | - |
-| sqlite | 50 | 0 | 228 | - | - | 0 | 0 | 43 | 2000 | 29 | - |
-| sqlite | 50 | 5 | 490 | 173 | 243 | 0 | 0 | 50 | 2000 | 29 | - |
-| sqlite | 50 | 20 | 2057 | 685 | 839 | 0 | 0 | 50 | 2000 | 29 | - |
-| sqlite | 200 | 0 | 958 | - | - | 0 | 0 | 57 | 2000 | 39 | - |
-| sqlite | 200 | 5 | 2170 | 175 | 248 | 0 | 0 | 74 | 2000 | 39 | - |
-| sqlite | 200 | 20 | 9924 | 684 | 830 | 0 | 0 | 77 | 2000 | 39 | - |
-| postgres | 2 | 0 | 64 | - | - | 0 | 0 | 20 | 2000 | 3 | 87210 |
-| postgres | 2 | 5 | 124 | 253 | 298 | 0 | 0 | 24 | 2000 | 3 | 87530 |
-| postgres | 2 | 20 | 243 | 879 | 1071 | 0 | 0 | 27 | 2000 | 3 | 86618 |
-| postgres | 50 | 0 | 2309 | - | - | 0 | 0 | 33 | 2000 | 3 | 34674 |
-| postgres | 50 | 5 | 4454 | 254 | 301 | 0 | 0 | 38 | 2000 | 3 | 34558 |
-| postgres | 50 | 20 | 7042 | 877 | 1079 | 0 | 0 | 38 | 2000 | 3 | 34482 |
-| postgres | 200 | 0 | 9326 | - | - | 0 | 0 | 45 | 2000 | 3 | 62428 |
-| postgres | 200 | 5 | 18244 | 254 | 296 | 0 | 0 | 63 | 2000 | 3 | 62366 |
-| postgres | 200 | 20 | 31584 | 869 | 1054 | 0 | 0 | 66 | 2000 | 3 | 62406 |
+| sqlite | 2 | 0 | 15 | - | - | 0 | 0 | 24 | 2000 | 112318 | - |
+| sqlite | 2 | 5 | 31 | 172 | 238 | 0 | 0 | 31 | 2000 | 112324 | - |
+| sqlite | 2 | 20 | 103 | 683 | 827 | 0 | 0 | 32 | 2000 | 112366 | - |
+| sqlite | 50 | 0 | 228 | - | - | 0 | 0 | 43 | 2000 | 58798 | - |
+| sqlite | 50 | 5 | 490 | 173 | 243 | 0 | 0 | 50 | 2000 | 58848 | - |
+| sqlite | 50 | 20 | 2057 | 685 | 839 | 0 | 0 | 50 | 2000 | 58882 | - |
+| sqlite | 200 | 0 | 958 | - | - | 0 | 0 | 57 | 2000 | 78358 | - |
+| sqlite | 200 | 5 | 2170 | 175 | 248 | 0 | 0 | 74 | 2000 | 78384 | - |
+| sqlite | 200 | 20 | 9924 | 684 | 830 | 0 | 0 | 77 | 2000 | 78364 | - |
+| postgres | 2 | 0 | 64 | - | - | 0 | 0 | 20 | 2000 | 5668 | 87210 |
+| postgres | 2 | 5 | 124 | 253 | 298 | 0 | 0 | 24 | 2000 | 5668 | 87530 |
+| postgres | 2 | 20 | 243 | 879 | 1071 | 0 | 0 | 27 | 2000 | 5668 | 86618 |
+| postgres | 50 | 0 | 2309 | - | - | 0 | 0 | 33 | 2000 | 5668 | 34674 |
+| postgres | 50 | 5 | 4454 | 254 | 301 | 0 | 0 | 38 | 2000 | 5668 | 34558 |
+| postgres | 50 | 20 | 7042 | 877 | 1079 | 0 | 0 | 38 | 2000 | 5664 | 34482 |
+| postgres | 200 | 0 | 9326 | - | - | 0 | 0 | 45 | 2000 | 5668 | 62428 |
+| postgres | 200 | 5 | 18244 | 254 | 296 | 0 | 0 | 63 | 2000 | 5666 | 62366 |
+| postgres | 200 | 20 | 31584 | 869 | 1054 | 0 | 0 | 66 | 2000 | 5668 | 62406 |
 
 Every cell runs on a store the cell's own import made: on SQLite a data directory
 the cell created, on Postgres a database the cell dropped and
