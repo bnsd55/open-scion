@@ -327,7 +327,7 @@ fn a_signed_zone_imports() {
     let store = Backend::open_test_shared(dir.path()).unwrap();
     let report = import(&store, &git, &head);
     let cs = changeset_of(&store, &head);
-    let repo = store.read(|c| Ok(c.repo_id("r")?)).unwrap();
+    let repo = store.read(|c| c.repo_id("r")).unwrap();
     let got = store.read(|c| c.get_changeset(repo, cs)).unwrap();
     // -0530 is -5 h 30 m.
     assert_eq!(got.author().tz_offset_minutes(), -330);
