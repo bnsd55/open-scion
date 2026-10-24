@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# The helpers the drill legs share with backup-n1.sh: the preamble and
+# the function bodies the legs call. The run section below is this
+# script's own.
+. "$(cd "$(dirname "$0")" && pwd)/drill-lib.sh"
+
 # The tagged-store upgrade job (issue #382): a store written by each tagged
 # release opens under this build and upgrades directly, and the direct
 # upgrade is the same store that upgrading stepwise through the tags gives.
@@ -38,31 +43,10 @@
 #                       The git history must carry the tags (a checkout
 #                       with fetch-depth: 0 and fetch-tags: true does).
 
-set -euo pipefail
 
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
-
-# The scripts give every address, name and path as a flag or their own
-# export, so the caller's environment must not change the story. Git runs
-# without the user's and the system's config, and NO_COLOR keeps the log
-# lines plain, so the `serving listen=` lines parse.
-unset SCION_SERVER SCION_REPO SCION_DATA SCION_AUTHOR
-export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
-export SCION_TOKEN=upgrade NO_COLOR=1
-
-die() {
-  echo "store-upgrade: $*" >&2
-  exit 1
-}
-
-note() { echo "-- $*" >&2; }
 
 # summary LINE: what a CI run reads. Into the step summary when there is
 # one; to stderr always, so a local run sees it too.
-summary() {
-  echo "$*" >&2
-  [ -z "${GITHUB_STEP_SUMMARY:-}" ] || echo "$*" >> "$GITHUB_STEP_SUMMARY"
-}
 
 # release_tags: every release tag that is an ancestor of HEAD and not HEAD
 # itself, oldest first. The ladder caps itself to the newest 8 (each tag is
@@ -147,132 +131,31 @@ note "the ladder holds $count tag(s): $(printf '%s' "$tags" | tr '\n' ' ')"
 
 # schema_of SRCDIR: the store schema version a checkout writes, from its
 # source. The refusal can only fire when two builds differ.
-schema_of() {
-  sed -n 's/.*SCHEMA_VERSION: u32 = \([0-9]*\).*/\1/p' "$1/crates/scion-server/src/store.rs" | head -1
-}
 
 # make_repo DIR: the small repository the matrix uses: three commits on
 # main, so ls, cat and blame all have something to say. The caller gives
 # a directory of its own: never a checkout or a worktree path, whose
 # .git/config is the repository's. The identity rides the commit
 # environment, so no git config of any checkout is ever written.
-make_repo() {
-  local dir=$1
-  git init -q -b main "$dir/src"
-  printf 'pub fn main() {}\n' >"$dir/src/hello.rs"
-  printf '# upgrade\n\nA small repository for the tagged-store job.\n' >"$dir/src/README.md"
-  git -C "$dir/src" add -A
-  GIT_AUTHOR_NAME=upgrade GIT_AUTHOR_EMAIL=upgrade@localhost \
-  GIT_COMMITTER_NAME=upgrade GIT_COMMITTER_EMAIL=upgrade@localhost \
-    git -C "$dir/src" commit -q -m first
-  printf '// one more line\n' >>"$dir/src/hello.rs"
-  GIT_AUTHOR_NAME=upgrade GIT_AUTHOR_EMAIL=upgrade@localhost \
-  GIT_COMMITTER_NAME=upgrade GIT_COMMITTER_EMAIL=upgrade@localhost \
-    git -C "$dir/src" commit -qam second
-  printf 'One more line of prose.\n' >>"$dir/src/README.md"
-  GIT_AUTHOR_NAME=upgrade GIT_AUTHOR_EMAIL=upgrade@localhost \
-  GIT_COMMITTER_NAME=upgrade GIT_COMMITTER_EMAIL=upgrade@localhost \
-    git -C "$dir/src" commit -qam third
-}
 
 # start NAME DIR BIN ready args...: run a server in the background and
 # wait for its `serving listen=` line; with `ready` = port, print it.
-start() {
-  local name=$1 dir=$2 bin=$3 ready=$4 log pid port tries=300
-  shift 4
-  log="$dir/$name.log"
-  "$bin" "$@" >"$log" 2>&1 &
-  pid=$!
-  echo "$pid" >"$log.pid"
-  while :; do
-    port=$(sed -n 's/.* serving listen=127\.0\.0\.1:\([0-9]*\).*/\1/p' "$log" | tail -1)
-    if [ -n "$port" ]; then
-      break
-    fi
-    if ! kill -0 "$pid" 2> /dev/null; then
-      tail -n 10 "$log" >&2
-      die "$name did not start"
-    fi
-    tries=$((tries - 1))
-    [ "$tries" -gt 0 ] || {
-      tail -n 10 "$log" >&2
-      die "$name did not come up within 30 s"
-    }
-    sleep 0.1
-  done
-  [ "$ready" = port ] && printf '%s\n' "$port"
-  return 0
-}
 
 # stop DIR NAME: stop the one process `start` started, polling for ten
 # seconds, then KILL, and say which process needed it.
-stop_one() {
-  local dir=$1 name=$2 log pid
-  log="$dir/$name.log"
-  pid=$(cat "$log.pid")
-  if ! kill -0 "$pid" 2> /dev/null; then
-    rm -f "$log.pid"
-    return 0
-  fi
-  kill "$pid" 2> /dev/null || true
-  for _ in $(seq 1 100); do
-    if ! kill -0 "$pid" 2> /dev/null; then
-      rm -f "$log.pid"
-      return 0
-    fi
-    sleep 0.1
-  done
-  kill -9 "$pid" 2> /dev/null || true
-  rm -f "$log.pid"
-  note "$name needed a KILL to stop"
-}
 
 # fingerprint STORE: the state a migrated store must keep, whatever path
 # the migrations took to it: the schema (every table and index as the
 # schema says it), the version, and the row counts of the tables that
 # hold truth. The cache-like tables are left out: their sweep runs on
 # the server's clock, not on this script's.
-fingerprint() {
-  local db=$1
-  {
-    echo "version $(sqlite3 "$db" 'PRAGMA user_version')"
-    sqlite3 "$db" "SELECT type || ' ' || tbl_name || ' ' || sql FROM sqlite_master
-                   WHERE sql IS NOT NULL ORDER BY type, tbl_name, sql"
-    for t in repos changesets changeset_parents repo_changesets refs trees git_import history_nodes; do
-      echo "$t $(sqlite3 "$db" "SELECT count(*) FROM $t" 2> /dev/null || echo absent)"
-    done
-  } | sort
-}
 
 # build_ref REF DIR: check REF out (a tag or any commit) and build its
 # server and client. The build lives in DIR/target, so one ref's build
 # never sees another's.
-build_ref() {
-  local ref=$1 dir=$2
-  note "checking out $ref"
-  # A previous run's registration of the same path must not block this
-  # one: -f overrides a missing-but-registered worktree.
-  rm -rf "$dir/src"
-  git -C "$ROOT" worktree add -f --detach "$dir/src" "$ref" > /dev/null ||
-    die "step 'checkout $ref' failed"
-  note "building $ref"
-  (cd "$dir/src" && CARGO_TARGET_DIR="$dir/target" cargo build --release --locked --quiet \
-    -p open-scion-server -p open-scion) || die "step 'build $ref' failed"
-}
 
 # make_store REF DIR: a fresh store of REF's version, with the repo of
 # make_repo in it and its ticket key made.
-make_store() {
-  local ref=$1 dir=$2
-  make_repo "$dir/fixture"
-  "$dir/bin/scion-server" --data "$dir/store" import "$dir/fixture/src" \
-    >"$dir/import.out" 2>"$dir/import.log" || {
-    tail -n 5 "$dir/import.log" >&2
-    die "the import of the $ref store failed"
-  }
-  "$dir/bin/scion-server" --data "$dir/store" ticket-key --out "$dir/ticket.key" \
-    >"$dir/ticket.pub" || die "the ticket key of the $ref store failed"
-}
 
 # readback REF DIR: the built store reads back under its own tag's pair
 # (O2): fsck opens the whole store, and a served ls and cat answer with
@@ -395,7 +278,19 @@ stepwise() {
 # guard has the last word: a changed local config fails the run.
 cleanup() {
   local status=$?
-  local ref dir
+  local ref dir log pid
+  # The servers `start` backgrounded die on every exit path, TERM then
+  # KILL: a die between start and stop_one must not orphan one.
+  for log in $(find "$WORK" -name '*.log.pid' 2>/dev/null); do
+    pid=$(cat "$log" 2>/dev/null) || continue
+    kill "$pid" 2>/dev/null || true
+  done
+  sleep 2
+  for log in $(find "$WORK" -name '*.log.pid' 2>/dev/null); do
+    pid=$(cat "$log" 2>/dev/null) || continue
+    kill -9 "$pid" 2>/dev/null || true
+    rm -f "$log"
+  done
   for ref in $tags; do
     dir="$WORK/$(printf '%s' "$ref" | tr -c 'A-Za-z0-9._-' '_')"
     git -C "$ROOT" worktree remove --force "$dir/src" > /dev/null 2>&1 || true
