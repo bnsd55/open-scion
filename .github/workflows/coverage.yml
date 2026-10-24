@@ -456,7 +456,7 @@ jobs:
           # shellcheck disable=SC2086
           if ! "$lcv" report $objects \
             -instr-profile=target/coverage/merged.profdata \
-            --summary-only --fail-under-lines 80 \
+            --summary-only \
             ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
             > target/coverage/report-summary.txt \
             2> target/coverage/report-stderr.txt; then
@@ -475,6 +475,15 @@ jobs:
           echo "functions with mismatched data: $mismatches (assert: 0)"
           if [ "$mismatches" -gt 0 ]; then
             echo "the report dropped $mismatches functions; the number is not the truth"
+            exit 2
+          fi
+          # The 80-line gate, checked here: raw llvm-cov has no
+          # --fail-under-lines flag.
+          total_lines=$(awk '$1 == "TOTAL" {print $10}' \
+            target/coverage/report-summary.txt | tr -d '%')
+          echo "total lines covered: ${total_lines:-none}% (floor 80%)"
+          if [ -z "$total_lines" ] || [ "${total_lines%%.*}" -lt 80 ]; then
+            echo "the total line coverage is under 80"
             exit 2
           fi
           # Guard 2: the Postgres side's lines must be above a floor.
