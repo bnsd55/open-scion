@@ -42,11 +42,11 @@ document landed on.
 | Finding | Evidence | Status |
 | --- | --- | --- |
 | Protocol reads are length-capped before `read_to_end` | `crates/scion-proto/src/runtime/auth/mod.rs:352`, cap `MAX_CHECKED_FILE = 1 MiB` at `:278` | bounded — ceiling: 1 MiB per checked read, `cap + 1` then refused; `docs/protocol-v1.md` states the message size limits |
-| One unary reply can aggregate a whole directory or changeset past the per-object memory budget (`whole_share` charges by encoded size, the aggregate is uncapped) | `crates/scion-server/src/service.rs:485,935` | open |
-| Slow clients can pin large unary replies outside the memory accounting | `crates/scion-server/src/service.rs` (`into_server`) | open |
+| One unary reply can aggregate a whole directory or changeset past the per-object memory budget (`whole_share` charged by encoded size, the aggregate uncapped) | `crates/scion-server/src/service.rs:485` (`whole_share_of`), `:1822` (the changeset's length-only query), `:1986` (`tree_size`) | fixed (#586): the share is taken from a length-only query before the object is built, an object over `MAX_OBJECT_BYTES` is refused before any byte is read, and the share is held for the whole reply (`stream_whole_holding`); the guard is `tests/reply_budget_h2.rs` (`a_client_that_resets_its_unread_replies_frees_the_budget`, which asserts the budget binds at `bodies.len() < 40` and the served reply is whole) |
+| Slow clients can pin large unary replies outside the memory accounting | `crates/scion-server/src/reply.rs` (`REPLY_MEMORY_BUDGET`), `crates/scion-server/src/metrics.rs` (`CountingBody`) | fixed (#586): the reply-memory layer counts every in-flight reply's bytes and refuses new unary replies past the 128 MiB budget; a client that resets its unread replies frees the budget (the guard is the same `tests/reply_budget_h2.rs` test) |
 | `gc` prune reads and deletes in batches of 1,000 rows | `crates/scion-server/src/gc.rs` (`prune_rows`) | fixed (#529 batched the reads and the deletes; the guard is `tests/gc_prune_batch.rs`) |
 | `scn commit` reads a regular file whole into RAM: the size limit is "whatever fits" | `crates/scn/src/cmd/commit.rs` | open |
-| `scn` JSON output silently replaces non-UTF-8 bytes | `crates/scn/src/client.rs:326` | open |
+| `scn` JSON output silently replaces non-UTF-8 bytes | `crates/scn/src/client.rs:328` (`lossy`), `:336` (`put_json_bytes`) | fixed (#576): the lossy text stays, and every non-UTF-8 name or message carries the exact bytes in a sibling `<field>_b64` (standard base64) so scripts can round-trip them; the guard is `crates/scn/tests/json_raw_bytes.rs` (`assert_b64` and the seed suites) |
 | Import batches are time-based per transaction and count-based for blobs | `crates/scion-server/src/import.rs:52` (`TX_BUDGET = 1 s`), `store.rs` (`BlobBatch`) | bounded — ceiling: 1 s of work or one commit per import transaction; `docs/benchmarks.md` records the measured commit size and rate the batches were tuned at |
 
 ## 4. Database loops
@@ -242,11 +242,9 @@ section; its fixes landed as #561. Highlights, with the C50 verdicts:
    open, closed by C54 (§1).
 2. The archive restore's repository-sized RAM hold (§2), and the C60
    Postgres lock-restart runbook + whether `serve` should wait (§2).
-3. The unary reply caps: `whole_share` aggregates and slow-client
-   pinning (§3), `scn commit` whole-file reads (§3), `lossy` JSON (§3).
+3. `scn commit` whole-file reads (§3), open until #582; the unary
+   reply caps and `lossy` JSON closed (#586, #576).
 4. The database-loop sweep: SQL in loops, `ORDER BY`, isolation (§4).
-5. The panic fixes the inventory (§5a) leaves: the worker-spawn
-   `EAGAIN` path, and the flight-leak fix's PR (§5b).
 6. The data-dir default create-vs-refuse question (§6).
 7. The additive contract goldens that enforce the format policies (§7).
 8. Digest pins for the service-container tags (§9).
