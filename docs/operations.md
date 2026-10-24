@@ -753,6 +753,26 @@ Proof: crates/scion-server/tests/restore_bench.rs::a_restore_of_a_stated_store_t
 
 Proof: crates/scion-server/tests/backup.rs::a_backup_taken_while_serving_restores_whole
 
+On Postgres, a restore's staging schema carries a `restore_staging`
+mark from its first transaction until publication, so a restore drops
+only what a restore made: a schema that names a store and no mark is
+refused ("a restore refuses to drop a store it did not make"), never
+dropped. One window sits between a restore's last transaction and the
+rename that publishes its data directory: a restore killed there
+leaves a complete store in the schema with no mark, and the next
+restore at that URL refuses it and names the way out - rename the
+target's `<name>.restoring` directory into place and start a server on
+it, or restore into a new schema.
+
+One warning about that name: a restore's **start** deletes a
+`<name>.restoring` directory beside the target without asking - it is
+the scratch of a run that died mid-replay, never a store. Keep nothing
+under that name, and rename a leftover into place (the way out above)
+before you start the next restore.
+
+Proof: crates/scion-server/tests/archive_attacks.rs::a_restore_at_a_stopped_stores_url_refuses_and_leaves_it_whole (behaviour, no command: the proof arms a crafted archive against a stopped store's own URL, which no guide command reproduces)
+Proof: crates/scion-server/tests/archive_attacks.rs::a_restored_store_does_not_carry_the_mark_and_a_later_restore_refuses (behaviour, no command: the proof replays a zero-repo archive and writes into the restored store, which no guide command reproduces)
+
 ## 4. Upgrades
 
 The schema version lives in the database. On open, a server migrates an

@@ -610,6 +610,14 @@ pub trait MetaTx {
         cs: &[u8],
         limit: usize,
     ) -> Result<Vec<FsckDerivedRow>>;
+
+    /// Removes the restore's staging mark, in the caller's transaction.
+    /// Publication is atomic with this: a store that answers reads
+    /// never carries the mark a later restore would drop it by.
+    /// # Errors
+    ///
+    /// A database error.
+    fn clear_restore_mark(&mut self) -> Result<()>;
 }
 
 /// The row ID of a repository, private to the backend.

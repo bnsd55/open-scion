@@ -385,6 +385,60 @@ jobs:
           SCION_DMW_REQUIRE: "1"
           SCION_DMW_REPLAY: ${{ runner.temp }}/replay-log
 
+  test-restore-ceiling:
+    name: test (restore rss ceiling)
+    needs: tier
+    # The nightly, main and a dispatch only: the fixture is too much
+    # store for a shared machine's shared disk, the guard is release-shaped (a
+    # debug build's own baseline would eat the ceiling), and the
+    # measured peak lands in this job's log. The second step flips the
+    # replay's whole-file mutation lever and refuses a run where the
+    # mutated restore also passes, so the ceiling is never a guard a
+    # whole-history read slips under.
+    # The tier job is pull_request-shaped, so on a dispatch it is
+    # skipped: the ceiling runs anyway, the way lint does.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request' && (needs.tier.result == 'success' || needs.tier.result == 'skipped')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-workspace-crates: true
+      - name: the streamed restore stays under its ceiling
+        run: cargo test --release -p open-scion-server --test archive_restore_stream a_big_restore -- --nocapture
+        env:
+          SCION_TEST_RESTORE_BIG: "1"
+      - name: the whole-file read would not (the guard is not vacuous)
+        # The mutated run must fail for THE CEILING's reason, not any
+        # reason: a compile error or a missing /proc would "fail" the
+        # same way and prove nothing. The output must carry the
+        # ceiling assert's own text - the mutated run measured a peak,
+        # and the peak passed the bound. Any other failure shows the
+        # output and fails the step.
+        run: |
+          if out=$(cargo test --release -p open-scion-server --test archive_restore_stream a_big_restore -- --nocapture 2>&1); then
+            echo "$out"
+            echo "::error::the whole-file mutation passed the ceiling: the guard is vacuous"
+            exit 1
+          fi
+          if ! printf '%s' "$out" | grep -q "passed the ceiling"; then
+            echo "$out"
+            echo "::error::the mutated run failed for a reason the ceiling did not name; the guard proves nothing"
+            exit 1
+          fi
+          printf '%s\n' "$out" | tail -5
+          echo "the whole-file mutation blew the ceiling, as it must"
+        env:
+          SCION_TEST_RESTORE_BIG: "1"
+          SCION_TEST_RESTORE_MUTATION: "whole_file"
+
   # The Postgres majors the support matrix claims (docs/support.md):
   # one native service per major, one matrix row each. The majors are
   # the upstream-supported ones the project claims - checked against

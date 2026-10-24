@@ -959,6 +959,13 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn clear_restore_mark(&mut self) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.clear_restore_mark(),
+            Self::Postgres(pg) => pg.clear_restore_mark(),
+        }
+    }
+
     fn repo_has_blob(&mut self, repo: RepoId, blob: BlobId) -> Result<bool> {
         match self {
             Self::Sqlite(tx) => tx.repo_has_blob(repo, blob),

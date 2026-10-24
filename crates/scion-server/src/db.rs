@@ -1595,6 +1595,11 @@ impl MetaTx for SqliteTx<'_> {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(crate::error::from_sqlite)
     }
+
+    fn clear_restore_mark(&mut self) -> Result<()> {
+        // SQLite has no restore staging mark: the mark is Postgres's.
+        Ok(())
+    }
 }
 /// Commit graphs for tests.
 #[cfg(test)]
