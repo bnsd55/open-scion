@@ -1772,14 +1772,19 @@ mod tests {
     fn a_land_on_a_missing_ref_is_a_recorded_rejection() {
         let f = fixture_shared();
         let cs = f.commit(f.root, &[put("a/x", "A")]);
-        let out = f.lands
-            .land(&f.store, &caller(), &LandRequest {
-                repo: "r".into(),
-                changeset: cs,
-                target_ref: "nope".into(),
-                request_key: "knone".into(),
-                deadline: Deadline::new(Instant::now() + std::time::Duration::from_secs(600)),
-            })
+        let out = f
+            .lands
+            .land(
+                &f.store,
+                &caller(),
+                &LandRequest {
+                    repo: "r".into(),
+                    changeset: cs,
+                    target_ref: "nope".into(),
+                    request_key: "knone".into(),
+                    deadline: Deadline::new(Instant::now() + std::time::Duration::from_secs(600)),
+                },
+            )
             .unwrap();
         assert_eq!(out.state, LandState::Rejected, "{}", out.detail);
         assert!(
