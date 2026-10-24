@@ -170,7 +170,6 @@ CS2=$(grep -Eo '[0-9a-f]{64}' "$WORK/from-mount.out" | tail -n 1)
 # (d) The diff of main against the new changeset: exactly the rename and
 # the delete, two lines.
 diff_out=$("$TIMEOUT" 60 "$BIN/scn" --server "$SERVER" diff main "$CS2")
-echo "$diff_out" | grep -q 'A' || true
 echo "$diff_out" | grep -Eq '^A[^[:alnum:]]*renamed\.txt$' \
   || die "the diff lacks 'A renamed.txt': $diff_out"
 echo "$diff_out" | grep -Eq '^D[^[:alnum:]]*README\.md$' \

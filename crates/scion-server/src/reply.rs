@@ -166,14 +166,18 @@ where
                     let size = response.extensions().get::<ReplySize>().map_or(0, |s| s.0);
                     // Count as the real path does, but leak the permit:
                     // no reset can ever free it.
-                    if size > 0
-                        && let Err(_) = budget
+                    if size > 0 {
+                        match budget
                             .clone()
                             .try_acquire_many_owned(u32::try_from(size).unwrap_or(u32::MAX))
-                    {
-                        return Ok(refusal(
-                            "the server's reply budget is spent; read what you opened",
-                        ));
+                        {
+                            Err(_) => {
+                                return Ok(refusal(
+                                    "the server's reply budget is spent; read what you opened",
+                                ));
+                            }
+                            Ok(permit) => std::mem::forget(permit),
+                        }
                     }
                     let (parts, body) = response.into_parts();
                     Ok(http::Response::from_parts(

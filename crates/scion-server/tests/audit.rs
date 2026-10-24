@@ -1247,10 +1247,44 @@ async fn a_land_with_a_bad_changeset_id_records_nothing() {
 
     // The refusal and its (absent) lines are both before the reply, but
     // the drop's cancelled line - if the code still wrote one - hands
-    // off to a blocking task. Give it a moment, then hold the file to
-    // its promise: nothing about this call is in it.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // off to a blocking task, so no fixed wait bounds it. A later event
+    // that must land does the bounding: the audit's queue is FIFO, so
+    // once a line queued after the refusal is durable, no line the
+    // refusal owed can still be coming. A create_changeset's intent and
+    // its result are such lines; wait for the result, then hold the
+    // file to its promise: nothing about the refused call is in it.
+    {
+        use scion_proto::v1::CreateChangesetRequest;
+        use tokio_stream::once;
+        let root = store.resolve_ref(REPO, "main").unwrap();
+        let mut after = writer(&url, "t-after").await;
+        after
+            .put_blob(once(scion_proto::v1::PutBlobRequest {
+                repo: REPO.into(),
+                data: b"after\n".to_vec(),
+            }))
+            .await
+            .expect("the later upload lands");
+        let blob = store.blobs().put(b"after\n").unwrap();
+        let (bytes, _id) = changeset(vec![root], "docs/after", blob).encode_with_id();
+        after
+            .create_changeset(CreateChangesetRequest {
+                repo: REPO.into(),
+                changeset: bytes,
+            })
+            .await
+            .expect("the later write lands");
+    }
     let lines = read_lines(&audit_path);
+    // The later event's RESULT line is the durable end of the queue:
+    // once it is in the file, no line the refusal owed can follow it.
+    let answered = lines
+        .iter()
+        .any(|line| line["request_id"] == "t-after" && line["outcome"] != "intent");
+    assert!(
+        answered,
+        "the later event's result never landed: the quiesce proves nothing: {lines:?}"
+    );
     assert!(
         land_lines(&lines, "t-bad").is_empty(),
         "a refused land records nothing: {:?}",

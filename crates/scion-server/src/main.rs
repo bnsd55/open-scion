@@ -718,6 +718,28 @@ fn write_gc_metrics_file(path: &Path, report: &gc::Report, took: Duration, dry_r
     }
 }
 
+/// The reply-memory budget the serve command runs with: the compiled
+/// default, or the size the env names. Test-hooks only: the lever tests
+/// spawn a child server and need a budget small enough that parking a
+/// few unread replies binds it (the compiled 128 MiB cannot be bound by
+/// the 256 streams one connection may open). Release builds never read
+/// the env.
+#[cfg(feature = "test-hooks")]
+fn test_reply_budget() -> usize {
+    match std::env::var_os("SCION_TEST_REPLY_BUDGET") {
+        Some(value) => value
+            .to_str()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(scion_server::REPLY_MEMORY_BUDGET),
+        None => scion_server::REPLY_MEMORY_BUDGET,
+    }
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn test_reply_budget() -> usize {
+    scion_server::REPLY_MEMORY_BUDGET
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
@@ -1231,7 +1253,7 @@ async fn serve(
             tls: config.server_tls,
             metrics,
             audit: config.audit,
-            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
+            reply_memory_budget: test_reply_budget(),
         },
         tickets,
         async move {
