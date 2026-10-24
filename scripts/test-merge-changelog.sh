@@ -129,3 +129,27 @@ mkdir "$check/changes"
 printf 'A thing that passes every rule, no front matter, no row\nmarker on the first line, no indent on any line.\n' >"$check/changes/1.fixed.md"
 (cd "$check" && "$here/merge-changelog.sh" --check) >/dev/null
 echo "merge-changelog --check: fixture ok"
+
+# The argument is either --check or a release name: a flag nobody reads
+# ("--dry-run" merged every fragment under "## [--dry-run]" and deleted
+# them, 2026-10-24), a word like v1, or an empty string must be refused
+# with exit 2 and must touch nothing - every fragment and CHANGELOG.md
+# keep the checksum they had.
+args=$(mktemp -d)
+trap 'rm -rf "$work" "$check" "$args"' EXIT
+mkdir "$args/changes"
+printf 'A real fragment, still on the books.\n' >"$args/changes/1.fixed.md"
+printf '## [v0.1.0] - unreleased\n' >"$args/CHANGELOG.md"
+for bad in '--dry-run' 'v1' ''; do
+    before=$(find "$args" -type f | sort | xargs cat | md5)
+    if (cd "$args" && "$here/merge-changelog.sh" "$bad") >/dev/null 2>&1; then
+        echo "the argument [$bad] was accepted; only --check or a release may be" >&2
+        exit 1
+    fi
+    after=$(find "$args" -type f | sort | xargs cat | md5)
+    if [ "$before" != "$after" ]; then
+        echo "the argument [$bad] touched files before its refusal" >&2
+        exit 1
+    fi
+done
+echo "merge-changelog arguments: fixture ok"
