@@ -57,8 +57,6 @@ jobs:
     name: coverage, the default backend
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    env:
-      PROOF_INJECTION: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -200,19 +198,6 @@ jobs:
           # counters could never match (C65's 1,221). The tar carries
           # the unit paths target/debug/... so the report reads them
           # where a build would have put them.
-          # PROOF-INJECTION (red proof, reverted in the PR head): a
-          # source change after the tests ran desyncs the units from
-          # the profiles; the report must drop the shifted functions
-          # and the gate must refuse. If this run goes green, the
-          # assert is decoration.
-          if [ -n "${PROOF_INJECTION:-}" ]; then
-            sed -i '1i // proof injection: desync the units from the profiles' crates/scion-server/src/lib.rs
-            # The measure's own build phase, verbatim: the wrapper
-            # around nextest died of a runner-side SIGTERM; plain
-            # nextest is what the build phase above already survived.
-            LLVM_PROFILE_FILE=/dev/null nice -n 19 cargo nextest run \
-              --workspace --no-run
-          fi
           # shellcheck disable=SC2046
           tar czf units-sqlite.tgz $(find target/debug -type f -perm -u+x ! -name '*.d' ! -name '*.rlib' ! -name '*.so')
 
