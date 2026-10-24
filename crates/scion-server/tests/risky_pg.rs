@@ -47,12 +47,10 @@ fn skip_on_sqlite() -> bool {
 /// A marker naming Postgres and the store `uuid`: the file an open
 /// writes into a served data directory.
 fn write_marker(data: &Path, uuid: [u8; 16]) {
-    let hex: String = uuid.iter().fold(String::new(), |a, b| a + &format!("{b:02x}"));
-    std::fs::write(
-        data.join("backend"),
-        format!("postgres\n{hex}\n"),
-    )
-    .unwrap();
+    let hex: String = uuid
+        .iter()
+        .fold(String::new(), |a, b| a + &format!("{b:02x}"));
+    std::fs::write(data.join("backend"), format!("postgres\n{hex}\n")).unwrap();
 }
 
 #[test]
