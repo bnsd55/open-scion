@@ -474,6 +474,9 @@ jobs:
           mismatches=$(grep -oE '[0-9]+ functions have mismatched data' \
             target/coverage/report-stderr.txt | grep -oE '[0-9]+' | head -1 || true)
           mismatches=${mismatches:-0}
+          echo "profraw files: $(find target/coverage -maxdepth 1 -name "*.profraw" | wc -l)"
+          echo "merged profdata bytes: $(wc -c < target/coverage/merged.profdata)"
+          grep -m2 '^TOTAL' target/coverage/report-summary.txt || echo "(no TOTAL row)"
           echo "functions with mismatched data: $mismatches (assert: 0)"
           if [ "$mismatches" -gt 0 ]; then
             echo "the report dropped $mismatches functions; the number is not the truth"
@@ -512,3 +515,13 @@ jobs:
               exit 1
             fi
           done < <(sed 's/^[[:space:]]*//; s/#.*//; s/[[:space:]]*$//' scripts/coverage-exclusions.txt | grep -v '^$')
+
+      - name: the report, kept for the record
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gate-report
+          path: |
+            target/coverage/report-summary.txt
+            target/coverage/report-stderr.txt
+          if-no-files-found: ignore
