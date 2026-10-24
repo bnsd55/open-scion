@@ -87,6 +87,7 @@ async fn server() -> (
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::default(),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         Some(keys.clone().into()),
         async {
@@ -322,6 +323,7 @@ async fn server_of_readme() -> (
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::default(),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         Some(keys.clone().into()),
         async {
@@ -561,6 +563,7 @@ async fn tiers() -> (Tiers, tokio::sync::oneshot::Sender<()>, tempfile::TempDir)
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::default(),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         Some(keys.clone().into()),
         async {

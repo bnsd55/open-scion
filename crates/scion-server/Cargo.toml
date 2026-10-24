@@ -61,6 +61,9 @@ tokio-postgres-rustls = "0.14"
 test-hooks = []
 
 [dev-dependencies]
+# The h2-level proof of the reply-memory budget's release on a reset:
+# only a raw HTTP/2 client can open a call and reset it unread.
+h2 = "0.4"
 open-scion-server = { path = ".", features = ["test-hooks"] }
 # The ledger's own hash, on purpose not the store's BLAKE3 (#377).
 sha2 = "0.11.1"

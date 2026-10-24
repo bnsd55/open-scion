@@ -1,0 +1,61 @@
+name: backup-n1
+
+on:
+  # The drill runs on its own file, never on pull_request: the backup
+  # and rollback paths it exercises are the store-upgrade script's and
+  # the backup suites', and those prove themselves in their own lanes.
+  # Weekly, so the pinned N-1 ref cannot rot quietly.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      n1:
+        description: "the N-1 ref: a pinned main SHA before v0.1.0, the release tag after"
+        required: false
+        type: string
+        # main at the drill's birth (2026-10-21). When v0.1.0 is tagged,
+        # this default becomes the tag and the script never changes.
+        default: "a5af1f9cf6e035b8e1efdfb8014c9525fbfe911f"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  drill:
+    name: the N-1 restore and rollback drill
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The whole history: the N-1 ref is a commit of it, and the
+          # builder's worktree needs it.
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: the work guard
+        run: scripts/test-backup-n1-work.sh
+      - name: the drill
+        env:
+          # The dispatch input, or the pinned default on a schedule
+          # trigger: there the inputs context is empty and the default
+          # does not apply, so the pin is named here once for both.
+          STORE_UPGRADE_TAGS: ${{ inputs.n1 || 'a5af1f9cf6e035b8e1efdfb8014c9525fbfe911f' }}
+        run: |
+          WORK="$RUNNER_TEMP/work" scripts/backup-n1.sh
+      - name: the drill's logs on a failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b7e2b8b40452f9df406618471f36d1 # v4.6.2
+        with:
+          name: backup-n1-logs
+          path: ${{ runner.temp }}/work/**/*.log
+          retention-days: 7
+          if-no-files-found: ignore

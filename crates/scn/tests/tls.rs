@@ -179,6 +179,7 @@ async fn serve_tls(certs: &TestCerts, shutdown: tokio::sync::oneshot::Receiver<(
             land_stale_secs: 1 << 40,
             tls: Some(tls),
             metrics: Arc::default(),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         None,
         async {

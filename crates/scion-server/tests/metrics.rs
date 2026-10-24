@@ -120,6 +120,7 @@ async fn setup() -> (
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: metrics.clone(),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         None,
         async {

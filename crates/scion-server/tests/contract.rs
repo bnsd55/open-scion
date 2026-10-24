@@ -378,6 +378,7 @@ async fn serve(dir: &std::path::Path, store: Backend) -> String {
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: std::sync::Arc::new(scion_server::Metrics::default()),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         Some(std::sync::Arc::clone(&keys)),
         std::future::pending(),
