@@ -207,10 +207,11 @@ jobs:
           # assert is decoration.
           if [ -n "${PROOF_INJECTION:-}" ]; then
             echo '// proof injection: desync the units from the profiles' >> crates/scion-server/src/lib.rs
-            # --no-run is forbidden beside --no-report on v0.9.1; a
-            # zero-match filter forces the same instrumented rebuild.
-            nice -n 19 cargo llvm-cov --no-report nextest run --workspace \
-              -E 'test(zzz_proof_injection_matches_nothing)'
+            # The measure's own build phase, verbatim: the wrapper
+            # around nextest died of a runner-side SIGTERM; plain
+            # nextest is what the build phase above already survived.
+            LLVM_PROFILE_FILE=/dev/null nice -n 19 cargo nextest run \
+              --workspace --no-run
           fi
           # shellcheck disable=SC2046
           tar czf units-sqlite.tgz $(find target/debug -type f -perm -u+x ! -name '*.d' ! -name '*.rlib' ! -name '*.so')
