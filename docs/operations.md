@@ -403,7 +403,9 @@ BLAKE3 digest (never the token itself) and maps each to a principal with
 per-repo read and write rules. Every line is tab-separated, and the columns
 are: the line's kind (`token`, `read`, `write`), the principal, then what
 the line grants - a digest on a `token` line, a repo name on a `read` or
-`write` line:
+`write` line. A `read` or `write` line may carry one more column, a path
+prefix that limits the rule to that folder (`read\tops\tmain\tsrc/a`
+covers `src/a/...`, not `srcx`); without it the line covers the whole repo:
 
 ```sh
 TOK=$(printf %s <SECRET> | ./scion-server hash-token)
