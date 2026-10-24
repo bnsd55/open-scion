@@ -190,6 +190,24 @@ jobs:
           kill "$watcher"
           df -h / | tail -1; free -m | awk 'NR==2'
           du -sh target/coverage; find target/coverage -name '*.profraw' | wc -l
+          echo "the measure's instrumented units:"
+          find target/debug -type f -perm -u+x ! -name '*.d' ! -name '*.rlib' ! -name '*.so' -exec du -ch {} + | tail -1
+          find target/debug -type f -perm -u+x ! -name '*.d' ! -name '*.rlib' ! -name '*.so' | wc -l
+          # The report maps raw counters against these EXACT bytes; a
+          # rebuild in the gate produced per-build mapping hashes the
+          # counters could never match (C65's 1,221). The tar carries
+          # the unit paths target/debug/... so the report reads them
+          # where a build would have put them.
+          # shellcheck disable=SC2046
+          tar czf units-sqlite.tgz $(find target/debug -type f -perm -u+x ! -name '*.d' ! -name '*.rlib' ! -name '*.so')
+
+      - name: upload the measure's units
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-units-sqlite
+          retention-days: 1
+          path: units-sqlite.tgz
+          if-no-files-found: error
 
       - name: upload the measure's profiles
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -346,6 +364,9 @@ jobs:
             -E 'package(open-scion-server) and not test(graph_queries_across_many_merges_answer)' \
             | tee measure-postgres.log
           kill "$watcher"
+          # The report maps these bytes; no rebuild may touch them.
+          # shellcheck disable=SC2046
+          tar czf units-postgres.tgz $(find target/debug -type f -perm -u+x ! -name '*.d' ! -name '*.rlib' ! -name '*.so')
         env:
           SCION_TEST_BACKEND: postgres
           SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
@@ -353,6 +374,13 @@ jobs:
           # ci.yml's postgres job lets them: the container's id is the
           # handle.
           SCION_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
+      - name: upload the measure's units
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-units-postgres
+          retention-days: 1
+          path: units-postgres.tgz
+          if-no-files-found: error
       - name: upload the measure's profiles
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -383,20 +411,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: llvm-tools-preview
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
-        with:
-          tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: coverage-instrumented
-          cache-on-failure: true
-      - run: |
-          curl -fsSL -o /tmp/cargo-llvm-cov.tgz \
-            https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz
-          echo "b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a  /tmp/cargo-llvm-cov.tgz" | sha256sum -c -
-          mkdir -p "$HOME/.local/bin"
-          tar -xzf /tmp/cargo-llvm-cov.tgz -C "$HOME/.local/bin"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: the checked-in exclusions, as one regex
         run: |
           regex=$(sed 's/^[[:space:]]*//; s/#.*//; s/[[:space:]]*$//' scripts/coverage-exclusions.txt \
@@ -404,88 +418,152 @@ jobs:
           if [ -n "$regex" ]; then
             echo "COVERAGE_IGNORE=$regex" >> "$GITHUB_ENV"
           fi
-      - name: lean build settings for the instrumented build
-        run: |
-          mkdir -p .cargo
-          printf '[profile.dev]\ndebug = false\nstrip = true\n\n[profile.test]\ndebug = false\nstrip = true\n' > .cargo/config.toml
-          echo "RUSTFLAGS=-C link-arg=-Wl,--no-keep-memory" >> "$GITHUB_ENV"
-      - name: the profiles of both measures
+      - name: the profiles of both measures, and their units
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: coverage-*
           path: target/coverage
           merge-multiple: true
+      - name: the two measures' units, unpacked where a build would put them
+        run: |
+          # Each tar carries the unit paths target/debug/...; the two
+          # measures built the same workspace with the same flags, so
+          # their units must be the same bytes - the report maps each
+          # job's counters against BOTH jobs' units and the assert
+          # below fails the run when that is not so.
+          mkdir -p target/units-sqlite target/units-postgres
+          tar xzf target/coverage/units-sqlite.tgz -C target/units-sqlite
+          tar xzf target/coverage/units-postgres.tgz -C target/units-postgres
+          echo "sqlite units: $(find target/units-sqlite -type f | wc -l) files, $(du -sh target/units-sqlite | cut -f1)"
+          echo "postgres units: $(find target/units-postgres -type f | wc -l) files, $(du -sh target/units-postgres | cut -f1)"
       - name: the merged report, and the gate
         run: |
           set -o pipefail
-          # The report needs the instrumented binaries, but no test run:
-          # show-env plus a plain build provide them, the two measures'
-          # profiles carry the counts, and the report step merges every
-          # profile in the target dir into the number the gate checks.
-          # The proof below reads its printed list. The target dirs are
-          # pinned after show-env, absolute, so the merge looks where the
-          # download put the profiles and nowhere else.
-          # shellcheck disable=SC1090
-          source <(cargo llvm-cov show-env --sh)
-          export CARGO_LLVM_COV_TARGET_DIR="$PWD/target/coverage"
-          export CARGO_TARGET_DIR="$PWD/target/coverage"
-          # The gate rebuilds the exact compilation units the measures
-          # built: `cargo test --no-run` compiles the lib in test mode
-          # and every integration test (what nextest builds too), which
-          # plain `cargo build --tests` does not - the unit-test
-          # functions it leaves out were the 1221 "functions have
-          # mismatched data" that no amount of profile hygiene removed.
-          LLVM_PROFILE_FILE=/dev/null nice -n 19 cargo test \
-            --workspace --no-run
-          cargo llvm-cov report --summary-only --fail-under-lines 80 \
-            ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
-            2> target/coverage/report-stderr.txt \
-            | tee target/coverage/report-summary.txt
-          # Guard 1: counters the report could not map are dropped
-          # silently into a warning. That is how the split lost the
-          # whole Postgres side while the total read 84.86% (run
-          # 39932392151: "794 functions have mismatched data", pg.rs
-          # 6%). One mapping flavor and discarded build-phase profiles
-          # fix the side the split lost, but the count is not zero:
-          # a constant 1221 functions in the profiles map to no unit
-          # the gate rebuilds, identical across three dispatches
-          # (39956356938, 39959927635, 39965099329). Naming that set
-          # is follow-up. The gate fails when the count rises above
-          # the constant: new unmappable functions are a regression.
-          # A lost side shows in guard 2's floors, not here.
-          # SHORTCUT: the 1,22x are unnamed profile data the report
-          # drops; the constant moves with main's own unit set (1221
-          # across three dispatches, 1226 after main grew by #574 and
-          # the capacity tests), so the ceiling is the constant plus
-          # headroom, not a fixed truth. Upgrade path = name the set
-          # (C65), then lower the ceiling to what is left, ideally 0.
-          mismatch_ceiling=1300
+          # The report maps the two measures' raw counters against THE
+          # EXACT BYTES those tests ran - no rebuild, no recompile, no
+          # second copy of any unit. A rebuild was the whole bug: a
+          # unit's mapping hash is build-specific, so the report could
+          # never match the counters it was given, and silently dropped
+          # them as mismatched data (pg.rs read 6% while its job ran
+          # 635 tests green). With the units in hand the count is zero
+          # by construction, and the assert below holds the line.
+          # -quit, not head: a head-truncated find dies of SIGPIPE, and
+          # pipefail turns that into a failed assignment (exit 141,
+          # reported as 1) before the report ever starts.
+          pd="$(find "$(rustc --print sysroot)" -type f -name llvm-profdata -print -quit)"
+          lcv="$(find "$(rustc --print sysroot)" -type f -name llvm-cov -print -quit)"
+          "$pd" merge -sparse target/coverage/*.profraw \
+            -o target/coverage/merged.profdata
+          # Every unit is a coverage object, passed as a repeated
+          # -object flag. Bare paths would read as source filters: the
+          # report would map the first binary and silently filter the
+          # rest into nothing.
+          objects=()
+          while IFS= read -r f; do objects+=(-object "$f"); done \
+            < <(find target/units-sqlite target/units-postgres -type f | sort)
+          echo "coverage objects: $(( ${#objects[@]} / 2 ))"
+          if ! "$lcv" report "${objects[@]}" \
+            -instr-profile=target/coverage/merged.profdata \
+            --summary-only \
+            --ignore-filename-regex "$ignore_regex" \
+            > target/coverage/report-summary.txt \
+            2> target/coverage/report-stderr.txt; then
+            echo "the report failed; its stderr:"
+            cat target/coverage/report-stderr.txt
+            exit 2
+          fi
+          cat target/coverage/report-stderr.txt
+          # Guard 1: the assert at zero. A mismatch means the report
+          # could not map a counter to the units at hand - the report
+          # lies by omission (its lines read uncovered), so the run
+          # fails rather than prints a number that was never true.
+          # || true: grep exits 1 on no match, which is the SUCCESS case
+          # (nothing dropped); -e would otherwise stop the script here.
           mismatches=$(grep -oE '[0-9]+ functions have mismatched data' \
-            target/coverage/report-stderr.txt | grep -oE '[0-9]+' | head -1)
+            target/coverage/report-stderr.txt | grep -oE '[0-9]+' | head -1 || true)
           mismatches=${mismatches:-0}
-          echo "functions with mismatched data: $mismatches (ceiling $mismatch_ceiling)"
-          if [ "$mismatches" -gt "$mismatch_ceiling" ]; then
-            echo "the report dropped $mismatches functions it could not map, above the known constant"
+          echo "profraw files: $(find target/coverage -maxdepth 1 -name "*.profraw" | wc -l)"
+          echo "merged profdata bytes: $(wc -c < target/coverage/merged.profdata)"
+          grep -m2 '^TOTAL' target/coverage/report-summary.txt || echo "(no TOTAL row)"
+          echo "functions with mismatched data: $mismatches (assert: 0)"
+          if [ "$mismatches" -gt 0 ]; then
+            echo "the report dropped $mismatches functions; the number is not the truth"
+            exit 2
+          fi
+          # Third-party sources stay out of the denominator. The
+          # registry's build.rs files map into the report at 0% - the
+          # measure discards build-phase profiles on purpose - and
+          # nothing under .cargo or rustc's sysroot is ours to cover.
+          # About three points of the total sat on 33 dependency
+          # build.rs files; the exclusions file cannot hold these
+          # patterns (its guard reads tracked paths only), so they
+          # live here, beside the exclusions file's regex.
+          # The denominator is product code only: test files run
+          # almost all of their own lines and would push the percent
+          # up (111 tests/ files read 90.9% on themselves); examples
+          # are demos, not the product; the generated protobuf under
+          # target/.../out/ is prost's output, the checked-in .proto
+          # files are its source. An empty alternative in a regex
+          # matches every path, so the exclusions join only when they
+          # exist.
+          ignore_regex='/tests/|/examples/|/target/debug/build/|/.cargo/registry/|/rustc/'
+          [ -n "$COVERAGE_IGNORE" ] && ignore_regex="$COVERAGE_IGNORE|$ignore_regex"
+          # The machine-checked numbers come from the JSON export: its
+          # fields are named and stable, unlike the text table's column
+          # positions, which move with the branch columns' presence.
+          if ! "$lcv" export "${objects[@]}" \
+            -instr-profile=target/coverage/merged.profdata \
+            --summary-only \
+            --ignore-filename-regex "$ignore_regex" \
+            > target/coverage/report.json; then
+            echo "the export failed"
+            exit 2
+          fi
+          # An over-wide filter would print a number over almost
+          # nothing; the workspace has hundreds of mapped files, so a
+          # report with fewer than 50 is a filter that ate the code.
+          mapped_files=$(jq -r '.data[0].files | length' target/coverage/report.json)
+          echo "mapped source files: ${mapped_files:-none} (floor 50)"
+          if [ -z "$mapped_files" ] || [ "$mapped_files" -lt 50 ]; then
+            echo "the report maps too few files; a filter ate the code"
+            exit 2
+          fi
+          total_lines=$(jq -r '.data[0].totals.lines.percent // "none"' target/coverage/report.json)
+          echo "total lines covered: ${total_lines:-none}% (floor 80%)"
+          case "$total_lines" in none|''|*[!0-9.]*) echo "the total is unreadable; the gate refuses a number it cannot read"; exit 2 ;; esac
+          if [ "${total_lines%%.*}" -lt 80 ]; then
+            echo "the total line coverage is under 80"
             exit 2
           fi
           # Guard 2: the Postgres side's lines must be above a floor.
           # pg.rs carries the Postgres backend's code; a correct merge
           # of both measures' profiles reads it far above half. The
-          # floor is half of the corrected reading (run 39947175543's
-          # gate), well under it, so a half-lost merge still fails.
+          # floor is half of the corrected reading, well under it, so a
+          # half-lost merge still fails.
           pg_floor=45
-          pg_cover=$(awk '$1 == "scion-server/src/pg.rs" {print $10}' \
-            target/coverage/report-summary.txt | tr -d '%')
+          pg_cover=$(jq -r '[.data[0].files[] | select(.filename | endswith("crates/scion-server/src/pg.rs"))][0].summary.lines.percent // "none"' target/coverage/report.json)
           echo "pg.rs lines covered: ${pg_cover:-none}% (floor $pg_floor%)"
-          if [ -z "$pg_cover" ] || [ "${pg_cover%%.*}" -lt "$pg_floor" ]; then
+          case "$pg_cover" in none|''|*[!0-9.]*) echo "pg.rs is unreadable; the Postgres side of the merge may be missing"; exit 2 ;; esac
+          if [ "${pg_cover%%.*}" -lt "$pg_floor" ]; then
             echo "pg.rs is below the floor; the Postgres side of the merge is missing"
             exit 2
           fi
           # The proof the filter applies: no excluded file may appear
-          # in the printed per-file list.
+          # in the export.
           while IFS= read -r pattern; do
-            if grep -qE "$pattern" target/coverage/report-summary.txt; then
+            if grep -qE "$pattern" target/coverage/report.json; then
               echo "the report still shows a file matching the exclusion '$pattern'"
               exit 1
             fi
           done < <(sed 's/^[[:space:]]*//; s/#.*//; s/[[:space:]]*$//' scripts/coverage-exclusions.txt | grep -v '^$')
+
+      - name: the report, kept for the record
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gate-report
+          path: |
+            target/coverage/report-summary.txt
+            target/coverage/report-stderr.txt
+            target/coverage/report.json
+          if-no-files-found: ignore
