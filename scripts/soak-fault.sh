@@ -499,6 +499,13 @@ if [ "$done_kills" -ne "$planned_kills" ]; then
   echo "FAIL: $done_kills of $planned_kills planned kills happened" >&2
   fail=1
 fi
+# A Postgres run that planned restarts but made none did not soak the
+# fault it was armed for: the summary row alone would show it, and
+# nothing would fail (C74 review F1).
+if [ "${SCION_FAULT_PG:-0}" = "1" ] && [ "$PG_RESTARTS" -ne "$done_kills" ]; then
+  echo "FAIL: $PG_RESTARTS of $done_kills kills restarted Postgres" >&2
+  fail=1
+fi
 
 # C3, fsck over the final state.
 if ! fsck_ok; then
