@@ -15,13 +15,19 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # The schedule runs in its own group. A concurrency group keeps one
+  # run in progress and at most one pending run, and a newer queued run
+  # replaces the pending one whatever cancel-in-progress says (GitHub
+  # docs, "Control the concurrency of workflows and jobs"): one group
+  # over the nightly and the pushes to main let any push replace a
+  # nightly that is waiting for the runner, and a busy day could keep
+  # the nightly waiting forever. A nightly that never ran is not a
+  # green night.
+  group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
   # A pull_request run may cancel the run before it (same branch,
   # superseded); a push to main may not: a run in progress finishes
   # and verifies the head it ran on, and while it runs only the
-  # newest push waits — an older pending run is replaced, not run.
-  # A 03:00 schedule and a push to main share one group, and neither
-  # cancels: the nightly waits its turn.
+  # newest push waits - an older pending run is replaced, not run.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Every third-party action is pinned to the commit SHA its version tag
