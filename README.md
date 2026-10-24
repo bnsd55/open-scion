@@ -313,8 +313,9 @@ lives there. Each directory above it must be owned by root or by you, and
 must not be writable by group or others unless it has the sticky bit (as
 `/tmp` has). `scn` checks the same for the socket. The error names the
 directory; `chmod go-w DIR` fixes it. With umask 002 (a private group per
-user), new directories are group-writable, so they are refused until you run
-that. Stop the daemon with Ctrl-C or SIGTERM: it then writes its index, and
+user), a plain mkdir makes a group-writable directory, and it is refused by
+choice (the rule stays fail-closed). Make the directory with
+`install -d -m 0700 DIR`, or run `chmod g-w DIR`. Stop the daemon with Ctrl-C or SIGTERM: it then writes its index, and
 its next start reads that one file instead of every stored object.
 
 A regional cache can also write snapshots, so that a new node's daemon does
@@ -478,6 +479,13 @@ tmpfs disk-full and dm-log-writes steps), `test (postgres)` (Postgres
 
 Requires Rust 1.88 or newer and `protoc` (the Protocol Buffers compiler; for
 example `brew install protobuf` or `apt install protobuf-compiler`).
+
+v0.1.0 is a source release: the binaries of a version build from its
+signed tag (`git checkout <tag>; cargo build --release --locked`). A
+release that ships binaries says so in its release notes, and
+`docs/verify.md` verifies them. An operator upgrading keeps the previous
+release's binaries beside the new ones: a rollback needs them
+(`docs/operations.md`, "Upgrades").
 
 ```sh
 cargo test --workspace

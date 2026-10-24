@@ -62,9 +62,16 @@ A release is cut through one PR from a branch named
    ```
 5. **A clean-checkout build and quick-start smoke.** From a fresh
    clone of the tagged commit, build the workspace and run the
-   README's `Try it` flow end to end.
-6. **The umask-002 run.** Once #302's CI job exists, it runs on the
-   release commit and its green result is part of the release.
+   README's `Try it` flow end to end. The tagged commit is also the
+   operator's source for the binaries (see `docs/operations.md`,
+   "Upgrades"): a source release says so in its notes (the binaries
+   build from this tag: `git checkout <tag>; cargo build --release
+   --locked`); a release that ships binaries says that instead. Either
+   way the notes point the operator at keeping the previous release's
+   binaries beside the new ones, because a rollback needs them.
+6. **The umask-002 run.** #302 is closed by choice: the group-writable
+   rule stays fail-closed and the refusal names the chmod, so the
+   release's umask-002 run proves the refusal, not an exception.
 7. **Benchmark numbers with their provenance.** A number that a
    release note states records the commit it measured, the OS, the
    filesystem, the dataset, the command, and the variance across runs.

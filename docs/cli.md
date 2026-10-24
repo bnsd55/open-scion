@@ -18,7 +18,11 @@ that round-trips the bytes.
 
 ## Global flags and environment variables
 
-Every command takes these flags, before or after the subcommand:
+Every command takes the connection flags (`--server`, `--objects`,
+`--tls-ca`, `--repo`, `--json`) before or after the subcommand. The two
+token flags sit before the subcommand only (they are flags of `scn`
+itself): `scn --token-file FILE cat main:src/lib.rs` parses;
+`scn cat --token-file FILE ...` does not.
 
 | Flag | Environment | Default | Meaning |
 |---|---|---|---|

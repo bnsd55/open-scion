@@ -238,6 +238,16 @@ fn a_no_reader_row_names_the_land_and_dashes_the_reads() {
 }
 
 #[test]
+fn the_caption_pins_the_filesystem_row() {
+    let doc = std::fs::read_to_string(Path::new(DOC)).expect("docs/operations.md exists");
+    let section = capacity_section(&doc);
+    assert!(
+        section.contains("| Filesystem | the filesystem the run measured"),
+        "the caption omits the filesystem row the machine.txt artifact fills"
+    );
+}
+
+#[test]
 fn the_caption_names_both_edges() {
     let doc = std::fs::read_to_string(Path::new(DOC)).expect("docs/operations.md exists");
     let section = capacity_section(&doc);

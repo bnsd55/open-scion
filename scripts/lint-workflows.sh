@@ -78,3 +78,58 @@ for workflow in .github/workflows/*.yml; do
     END { exit bad }
   ' "$workflow" || die "$workflow has a services image without a digest pin"
 done
+
+# One action, one version, everywhere: where an action's pin is a
+# released version (its comment names `vX.Y.Z`), the same owner/repo
+# must appear with one SHA under .github/, and one SHA must carry one
+# version comment. A second version-pinned SHA of the same action is an
+# upgrade that missed a file - the backup-n1.yml upload pinned a SHA
+# that does not exist (a one-character typo of the real v4.6.2), and no
+# run saw it because the workflow had never run. Actions whose SHA pins
+# a branch on purpose (dtolnay's toolchain branches: stable, nightly,
+# the MSRV) carry a ref comment, not a version, and pass. Offline: the
+# pins and the comments are only compared against each other, never
+# against the network.
+python3 - <<'PYEOF'
+import glob, re, sys
+
+pins: dict[str, set[str]] = {}
+comments: dict[str, set[str]] = {}
+for path in sorted(glob.glob(".github/workflows/*.yml")):
+    for line in open(path):
+        m = re.search(r"uses:\s*([^\s@]+)@([0-9a-f]{40})(?:\s*#\s*(\S+))?", line)
+        if not m:
+            continue
+        action, sha, comment = m.group(1), m.group(2), m.group(3)
+        pins.setdefault(action, set()).add(sha)
+        comments.setdefault(f"{action}@{sha}", set()).add(comment)
+
+bad = 0
+versioned = {
+    action: {sha for sha in shas if any(c and c.startswith("v") and c[1].isdigit() for c in comments[f"{action}@{sha}"])}
+    for action, shas in pins.items()
+}
+for action, shas in sorted(versioned.items()):
+    if len(shas) > 1:
+        for sha in sorted(shas):
+            where = [
+                p
+                for p in sorted(glob.glob(".github/workflows/*.yml"))
+                if any(
+                    m.group(1) == action and m.group(2) == sha
+                    for line in open(p)
+                    if (m := re.search(r"uses:\s*([^\s@]+)@([0-9a-f]{40})", line))
+                )
+            ]
+            print(
+                f"lint-workflows: {action} runs with two version pins; "
+                f"{sha} in {','.join(where)}"
+            )
+        bad = 1
+for key, cs in sorted(comments.items()):
+    real = {c for c in cs if c}
+    if len(real) > 1:
+        print(f"lint-workflows: {key} carries the comments {sorted(real)}")
+        bad = 1
+sys.exit(bad)
+PYEOF
