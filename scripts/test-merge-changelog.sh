@@ -90,6 +90,37 @@ if ! diff -u "$work/expected.md" "$work/CHANGELOG.md"; then
     echo "the merged changelog does not match the expected text" >&2
     exit 1
 fi
+
+# A fragment that starts with a front-matter block (a stray "---" first
+# line, the ms: preamble one author added on 2026-10-22) is refused, and
+# the refusal names the file.
+cat >"$work/CHANGELOG.md" <<'EOF'
+# Changelog
+
+## [v0.1.0] - unreleased
+
+### Added
+
+- An existing row.
+EOF
+cat >"$work/changes/14.added.md" <<'EOF'
+---
+ms: "a one-liner that is not a format"
+---
+
+A body that must never merge behind that block.
+EOF
+
+if (cd "$work" && "$here/merge-changelog.sh" v0.1.0) >"$work/out.txt" 2>"$work/err.txt"; then
+    echo "the merge accepted a fragment that starts with ---" >&2
+    exit 1
+fi
+grep -q "changes/14.added.md" "$work/err.txt" || {
+    echo "the refusal does not name the file; it said:" >&2
+    cat "$work/err.txt" >&2
+    exit 1
+}
+
 echo "merge-changelog: fixture ok"
 
 # --check: the same rules, nothing merged. A fragment that fails the
