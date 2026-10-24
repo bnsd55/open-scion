@@ -254,6 +254,88 @@ fn fixture() -> (Git, History) {
     (git, history)
 }
 
+/// A git commit whose date is git's written form of an unknown offset
+/// (`-0000`) cannot read back as itself: zero parses to `+0000`. The
+/// import must refuse it, not store history that differs from its
+/// source without saying so. `git commit-tree` normalizes `-0000` to
+/// `+0000`; fast-import writes the date header verbatim.
+#[test]
+fn an_unknown_timezone_date_is_refused() {
+    let git = Git::init();
+    let mut stream = Vec::new();
+    writeln!(
+        stream,
+        "commit refs/heads/main\ncommitter B <b@x> 1717000000 -0000\ndata 2\nt\nM 100644 inline f\ndata 2\n1\n"
+    )
+    .unwrap();
+    git.run_with(&["fast-import", "--quiet"], &stream);
+    let bad = git.run(&["rev-parse", "main"]);
+    // git really wrote the unknown offset.
+    assert!(
+        git.raw(&["cat-file", "commit", &bad], b"")
+            .windows(5)
+            .any(|w| w == b"-0000"),
+        "the fixture's commit carries -0000"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Backend::open_test_shared(dir.path()).unwrap();
+    let err = try_import(&store, &git, &bad).unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("is not a date git can write"),
+        "the refusal names the date: {text}"
+    );
+}
+
+/// A negative zero on the author line takes the same refusal: both
+/// identities ride `identity()`.
+#[test]
+fn an_unknown_timezone_on_the_author_line_is_refused() {
+    let git = Git::init();
+    let mut stream = Vec::new();
+    writeln!(
+        stream,
+        "commit refs/heads/main\nauthor A <a@x> 1717000000 -0000\ncommitter B <b@x> 1717000000 +0000\ndata 2\nt\nM 100644 inline f\ndata 2\n1\n"
+    )
+    .unwrap();
+    git.run_with(&["fast-import", "--quiet"], &stream);
+    let bad = git.run(&["rev-parse", "main"]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Backend::open_test_shared(dir.path()).unwrap();
+    let err = try_import(&store, &git, &bad).unwrap_err();
+    assert!(
+        err.to_string().contains("is not a date git can write"),
+        "the refusal names the date: {err}"
+    );
+}
+
+/// A real zone with a sign imports: `+0000` and `-0530` both read back
+/// as themselves.
+#[test]
+fn a_signed_zone_imports() {
+    let git = Git::init();
+    let mut stream = Vec::new();
+    writeln!(
+        stream,
+        "commit refs/heads/main\nauthor A <a@x> 1717000000 -0530\ncommitter B <b@x> 1717000000 +0000\ndata 2\nt\nM 100644 inline f\ndata 2\n1\n"
+    )
+    .unwrap();
+    git.run_with(&["fast-import", "--quiet"], &stream);
+    let head = git.run(&["rev-parse", "main"]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Backend::open_test_shared(dir.path()).unwrap();
+    let report = import(&store, &git, &head);
+    let cs = changeset_of(&store, &head);
+    let repo = store.read(|c| c.repo_id("r")).unwrap();
+    let got = store.read(|c| c.get_changeset(repo, cs)).unwrap();
+    // -0530 is -5 h 30 m.
+    assert_eq!(got.author().tz_offset_minutes(), -330);
+    assert_eq!(report.commits, 1);
+}
+
 fn opts(rev: &str) -> ImportOptions {
     ImportOptions {
         rev: rev.to_owned(),

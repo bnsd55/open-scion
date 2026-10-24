@@ -49,7 +49,7 @@ pub(crate) mod vfs;
 pub mod test_support {
     /// A client pre-set for tests: the object roots of a running server.
     pub mod client {
-        pub use crate::client::test_objects;
+        pub use crate::client::{set_put_pause, test_objects};
     }
     /// The mount session file, so a test stages what
     /// `scn commit --from-mount` reads.
