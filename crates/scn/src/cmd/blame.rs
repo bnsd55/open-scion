@@ -6,7 +6,7 @@ use scion_proto::v1::BlameRequest;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
-use crate::client::{Ctx, id_from, lossy, split_spec};
+use crate::client::{Ctx, id_from, lossy, put_json_bytes, split_spec};
 use crate::cmd::read::{identity_json, opt_id, read_stream};
 use crate::outln;
 
@@ -221,14 +221,18 @@ fn ranges_json(lines: &[(ChangesetId, u32)], sources: &Sources) -> Vec<Value> {
         .into_iter()
         .map(|(start_line, id, origin_line, line_count)| {
             let source = sources.get(&id);
-            json!({
+            let mut value = json!({
                 "start_line": start_line,
                 "line_count": line_count,
                 "changeset": id.to_string(),
                 "path": source.map(|(_, path)| lossy(path)),
                 "origin_line": origin_line,
                 "author": source.map(|(author, _)| identity_json(author)),
-            })
+            });
+            if let Some((_, path)) = &source {
+                put_json_bytes(&mut value, "path", path);
+            }
+            value
         })
         .collect()
 }
