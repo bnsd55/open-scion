@@ -98,6 +98,7 @@ async fn served() -> (
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::clone(&metrics),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         Some(Arc::new(Keys::generate())),
         async {

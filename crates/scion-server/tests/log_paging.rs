@@ -80,6 +80,7 @@ async fn serve(store: Backend, dir: &std::path::Path) -> String {
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::new(Metrics::default()),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         None,
         std::future::pending(),

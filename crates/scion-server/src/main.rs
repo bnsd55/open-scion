@@ -1231,6 +1231,7 @@ async fn serve(
             tls: config.server_tls,
             metrics,
             audit: config.audit,
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         tickets,
         async move {
