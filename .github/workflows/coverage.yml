@@ -469,8 +469,10 @@ jobs:
           # could not map a counter to the units at hand - the report
           # lies by omission (its lines read uncovered), so the run
           # fails rather than prints a number that was never true.
+          # || true: grep exits 1 on no match, which is the SUCCESS case
+          # (nothing dropped); -e would otherwise stop the script here.
           mismatches=$(grep -oE '[0-9]+ functions have mismatched data' \
-            target/coverage/report-stderr.txt | grep -oE '[0-9]+' | head -1)
+            target/coverage/report-stderr.txt | grep -oE '[0-9]+' | head -1 || true)
           mismatches=${mismatches:-0}
           echo "functions with mismatched data: $mismatches (assert: 0)"
           if [ "$mismatches" -gt 0 ]; then
