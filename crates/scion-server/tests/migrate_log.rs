@@ -117,14 +117,32 @@ fn an_open_logs_what_migrated_and_nothing_when_nothing_did() {
         return;
     }
     init_log();
-    // An open at the current schema says nothing: create a store (its
-    // climb would be the other half of this test), then read the log
-    // around a second open of the same directory.
+    // A fresh store's first open says it created the schema, and no
+    // migration line: nothing was there for a migration to move, and a
+    // line that says it migrated would be false.
     let dir = tempfile::tempdir().unwrap();
+    let fresh_at = mark();
     {
         let store = Backend::open_test(dir.path()).unwrap();
         drop(store);
     }
+    let fresh = since(fresh_at);
+    assert_eq!(
+        fields(&fresh, "the metadata schema was created", "to_version="),
+        vec![SQLITE_TOP],
+        "a fresh store says what it created; the log was:\n{fresh}"
+    );
+    assert!(
+        !fresh.contains("migrat"),
+        "a fresh store's story is a creation, not a migration: {fresh}"
+    );
+    assert!(
+        !fresh.contains("removed temp folders"),
+        "a fresh store's tmp held nothing to sweep: {fresh}"
+    );
+
+    // An open at the current schema says nothing: read the log around a
+    // second open of the same directory.
     let quiet_at = mark();
     let store = Backend::open_test(dir.path()).unwrap();
     drop(store);
@@ -132,6 +150,24 @@ fn an_open_logs_what_migrated_and_nothing_when_nothing_did() {
     assert!(
         !quiet.contains("migrat"),
         "an open at the current schema says nothing: {quiet}"
+    );
+
+    // A leftover temp folder is still reported, for what it is: the
+    // folder's process is gone - a crash's or a one-shot run's. The
+    // sweep cannot tell which, and the line does not claim to.
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir(tmp.join("dead-folder")).unwrap();
+    let leftover_at = mark();
+    let store = Backend::open_test(dir.path()).unwrap();
+    drop(store);
+    let leftover = since(leftover_at);
+    assert!(
+        leftover.contains("removed temp folders whose process is gone"),
+        "a folder whose process is gone is reported: {leftover}"
+    );
+    assert!(
+        !tmp.join("dead-folder").exists(),
+        "the leftover's folder is gone"
     );
 
     // An open of an older store tells the whole story: from version,
@@ -184,11 +220,12 @@ fn an_open_logs_what_migrated_and_nothing_when_nothing_did() {
     );
 }
 
-/// The Postgres leg: a fresh database climbs from version 0, and the
-/// same three line shapes carry it. Skips itself without the test
-/// backend's environment, as the parity job sets it.
+/// The Postgres leg: a fresh database says it created the schema - the
+/// same honest one-liner as SQLite's - and nothing about migrating.
+/// Skips itself without the test backend's environment, as the parity
+/// job sets it.
 #[test]
-fn a_postgres_open_of_a_fresh_database_logs_the_same_story() {
+fn a_postgres_open_of_a_fresh_database_logs_its_creation() {
     init_log();
     if std::env::var("SCION_TEST_BACKEND").as_deref() != Ok("postgres") {
         return;
@@ -200,27 +237,12 @@ fn a_postgres_open_of_a_fresh_database_logs_the_same_story() {
     let log = since(at);
 
     assert_eq!(
-        fields(&log, "migrating the metadata schema", "from_version="),
-        vec![0],
-        "a fresh database starts from nothing; the log was:\n{log}"
-    );
-    let steps = fields(
-        &log,
-        "the metadata schema migrated one step",
-        "from_version=",
-    );
-    assert_eq!(
-        steps,
-        (0..POSTGRES_TOP).collect::<Vec<_>>(),
-        "one step per version, in order"
-    );
-    assert_eq!(
-        fields(&log, "the metadata schema migrated one step", "elapsed_ms=").len(),
-        POSTGRES_TOP as usize
-    );
-    assert_eq!(
-        fields(&log, "the metadata migration is done", "to_version="),
+        fields(&log, "the metadata schema was created", "to_version="),
         vec![POSTGRES_TOP],
-        "the Postgres metadata schema is at this build's version"
+        "a fresh database says what it created; the log was:\n{log}"
+    );
+    assert!(
+        !log.contains("migrat"),
+        "a fresh database's story is a creation, not a migration: {log}"
     );
 }

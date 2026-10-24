@@ -834,6 +834,24 @@ pub fn migrate(db: &Connection, target: u32) -> Result<Option<(u32, u32)>> {
     if version == target {
         return Ok(None);
     }
+    // A fresh database (version 0) is created, not migrated: nothing is
+    // there for a migration to move, so the log says what happened once,
+    // and the per-step lines stay for a real migration of real data.
+    if version == 0 {
+        for (to, sql) in (1..=target).zip(MIGRATIONS) {
+            let tx = db.unchecked_transaction().map_err(from_sqlite)?;
+            tx.execute_batch(sql).map_err(from_sqlite)?;
+            if to == 4 {
+                // SQL cannot read the blob IDs inside changeset bytes.
+                crate::db::fill_repo_blobs(&tx)?;
+            }
+            tx.pragma_update(None, "user_version", to)
+                .map_err(from_sqlite)?;
+            tx.commit().map_err(from_sqlite)?;
+        }
+        tracing::info!(to_version = target, "the metadata schema was created");
+        return Ok(None);
+    }
     tracing::info!(
         from_version = version,
         to_version = target,
@@ -1097,7 +1115,10 @@ impl Blobs {
             }
         }
         if removed > 0 {
-            tracing::info!(removed, "removed temp folders that a crash left behind");
+            tracing::info!(
+                removed,
+                "removed temp folders whose process is gone: a crash's leftovers, or a one-shot run's"
+            );
         }
         Ok(())
     }
