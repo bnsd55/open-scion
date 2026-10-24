@@ -500,10 +500,13 @@ jobs:
           # live here, beside the exclusions file's regex.
           # The denominator is product code only: test files run
           # almost all of their own lines and would push the percent
-          # up (111 tests/ files read 90.9% on themselves). An empty
-          # alternative in a regex matches every path, so the
-          # exclusions join only when they exist.
-          ignore_regex='/tests/|/.cargo/registry/|/rustc/'
+          # up (111 tests/ files read 90.9% on themselves); examples
+          # are demos, not the product; the generated protobuf under
+          # target/.../out/ is prost's output, the checked-in .proto
+          # files are its source. An empty alternative in a regex
+          # matches every path, so the exclusions join only when they
+          # exist.
+          ignore_regex='/tests/|/examples/|/target/debug/build/|/.cargo/registry/|/rustc/'
           [ -n "$COVERAGE_IGNORE" ] && ignore_regex="$COVERAGE_IGNORE|$ignore_regex"
           # The machine-checked numbers come from the JSON export: its
           # fields are named and stable, unlike the text table's column
