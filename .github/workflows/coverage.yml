@@ -499,9 +499,10 @@ jobs:
             echo "the export failed"
             exit 2
           fi
-          total_lines=$(jq -r '.data[0].totals.lines.percent' target/coverage/report.json)
+          total_lines=$(jq -r '.data[0].totals.lines.percent // "none"' target/coverage/report.json)
           echo "total lines covered: ${total_lines:-none}% (floor 80%)"
-          if [ -z "$total_lines" ] || [ "${total_lines%%.*}" -lt 80 ]; then
+          case "$total_lines" in none|''|*[!0-9.]*) echo "the total is unreadable; the gate refuses a number it cannot read"; exit 2 ;; esac
+          if [ "${total_lines%%.*}" -lt 80 ]; then
             echo "the total line coverage is under 80"
             exit 2
           fi
@@ -511,9 +512,10 @@ jobs:
           # floor is half of the corrected reading, well under it, so a
           # half-lost merge still fails.
           pg_floor=45
-          pg_cover=$(jq -r '[.data[0].files[] | select(.filename | endswith("scion-server/src/pg.rs"))][0].totals.lines.percent' target/coverage/report.json)
+          pg_cover=$(jq -r '[.data[0].files[] | select(.filename | endswith("crates/scion-server/src/pg.rs"))][0].summary.lines.percent // "none"' target/coverage/report.json)
           echo "pg.rs lines covered: ${pg_cover:-none}% (floor $pg_floor%)"
-          if [ -z "$pg_cover" ] || [ "${pg_cover%%.*}" -lt "$pg_floor" ]; then
+          case "$pg_cover" in none|''|*[!0-9.]*) echo "pg.rs is unreadable; the Postgres side of the merge may be missing"; exit 2 ;; esac
+          if [ "${pg_cover%%.*}" -lt "$pg_floor" ]; then
             echo "pg.rs is below the floor; the Postgres side of the merge is missing"
             exit 2
           fi
