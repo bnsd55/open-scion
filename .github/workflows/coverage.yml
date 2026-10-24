@@ -488,13 +488,18 @@ jobs:
             echo "the report dropped $mismatches functions; the number is not the truth"
             exit 2
           fi
-          # The 80-line gate, checked here: raw llvm-cov has no
-          # --fail-under-lines flag.
-          # $7 = the lines-cover column in raw llvm-cov's table
-          # ($10 was cargo-llvm-cov's layout, the wrapper had one more
-          # column).
-          total_lines=$(awk '$1 == "TOTAL" {print $7}' \
-            target/coverage/report-summary.txt | tr -d '%')
+          # The machine-checked numbers come from the JSON export: its
+          # fields are named and stable, unlike the text table's column
+          # positions, which move with the branch columns' presence.
+          if ! "$lcv" export "${objects[@]}" \
+            -instr-profile=target/coverage/merged.profdata \
+            --summary-only \
+            ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
+            > target/coverage/report.json; then
+            echo "the export failed"
+            exit 2
+          fi
+          total_lines=$(jq -r '.data[0].totals.lines.percent' target/coverage/report.json)
           echo "total lines covered: ${total_lines:-none}% (floor 80%)"
           if [ -z "$total_lines" ] || [ "${total_lines%%.*}" -lt 80 ]; then
             echo "the total line coverage is under 80"
@@ -506,17 +511,16 @@ jobs:
           # floor is half of the corrected reading, well under it, so a
           # half-lost merge still fails.
           pg_floor=45
-          pg_cover=$(awk '$1 == "scion-server/src/pg.rs" {print $7}' \
-            target/coverage/report-summary.txt | tr -d '%')
+          pg_cover=$(jq -r '[.data[0].files[] | select(.filename | endswith("scion-server/src/pg.rs"))][0].totals.lines.percent' target/coverage/report.json)
           echo "pg.rs lines covered: ${pg_cover:-none}% (floor $pg_floor%)"
           if [ -z "$pg_cover" ] || [ "${pg_cover%%.*}" -lt "$pg_floor" ]; then
             echo "pg.rs is below the floor; the Postgres side of the merge is missing"
             exit 2
           fi
           # The proof the filter applies: no excluded file may appear
-          # in the printed per-file list.
+          # in the export.
           while IFS= read -r pattern; do
-            if grep -qE "$pattern" target/coverage/report-summary.txt; then
+            if grep -qE "$pattern" target/coverage/report.json; then
               echo "the report still shows a file matching the exclusion '$pattern'"
               exit 1
             fi
@@ -530,4 +534,5 @@ jobs:
           path: |
             target/coverage/report-summary.txt
             target/coverage/report-stderr.txt
+            target/coverage/report.json
           if-no-files-found: ignore
