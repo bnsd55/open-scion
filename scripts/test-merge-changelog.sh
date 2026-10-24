@@ -141,12 +141,18 @@ mkdir "$args/changes"
 printf 'A real fragment, still on the books.\n' >"$args/changes/1.fixed.md"
 printf '## [v0.1.0] - unreleased\n' >"$args/CHANGELOG.md"
 for bad in '--dry-run' 'v1' ''; do
-    before=$(find "$args" -type f | sort | xargs cat | md5)
-    if (cd "$args" && "$here/merge-changelog.sh" "$bad") >/dev/null 2>&1; then
+    before=$(find "$args" -type f | sort | xargs cat | cksum)
+    st=0
+    (cd "$args" && "$here/merge-changelog.sh" "$bad") >/dev/null 2>&1 || st=$?
+    if [ "$st" -eq 0 ]; then
         echo "the argument [$bad] was accepted; only --check or a release may be" >&2
         exit 1
     fi
-    after=$(find "$args" -type f | sort | xargs cat | md5)
+    if [ "$st" -ne 2 ]; then
+        echo "the argument [$bad] failed with status $st, not the usage exit 2" >&2
+        exit 1
+    fi
+    after=$(find "$args" -type f | sort | xargs cat | cksum)
     if [ "$before" != "$after" ]; then
         echo "the argument [$bad] touched files before its refusal" >&2
         exit 1
