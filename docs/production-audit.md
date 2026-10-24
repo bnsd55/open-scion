@@ -233,7 +233,7 @@ section; its fixes landed as #561. Highlights, with the C50 verdicts:
 | --- | --- | --- |
 | The workspace and the three fuzz lockfiles are committed | `Cargo.lock`, `crates/*/fuzz/Cargo.lock` (4 files) | bounded — ceiling: exactly 4 lockfiles, all committed; the release smoke and the CI builds run `--locked` |
 | Every third-party action is pinned to a commit SHA with the version in a comment | `.github/workflows/ci.yml:24` and every workflow | fixed (pinned at introduction; the scorecard workflow watches for drift) |
-| Service containers carry version tags, not mutable `latest` | `ci.yml:316-317` (the matrix `postgres:16.15/17.11/18.6`), `ci.yml:538,629` and `bench.yml:71` (`postgres:17.11`) | bounded — ceiling: 3 version tags, no `latest`; a digest pin per tag is the upgrade, tracked open |
+| Service containers carry version tags, not mutable `latest` | `ci.yml` (the matrix `postgres:16.15/17.11/18.6`, each `@sha256:`-pinned in its include entry), `ci.yml` and `bench.yml` (`postgres:17.11@sha256:...`) | fixed — every services image pins its tag's multi-arch index; `scripts/lint-workflows.sh` fails a services `image:` line without `@sha256:` |
 | Artifacts are built from the protected release tag only | `docs/RELEASING.md`, `docs/verify.md`, `docs/slsa.md` | fixed by design (the release workflow builds on the tag; the provenance doc states the SLSA level) |
 
 ## The open list (the v1.0 blockers this audit leaves)

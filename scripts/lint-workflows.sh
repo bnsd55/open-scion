@@ -58,3 +58,23 @@ note "actionlint $($ACTIONLINT -version | head -1 | cut -d' ' -f2) over .github/
 for workflow in .github/workflows/*.yml; do
   grep -q '^permissions:' "$workflow" || die "$workflow has no top-level permissions: block"
 done
+
+# Every services image carries a digest pin: a tag can move to new
+# bytes, a digest cannot (production-audit.md section 9). The pin is
+# `image: <name>:<tag>@sha256:<digest of the multi-arch index>`; the
+# matrix jobs carry the digest in their include entries. An `image:`
+# line inside a `services:` block without `@sha256:` fails here, on
+# the PR that carries it.
+for workflow in .github/workflows/*.yml; do
+  awk -v w="$workflow" '
+    /^[^ #]/            { in_services = 0 }   # a top-level key leaves the job
+    /^  [^ ]/           { in_services = 0 }   # a job id or a sibling of one
+    /^    [^ ]/         { if ($0 !~ /^    services: *$/) in_services = 0 }  # a sibling of services
+    /^    services: *$/ { in_services = 1 }
+    in_services && /^[ ]*image: / && $0 !~ /@sha256:/ {
+      printf "lint-workflows: %s: a services image without a digest pin: %s\n", w, $0
+      bad = 1
+    }
+    END { exit bad }
+  ' "$workflow" || die "$workflow has a services image without a digest pin"
+done

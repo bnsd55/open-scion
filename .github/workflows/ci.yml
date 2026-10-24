@@ -401,9 +401,21 @@ jobs:
         # the tier rule above); the 16 and 18 cells are best effort and
         # run nightly and on a release candidate's dispatch.
         version: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && fromJSON('["16.15", "17.11", "18.6"]') || fromJSON('["17.11"]') }}
+        # The digest pins. A tag can move to new bytes; a digest cannot
+        # (production-audit.md section 9). Each include entry pins the
+        # multi-arch image index of its tag, fetched live from the
+        # registry (the runners are x64 and arm64; both are in the
+        # index). Bump a version together with its digest line.
+        include:
+          - version: 16.15
+            digest: 9e2cf6287f25c3151f4c9421ccce2b17f3e60061c111a29165e0d2cdd9ff0a97
+          - version: 17.11
+            digest: b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+          - version: 18.6
+            digest: edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6
     services:
       postgres:
-        image: postgres:${{ matrix.version }}
+        image: postgres:${{ matrix.version }}@sha256:${{ matrix.digest }}
         env:
           POSTGRES_PASSWORD: scion
           POSTGRES_DB: scion
@@ -630,7 +642,7 @@ jobs:
       # the blob files take the cuts, the metadata sits in the database's
       # own WAL, and the run proves the store reads what the cut left.
       postgres:
-        image: postgres:17.11
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
         env:
           POSTGRES_PASSWORD: scion
           POSTGRES_DB: scion
@@ -721,7 +733,7 @@ jobs:
       # the marker and the blob files sit on the NFS mount, the metadata
       # sits in the database, and the run proves the mount of that half.
       postgres:
-        image: postgres:17.11
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
         env:
           POSTGRES_PASSWORD: scion
           POSTGRES_DB: scion
