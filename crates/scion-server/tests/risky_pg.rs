@@ -74,8 +74,9 @@ fn a_served_database_refuses_a_markerless_directory_and_a_mismatched_marker() {
     // names a store the directory does not know, and the schema has
     // served repos, so the open refuses instead of adopting it.
     let dir2 = tempfile::tempdir().unwrap();
-    let Ok(refused) = Backend::open(dir2.path(), Some(&url), None) else {
-        panic!("a served database refuses a marker-less directory: {e:#}")
+    let Err(refused) = Backend::open(dir2.path(), Some(&url), None)
+    else {
+        panic!("a served database refuses a marker-less directory")
     };
     assert!(
         matches!(refused, scion_server::Error::FailedPrecondition(_)),
@@ -90,8 +91,9 @@ fn a_served_database_refuses_a_markerless_directory_and_a_mismatched_marker() {
     // refusal, before any row of this directory is named.
     let dir3 = tempfile::tempdir().unwrap();
     write_marker(dir3.path(), [0xaa; 16]);
-    let Ok(refused) = Backend::open(dir3.path(), Some(&url), None) else {
-        panic!("a mismatched marker refuses the open: {e:#}")
+    let Err(refused) = Backend::open(dir3.path(), Some(&url), None)
+    else {
+        panic!("a mismatched marker refuses the open")
     };
     let text = format!("{refused:#}");
     assert!(
@@ -110,8 +112,9 @@ fn an_offhost_plain_url_is_refused_before_it_connects() {
     // is TEST-NET-3: nothing answers there, so a connect would hang -
     // the test would time out if the check did not fire first.
     let dir = tempfile::tempdir().unwrap();
-    let Ok(refused) = Backend::open(dir.path(), Some("postgres://203.0.113.7/scion"), None) else {
-        panic!("an off-host plain URL refuses: {e:#}")
+    let Err(refused) = Backend::open(dir.path(), Some("postgres://203.0.113.7/scion"), None)
+    else {
+        panic!("an off-host plain URL refuses")
     };
     let text = format!("{refused:#}");
     assert!(
@@ -123,8 +126,9 @@ fn an_offhost_plain_url_is_refused_before_it_connects() {
     // check and fails on the connect instead (nothing listens there),
     // which must NOT be the encryption refusal.
     let dir = tempfile::tempdir().unwrap();
-    let Ok(refused) = Backend::open(dir.path(), Some("postgres://127.0.0.1:1/scion"), None) else {
-        panic!("a closed loopback port still refuses, on the connect: {e:#}")
+    let Err(refused) = Backend::open(dir.path(), Some("postgres://127.0.0.1:1/scion"), None)
+    else {
+        panic!("a closed loopback port still refuses, on the connect")
     };
     assert!(
         !format!("{refused:#}").contains("must be encrypted"),
@@ -157,8 +161,9 @@ fn a_database_of_a_newer_schema_is_refused() {
             .batch_execute("INSERT INTO schema_migrations (version, name) VALUES (99, 'future')")
             .unwrap();
     }
-    let Ok(refused) = Backend::open(dir.path(), Some(&db_url), None) else {
-        panic!("a newer-schema database refuses the older build: {e:#}")
+    let Err(refused) = Backend::open(dir.path(), Some(&db_url), None)
+    else {
+        panic!("a newer-schema database refuses the older build")
     };
     let text = format!("{refused:#}");
     assert!(
