@@ -357,6 +357,9 @@ refusal() {
   fi
   note "refusal: the store of HEAD on $ref's binary"
   fresh="$dir/store-of-head"
+  # HEAD's binary refuses a missing data directory (#578), and it is
+  # the first to touch this one: the import creates it.
+  mkdir -p "$fresh"
   "$BIN/scion-server" --data "$fresh" import "$WORK/head/fixture/src" \
     >"$dir/import-head.log" 2>&1 || die "refusal ($ref): the import of the HEAD store failed"
   if "$dir/bin/scion-server" --data "$fresh" fsck >"$dir/refuse.log" 2>&1; then

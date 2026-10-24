@@ -14,6 +14,11 @@
 set -eu
 cd "$(dirname "$0")"
 
+# A CI runner carries no git identity; the commits below need one.
+# The environment, never a config write.
+export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t
+export GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -23,13 +28,11 @@ cp ./store-upgrade.sh "$work/repo/scripts/"
 git -C "$work/repo" commit -q --allow-empty -m base
 for i in 1 2 3 4 5 6 7 8 9; do
   git -C "$work/repo" commit -q --allow-empty -m "r$i"
-  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t \
-    GIT_COMMITTER_EMAIL=t@t git -C "$work/repo" tag "v0.$i.0"
+  git -C "$work/repo" tag "v0.$i.0"
 done
 git -C "$work/repo" commit -q --allow-empty -m after
 # Not a release tag: the v[0-9]* filter must drop it.
-GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t \
-  GIT_COMMITTER_EMAIL=t@t git -C "$work/repo" tag not-a-release
+git -C "$work/repo" tag not-a-release
 
 # The resolver needs the script's ROOT to be the fixture repo.
 out=$(GITHUB_STEP_SUMMARY="$work/summary" \
