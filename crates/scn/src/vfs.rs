@@ -21,11 +21,15 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
+#[cfg(feature = "unstable-writable-mount")]
 use std::future::Future;
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
+#[cfg(feature = "unstable-writable-mount")]
+use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "unstable-writable-mount")]
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,14 +38,16 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 use hashlink::LinkedHashMap;
 use nfsserve::nfs::{
-    fattr3, fileid3, filename3, ftype3, nfs_fh3, nfspath3, nfsstat3, nfstime3, sattr3, set_mode3,
-    set_size3, specdata3,
+    fattr3, fileid3, filename3, ftype3, nfs_fh3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
 };
+#[cfg(feature = "unstable-writable-mount")]
+use nfsserve::nfs::{set_mode3, set_size3};
 // The test seam re-exports this (test_support.vfs), and
 // unreachable_pub does not see through a re-export.
 #[allow(unreachable_pub)]
 pub use nfsserve::vfs::NFSFileSystem;
 use nfsserve::vfs::{DirEntry, ReadDirResult, VFSCapabilities};
+#[cfg(feature = "unstable-writable-mount")]
 use rustix::fs::{Mode, OFlags};
 use scion_core::{BlobId, ChangesetId, Entry, FileState, RepoPath, Tree, TreeId};
 use scion_proto::runtime::object::{self, Assembler, Header};
@@ -121,9 +127,13 @@ struct Node {
     path: Option<RepoPath>,
     kind: Kind,
     /// Whether the ref names this path, so removing it is a deletion.
+    #[cfg(feature = "unstable-writable-mount")]
     from_ref: bool,
 }
 
+// The overlay variants are constructed only by the write path, which a
+// build without the feature compiles out; the read side still names them.
+#[cfg_attr(not(feature = "unstable-writable-mount"), allow(dead_code))]
 enum Kind {
     /// A directory. Its tree is fetched once, when it is first listed or
     /// looked up in; `listed` then names each entry's handle.
@@ -175,6 +185,8 @@ struct Nodes {
 
 impl Nodes {
     /// Puts a new node into the map, with a fresh handle.
+    #[cfg(feature = "unstable-writable-mount")]
+    #[cfg_attr(not(feature = "unstable-writable-mount"), allow(unused_variables))]
     fn add(&mut self, path: Option<RepoPath>, kind: Kind, from_ref: bool) -> u64 {
         let id = self.next;
         self.next += 1;
@@ -184,6 +196,7 @@ impl Nodes {
             Node {
                 path,
                 kind,
+                #[cfg(feature = "unstable-writable-mount")]
                 from_ref,
             },
         );
@@ -193,6 +206,7 @@ impl Nodes {
     /// Drops the node `id`, and its name from its directory's listing.
     /// Drops the node `id`, and its name from the map of paths. A deletion
     /// note stays: a re-created path takes it off (`forget_delete`).
+    #[cfg(feature = "unstable-writable-mount")]
     fn drop_node(&mut self, id: u64) {
         if let Some(node) = self.by_id.remove(&id) {
             self.by_path.remove(&node.path);
@@ -234,7 +248,10 @@ pub struct Vfs {
     /// Whether the mount takes writes: v0.1 mounts are read-only unless
     /// `scn mount --unstable-writable` said otherwise, because a symlinked
     /// parent directory in the overlay can still redirect a write outside
-    /// it.
+    /// it. The write path exists only in a build with the
+    /// `unstable-writable-mount` feature; a default or release build has
+    /// no write path at all.
+    #[cfg(feature = "unstable-writable-mount")]
     writable: bool,
     /// The secret that a mount path names and every file handle carries.
     /// Not a protection: see section 8 of the docs.
@@ -281,6 +298,7 @@ impl Vfs {
                             tree: Some(root),
                             listed: None,
                         },
+                        #[cfg(feature = "unstable-writable-mount")]
                         from_ref: true,
                     },
                 )]),
@@ -293,6 +311,7 @@ impl Vfs {
             uid: rustix::process::geteuid().as_raw(),
             gid: rustix::process::getegid().as_raw(),
             overlay,
+            #[cfg(feature = "unstable-writable-mount")]
             writable: false,
         }
     }
@@ -301,6 +320,7 @@ impl Vfs {
     /// is the only caller that passes true. A read-only VFS answers every
     /// mutating call with `EROFS`, before it looks at its arguments.
     #[must_use]
+    #[cfg(feature = "unstable-writable-mount")]
     // The test seam re-exports the Vfs surface (test_support.vfs), and
     // unreachable_pub does not see through a re-export.
     #[allow(unreachable_pub)]
@@ -309,8 +329,16 @@ impl Vfs {
         self
     }
 
-    /// Refuses a mutating call on a read-only mount.
+    #[cfg(feature = "unstable-writable-mount")]
+    /// Refuses a mutating call on a read-only mount. A build without the
+    /// writable-mount feature refuses every mutating call: it has no
+    /// write path at all.
     fn want_write(&self) -> Result<(), nfsstat3> {
+        #[cfg(not(feature = "unstable-writable-mount"))]
+        {
+            Err(nfsstat3::NFS3ERR_ROFS)
+        }
+        #[cfg(feature = "unstable-writable-mount")]
         if self.writable {
             Ok(())
         } else {
@@ -369,6 +397,7 @@ impl Vfs {
     }
 
     /// Puts a new node into the map, with a fresh handle.
+    #[cfg_attr(not(feature = "unstable-writable-mount"), allow(unused_variables))]
     fn add(nodes: &mut Nodes, path: Option<RepoPath>, kind: Kind, from_ref: bool) -> u64 {
         let id = nodes.next;
         nodes.next += 1;
@@ -378,6 +407,7 @@ impl Vfs {
             Node {
                 path,
                 kind,
+                #[cfg(feature = "unstable-writable-mount")]
                 from_ref,
             },
         );
@@ -676,7 +706,16 @@ impl Vfs {
 #[async_trait]
 impl NFSFileSystem for Vfs {
     fn capabilities(&self) -> VFSCapabilities {
-        VFSCapabilities::ReadWrite
+        // A build without the writable-mount feature serves read-only,
+        // whatever the mount said: it has no write path at all.
+        #[cfg(not(feature = "unstable-writable-mount"))]
+        return VFSCapabilities::ReadOnly;
+        #[cfg(feature = "unstable-writable-mount")]
+        if self.writable {
+            VFSCapabilities::ReadWrite
+        } else {
+            VFSCapabilities::ReadOnly
+        }
     }
 
     fn root_dir(&self) -> fileid3 {
@@ -698,6 +737,12 @@ impl NFSFileSystem for Vfs {
         self.attr_of(&nodes, id)
     }
 
+    #[cfg(not(feature = "unstable-writable-mount"))]
+    async fn setattr(&self, _id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    #[cfg(feature = "unstable-writable-mount")]
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
         self.want_write()?;
         let mut nodes = self.nodes.write().await;
@@ -796,6 +841,12 @@ impl NFSFileSystem for Vfs {
         }
     }
 
+    #[cfg(not(feature = "unstable-writable-mount"))]
+    async fn write(&self, _id: fileid3, _offset: u64, __data: &[u8]) -> Result<fattr3, nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    #[cfg(feature = "unstable-writable-mount")]
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
         use std::io::Seek as _;
 
@@ -823,6 +874,17 @@ impl NFSFileSystem for Vfs {
         Ok(self.attr(ftype3::NF3REG, file_mode(0o644, exec), meta.len(), id))
     }
 
+    #[cfg(not(feature = "unstable-writable-mount"))]
+    async fn create(
+        &self,
+        _dirid: fileid3,
+        _filename: &filename3,
+        _attr: sattr3,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    #[cfg(feature = "unstable-writable-mount")]
     async fn create(
         &self,
         dirid: fileid3,
@@ -845,6 +907,16 @@ impl NFSFileSystem for Vfs {
         Ok((id, self.attr(ftype3::NF3REG, file_mode(0o644, exec), 0, id)))
     }
 
+    #[cfg(not(feature = "unstable-writable-mount"))]
+    async fn create_exclusive(
+        &self,
+        _dirid: fileid3,
+        _filename: &filename3,
+    ) -> Result<fileid3, nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    #[cfg(feature = "unstable-writable-mount")]
     async fn create_exclusive(
         &self,
         dirid: fileid3,
@@ -865,6 +937,16 @@ impl NFSFileSystem for Vfs {
         Ok(id)
     }
 
+    #[cfg(not(feature = "unstable-writable-mount"))]
+    async fn mkdir(
+        &self,
+        _dirid: fileid3,
+        _dirname: &filename3,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    #[cfg(feature = "unstable-writable-mount")]
     async fn mkdir(
         &self,
         dirid: fileid3,
@@ -885,6 +967,12 @@ impl NFSFileSystem for Vfs {
         Ok((id, self.attr(ftype3::NF3DIR, 0o755, 4096, id)))
     }
 
+    #[cfg(not(feature = "unstable-writable-mount"))]
+    async fn remove(&self, _dirid: fileid3, _filename: &filename3) -> Result<(), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    #[cfg(feature = "unstable-writable-mount")]
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
         self.want_write()?;
         let mut nodes = self.nodes.write().await;
@@ -935,6 +1023,18 @@ impl NFSFileSystem for Vfs {
         Ok(())
     }
 
+    #[cfg(not(feature = "unstable-writable-mount"))]
+    async fn rename(
+        &self,
+        _from_dirid: fileid3,
+        _from_filename: &filename3,
+        _to_dirid: fileid3,
+        _to_filename: &filename3,
+    ) -> Result<(), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    #[cfg(feature = "unstable-writable-mount")]
     async fn rename(
         &self,
         from_dirid: fileid3,
@@ -1090,6 +1190,18 @@ impl NFSFileSystem for Vfs {
         Ok(ReadDirResult { entries: out, end })
     }
 
+    #[cfg(not(feature = "unstable-writable-mount"))]
+    async fn symlink(
+        &self,
+        _dirid: fileid3,
+        _linkname: &filename3,
+        _symlink: &nfspath3,
+        _attr: &sattr3,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    #[cfg(feature = "unstable-writable-mount")]
     async fn symlink(
         &self,
         dirid: fileid3,
@@ -1207,6 +1319,7 @@ impl Vfs {
         }
     }
 
+    #[cfg(feature = "unstable-writable-mount")]
     /// The path is in the overlay again: take it off the note of deletions.
     fn forget_delete(&self, nodes: &mut Nodes, path: &RepoPath) {
         if nodes.deleted.remove(path)
@@ -1216,6 +1329,7 @@ impl Vfs {
         }
     }
 
+    #[cfg(feature = "unstable-writable-mount")]
     /// The first write of a file of the ref: its blob goes to the overlay.
     /// Keeps the executable bit.
     async fn materialize(&self, nodes: &mut Nodes, id: u64) -> Result<(), nfsstat3> {
@@ -1283,6 +1397,7 @@ impl Vfs {
         }
     }
 
+    #[cfg(feature = "unstable-writable-mount")]
     /// Notes in the overlay that the path of the ref is deleted.
     fn note_delete(&self, nodes: &mut Nodes, path: &RepoPath) {
         if nodes.deleted.insert(path.clone())
@@ -1300,6 +1415,7 @@ impl Vfs {
 /// is read the best it can).
 const DELETES_VERSION_1: u8 = 1;
 
+#[cfg(feature = "unstable-writable-mount")]
 /// Writes the note of the paths that the ref held and the mount deleted:
 /// a temp file, an fsync, and a rename, so a crash mid-write leaves the
 /// old note whole, not a half-written one.
@@ -1411,6 +1527,7 @@ fn broken_note(why: anyhow::Error) -> anyhow::Error {
     )
 }
 
+#[cfg(feature = "unstable-writable-mount")]
 /// Records `name` in the listing of the directory `dirid`, if it is loaded.
 fn note_child(nodes: &mut Nodes, dirid: u64, name: &[u8], id: u64) {
     if let Some(node) = nodes.by_id.get_mut(&dirid)
@@ -1423,6 +1540,7 @@ fn note_child(nodes: &mut Nodes, dirid: u64, name: &[u8], id: u64) {
     }
 }
 
+#[cfg(feature = "unstable-writable-mount")]
 /// Takes `name` off the listing of the directory `dirid`.
 fn drop_listed(nodes: &mut Nodes, dirid: u64, name: &[u8]) {
     if let Some(node) = nodes.by_id.get_mut(&dirid)
@@ -1453,6 +1571,7 @@ fn warn<E: std::fmt::Display>(what: &str, error: &E) {
     eprintln!("scn mount: {what}: {error}");
 }
 
+#[cfg(feature = "unstable-writable-mount")]
 /// Writes `bytes` to `file` under the overlay, with the mode of `exec`.
 fn write_file(file: &Path, bytes: &[u8], exec: bool) -> std::io::Result<()> {
     if let Some(parent) = file.parent() {
@@ -1463,6 +1582,7 @@ fn write_file(file: &Path, bytes: &[u8], exec: bool) -> std::io::Result<()> {
     made.set_permissions(std::fs::Permissions::from_mode(file_mode(0o644, exec)))
 }
 
+#[cfg(feature = "unstable-writable-mount")]
 /// Opens an overlay file for the VFS to write, and refuses a symlink at
 /// its path: the mount is reachable by anyone who can read the mount
 /// table, so the VFS never writes through an OS symlink a client could
@@ -1479,6 +1599,7 @@ fn open_overlay_write(file: &Path, create: bool) -> std::io::Result<std::fs::Fil
         .map_err(std::io::Error::from)
 }
 
+#[cfg(feature = "unstable-writable-mount")]
 /// Opens an overlay file without following a symlink, for a mode
 /// change: a read-only handle is enough for `fchmod`, and a read-only
 /// open needs no write bit.
@@ -1492,6 +1613,7 @@ fn open_overlay_chmod(file: &Path) -> std::io::Result<std::fs::File> {
     .map_err(std::io::Error::from)
 }
 
+#[cfg(feature = "unstable-writable-mount")]
 /// Makes a symlink that names `target`.
 fn symlink_bytes(target: &[u8], file: &Path) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
@@ -1512,6 +1634,7 @@ fn secret_from_urandom() -> [u8; 16] {
 }
 
 impl Vfs {
+    #[cfg(feature = "unstable-writable-mount")]
     /// Whether the directory `id` (`path`) holds nothing: no overlay child
     /// and no listed child of the tree. The tree of a directory that was
     /// never listed is fetched first, so the answer is about the real
@@ -1545,6 +1668,7 @@ impl Vfs {
         Ok(!overlay_child && !tree_child)
     }
 
+    #[cfg(feature = "unstable-writable-mount")]
     /// Moves the directory `from_id` (`from_path`) to `to_path`. Boxed:
     /// the walk recurses.
     fn move_dir<'a>(
@@ -1557,6 +1681,7 @@ impl Vfs {
         Box::pin(self.move_dir_inner(nodes, dir_id, from, to))
     }
 
+    #[cfg(feature = "unstable-writable-mount")]
     /// Moves the directory `from_id` (`from_path`) to `to_path`: each file
     /// and symlink under it, of the ref or of the overlay, is written to
     /// the new overlay path, and its old path is a deletion. A directory
@@ -1774,10 +1899,12 @@ mod tests {
             root,
             &reply.ticket,
             overlay.path().to_path_buf(),
-        )
+        );
         // The unit tests of the VFS carry writes: a `--unstable-writable`
-        // mount is what they exercise.
-        .writable(true);
+        // mount is what they exercise. A build without the feature has no
+        // write path; its tests here are the read-side ones.
+        #[cfg(feature = "unstable-writable-mount")]
+        let vfs = vfs.writable(true);
         Test {
             vfs,
             dirs: [data, overlay],
@@ -1887,7 +2014,7 @@ mod tests {
         let fh = test.vfs.id_to_fh(id);
         assert_eq!(test.vfs.fh_to_id(&fh).unwrap(), id);
     }
-
+    #[cfg(feature = "unstable-writable-mount")]
     #[tokio::test]
     async fn a_write_lands_in_the_overlay() {
         let test = start(&[("README.md", b"hello\n", Some(false))]).await;
@@ -1941,7 +2068,7 @@ mod tests {
 
     /// A symlink planted at an overlay path redirects nothing: the mount
     /// is reachable by anyone who can read the mount table, so the VFS
-    /// never writes through, or sets the mode of, an OS symlink there.
+    #[cfg(feature = "unstable-writable-mount")]
     #[tokio::test]
     async fn a_planted_symlink_is_never_written_through() {
         let test = start(&[("README.md", b"hello\n", Some(false))]).await;
@@ -2018,7 +2145,7 @@ mod tests {
             [RepoPath::new("gone.txt").unwrap()]
         );
     }
-
+    #[cfg(feature = "unstable-writable-mount")]
     #[tokio::test]
     async fn a_symlink_round_trips() {
         // The ref holds a symlink too, so its blob is read on `readlink`.
@@ -2052,6 +2179,7 @@ mod tests {
     /// The target of a directory rename must be a directory, and empty
     /// at most ([F1 of the hunt]: a rename once merged two directories).
     /// Fails on main, which merges the target's children in.
+    #[cfg(feature = "unstable-writable-mount")]
     #[tokio::test]
     async fn a_rename_of_a_dir_over_a_non_empty_dir_is_refused() {
         let test = start(&[("x/a", b"ax\n", Some(false)), ("y/b", b"by\n", Some(false))]).await;
@@ -2079,7 +2207,7 @@ mod tests {
     }
 
     /// A rename of a directory over an existing file is not a directory
-    /// ([F1]). Fails on main, which merges the two.
+    #[cfg(feature = "unstable-writable-mount")]
     #[tokio::test]
     async fn a_rename_of_a_dir_over_a_file_is_refused() {
         let test = start(&[("d/f", b"df\n", Some(false)), ("f", b"fx\n", Some(false))]).await;
@@ -2100,6 +2228,7 @@ mod tests {
     /// A rename of a directory into its own subtree is invalid ([F2]).
     /// Fails on main, which accepts it and loses the mover's children at
     /// the commit.
+    #[cfg(feature = "unstable-writable-mount")]
     #[tokio::test]
     async fn a_rename_of_a_dir_into_itself_is_refused() {
         let test = start(&[("a/b", b"b\n", Some(false)), ("a/c", b"c\n", Some(false))]).await;
@@ -2117,7 +2246,7 @@ mod tests {
         assert!(matches!(refused, nfsstat3::NFS3ERR_INVAL));
     }
 
-    /// A rename over an empty directory replaces it, as POSIX allows.
+    #[cfg(feature = "unstable-writable-mount")]
     #[tokio::test]
     async fn a_rename_of_a_dir_over_an_empty_local_dir_replaces_it() {
         let test = start(&[("x/a", b"ax\n", Some(false))]).await;
@@ -2166,7 +2295,7 @@ mod tests {
 
     /// The note holds raw bytes, so a name that is not UTF-8 comes back
     /// as itself ([F6]). The lossy names of main would delete the wrong
-    /// path or none.
+    #[cfg(feature = "unstable-writable-mount")]
     #[test]
     fn a_note_of_a_name_that_is_not_utf8_round_trips() {
         let overlay = tempfile::tempdir().unwrap();
@@ -2179,6 +2308,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "unstable-writable-mount")]
     #[tokio::test]
     async fn a_rename_moves_the_overlay_file() {
         let test = start(&[("old", b"same\n", Some(false))]).await;

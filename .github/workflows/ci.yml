@@ -53,6 +53,7 @@ jobs:
       pg: ${{ steps.files.outputs.pg }}
       macos: ${{ steps.files.outputs.macos }}
       workflows: ${{ steps.files.outputs.workflows }}
+      mount: ${{ steps.files.outputs.mount }}
       deps: ${{ steps.files.outputs.deps }}
     steps:
       - id: files
@@ -68,6 +69,7 @@ jobs:
           pg=false
           macos=false
           workflows=false
+          mount=false
           deps=false
           while IFS= read -r line; do
             [ -z "$line" ] && continue
@@ -123,6 +125,17 @@ jobs:
             case "$file" in
               .github/workflows/*|scripts/release*) workflows=true ;;
             esac
+            # The writable mount (C54): its code lives in the VFS, the
+            # mount command and the commit's mount path. A pull request
+            # that touches one runs the feature's tests, so a PR cannot
+            # break the writable build for main to find out after the
+            # merge.
+            case "$file" in
+              crates/scn/src/vfs.rs|\
+              crates/scn/src/cmd/mount.rs|\
+              crates/scn/src/cmd/commit.rs|\
+              crates/scn/tests/from_mount.rs) mount=true ;;
+            esac
             # A dependency surface: any manifest, any lockfile (the
             # root's or a fuzz workspace's), the deny configuration a
             # lockfile is checked against, and the coverage script
@@ -141,6 +154,7 @@ jobs:
             echo "pg=$pg"
             echo "macos=$macos"
             echo "workflows=$workflows"
+            echo "mount=$mount"
             echo "deps=$deps"
           } >> "$GITHUB_OUTPUT"
 
@@ -205,6 +219,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The writable mount is a build feature, off by default (C54): a
+      # PR that breaks the feature build must fail on the PR, not on
+      # main after the merge.
+      - run: cargo clippy -p open-scion --features unstable-writable-mount -- -D warnings
       # A release build has no dev-dependencies, so the test-hooks feature
       # stays off and every test-only item that a cfg misses shows up as
       # dead code. --all-targets unifies the dev-dependency that turns
@@ -483,6 +501,55 @@ jobs:
           SCION_TEST_BACKEND=postgres \
           SCION_TEST_POSTGRES_URL=postgres://postgres:scion@localhost:5432/scion \
           cargo test -p open-scion-server --test backend_refusals -- --ignored
+
+  test-writable:
+    name: test (the writable mount feature)
+    needs: tier
+    # Risk tier: a pull request that touches the mount's write path
+    # (the VFS, the mount command or the commit's mount path) also runs
+    # the feature's tests, so a PR cannot break the build that carries
+    # the write path. Main, the nightly and a dispatch always run it.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' && needs.tier.outputs.mount == 'true')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The feature build's tests: the write-side unit tests of the VFS
+      # and the from-mount suite, which the default build compiles out.
+      - run: cargo test -p open-scion --features unstable-writable-mount
+      # The release profile never builds the feature, so a default
+      # release scn holds none of the write path's own symbols: the
+      # path is compiled out, not switched off. Both sides are
+      # asserted, so the pattern cannot quietly match nothing: the
+      # default build must match 0, the feature build at least 1. The
+      # pattern names the write path's own functions (write_file,
+      # write_deletes): the NFS trait's write name matches the ROFS
+      # stub every build carries, and the nodes lock's write is taken
+      # on read paths too, so neither proves anything.
+      - run: |
+          cargo build -p open-scion --release
+          # grep -c exits 1 when it prints 0, and a step runs bash -e:
+          # the good case would kill the step before the ifs run.
+          default=$(nm target/release/scn | grep -cE '3vfs(10write_file|13write_deletes)' || true)
+          cargo build -p open-scion --release --features unstable-writable-mount
+          feat=$(nm target/release/scn | grep -cE '3vfs(10write_file|13write_deletes)' || true)
+          echo "write-path symbols: default=$default feature=$feat"
+          if [ "$default" != 0 ]; then
+            echo "the default release scn carries a write-path symbol" >&2
+            exit 1
+          fi
+          if [ "$feat" -lt 1 ]; then
+            echo "the feature build lost its write-path symbols; the check is blind" >&2
+            exit 1
+          fi
 
   test-macos:
     name: test (macOS)

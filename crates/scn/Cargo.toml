@@ -36,6 +36,14 @@ tonic.workspace = true
 # outside, which the feature makes reachable (#332: nothing gated may
 # live ungated in a release build).
 test-hooks = []
+# The writable overlay mount and `scn commit --from-mount`, off by
+# default: a planted parent symlink in the overlay can still redirect a
+# write outside it (the SHORTCUT row of `vfs.rs`'s `open_overlay_write`
+# in architecture.md section 9), so a default or release build has no
+# write path at all, and the read-only mount stays. The flag and the
+# mount argument exist in every build; a build without the feature
+# refuses both by name. Out until v1.0.0 passes (ROADMAP D24).
+unstable-writable-mount = []
 
 [dev-dependencies]
 rcgen.workspace = true

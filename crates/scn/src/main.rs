@@ -202,6 +202,21 @@ fn chain_text(error: &(dyn std::error::Error + 'static)) -> String {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
+    // A build without the writable-mount feature has no write path at
+    // all. The refusal fires before anything connects, so it names the
+    // build, not the syntax and not the server.
+    #[cfg(not(feature = "unstable-writable-mount"))]
+    match &cli.command {
+        Command::Mount(args) if args.writable_requested() => anyhow::bail!(
+            "this build has no writable mount: it was built without the \
+             unstable-writable-mount feature"
+        ),
+        Command::Commit(args) if args.from_mount() => anyhow::bail!(
+            "this build has no writable mount: it was built without the \
+             unstable-writable-mount feature"
+        ),
+        _ => {}
+    }
     // The token's source: the checked file, the env, or the argv form,
     // which warns that the process list shows it.
     let token = match (&cli.token, &cli.token_file) {

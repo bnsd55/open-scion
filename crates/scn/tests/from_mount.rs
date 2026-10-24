@@ -7,7 +7,9 @@
 use std::process::Command;
 
 use common::{REPO, TOKEN, changeset, land};
-use nfsserve::nfs::{filename3, nfspath3, nfsstat3, sattr3, set_size3};
+#[cfg(feature = "unstable-writable-mount")]
+use nfsserve::nfs::set_size3;
+use nfsserve::nfs::{filename3, nfspath3, nfsstat3, sattr3};
 use open_scion::client::id_from;
 use open_scion::test_support::{
     client::test_objects,
@@ -21,6 +23,7 @@ use scion_server::Backend;
 mod common;
 
 /// Runs `scn ARGS` against `url`, with `home` as the home directory.
+#[cfg(feature = "unstable-writable-mount")]
 fn scn(url: &str, home: &std::path::Path, args: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_scn"))
         .args(["--server", url, "--repo", REPO])
@@ -92,7 +95,9 @@ struct Mount {
 }
 
 /// Mounts the tree of `base` through the VFS, with the writes a
-/// `--unstable-writable` mount takes.
+/// `--unstable-writable` mount takes. A build without the feature
+/// compiles its callers out, so the helper goes with them.
+#[cfg(feature = "unstable-writable-mount")]
 fn mount(tiers: &common::Tiers, base: &ChangesetId) -> Mount {
     mount_as(tiers, base, true)
 }
@@ -130,8 +135,11 @@ fn mount_as(tiers: &common::Tiers, base: &ChangesetId, writable: bool) -> Mount 
         root,
         &reply.ticket,
         overlay.join("tree"),
-    )
-    .writable(writable);
+    );
+    // A build without the feature has no write path: only its read-only
+    // tests run, and the record still says so.
+    #[cfg(feature = "unstable-writable-mount")]
+    let vfs = vfs.writable(writable);
     // The session file the commit reads, under the home of the `scn` runs.
     std::fs::create_dir_all(home.path().join(".scion")).unwrap();
     write_sessions(
@@ -148,6 +156,7 @@ fn mount_as(tiers: &common::Tiers, base: &ChangesetId, writable: bool) -> Mount 
     Mount { vfs, home, view }
 }
 
+#[cfg(feature = "unstable-writable-mount")]
 #[test]
 fn a_mounts_overlay_commits_without_a_scan() {
     let data = tempfile::tempdir().unwrap();
@@ -254,6 +263,7 @@ fn a_mounts_overlay_commits_without_a_scan() {
 /// file its lossy spelling names. Linux filesystems hold such names;
 /// macOS's refuse them at create time, so there is nothing to commit.
 #[cfg(target_os = "linux")]
+#[cfg(feature = "unstable-writable-mount")]
 #[test]
 fn a_non_utf8_name_commits_its_own_content() {
     use open_scion::client::Ctx;
@@ -452,6 +462,7 @@ fn a_read_only_mount_answers_rofs_to_every_write() {
 
 /// `commit --from-mount` refuses a read-only mount, with the flag the
 /// mount would have needed named in the error.
+#[cfg(feature = "unstable-writable-mount")]
 #[test]
 fn a_commit_from_a_read_only_mount_names_the_flag() {
     let data = tempfile::tempdir().unwrap();
@@ -474,4 +485,93 @@ fn a_commit_from_a_read_only_mount_names_the_flag() {
         err.contains("--unstable-writable"),
         "the error names the flag: {err}"
     );
+}
+
+/// A build without the writable-mount feature has no write path at all:
+/// the flag and the mount argument exist so the refusal names the build,
+/// and every mutating NFS call is refused before it looks at its
+/// arguments. This test runs only in that default build (a feature build
+/// mounts for real), so it is the pin that keeps the write path out.
+#[cfg(not(feature = "unstable-writable-mount"))]
+mod a_default_build_has_no_writable_mount {
+    use super::*;
+
+    #[test]
+    fn the_mount_flag_refuses_by_name() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Backend::open_test(data.path()).unwrap();
+        let base = start(&store);
+        let tiers = common::Tiers::start(data, store.clone());
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("view")).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_scn"))
+            .args(["--server", &tiers.server, "--repo", REPO])
+            .args(["mount", "--unstable-writable", "--no-mount"])
+            .arg(home.path().join("view"))
+            .arg(base.to_string())
+            .env("SCION_TOKEN", TOKEN)
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "the mount is refused");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("no writable mount") && err.contains("unstable-writable-mount"),
+            "the refusal names the build and the feature: {err}"
+        );
+    }
+
+    #[test]
+    fn the_commit_argument_refuses_by_name() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Backend::open_test(data.path()).unwrap();
+        let base = start(&store);
+        let tiers = common::Tiers::start(data, store.clone());
+        let mounted = mount_as(&tiers, &base, false);
+        let out = Command::new(env!("CARGO_BIN_EXE_scn"))
+            .args(["--server", &tiers.server, "--repo", REPO])
+            .args(["commit", "-m", "no writes", "--from-mount"])
+            .arg(&mounted.view)
+            .env("SCION_TOKEN", TOKEN)
+            .env("HOME", mounted.home.path())
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "the commit is refused");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("no writable mount") && err.contains("unstable-writable-mount"),
+            "the refusal names the build and the feature: {err}"
+        );
+    }
+
+    #[test]
+    fn the_vfs_serves_read_only_and_refuses_every_write() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Backend::open_test(data.path()).unwrap();
+        let base = start(&store);
+        let tiers = common::Tiers::start(data, store.clone());
+        let mounted = mount_as(&tiers, &base, true);
+        let vfs = &mounted.vfs;
+
+        assert!(
+            matches!(vfs.capabilities(), nfsserve::vfs::VFSCapabilities::ReadOnly),
+            "the default build serves read-only, whatever the mount said"
+        );
+        tiers.runtime.block_on(async {
+            let root = NFSFileSystem::root_dir(vfs);
+            let id = vfs
+                .lookup(root, &filename3::from(b"keep.txt".to_vec()))
+                .await
+                .unwrap();
+            let (bytes, _) = vfs.read(id, 0, 5).await.unwrap();
+            assert_eq!(bytes, b"same\n");
+            assert!(
+                matches!(
+                    vfs.write(id, 0, b"x").await.unwrap_err(),
+                    nfsstat3::NFS3ERR_ROFS
+                ),
+                "write"
+            );
+        });
+    }
 }

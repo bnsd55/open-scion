@@ -67,7 +67,11 @@ Every command takes these flags, before or after the subcommand:
   The mount is read-only: every write is answered `EROFS`. With
   `--unstable-writable` it takes writes into its overlay — unstable,
   because a symlinked parent directory in the overlay can still
-  redirect a write outside it.
+  redirect a write outside it. The write path is a build feature,
+  `unstable-writable-mount`, off by default: a default or release build
+  refuses the flag by name (`this build has no writable mount: it was
+  built without the unstable-writable-mount feature`) and has no write
+  path at all ([stability.md](stability.md)).
   `scn unmount DIR` stops the mount.
 - `scn commit --message MESSAGE` (`-m`) — create a changeset on the server. It moves no
   ref; use `scn land` next. `--base REV` is the base (default `main`);
@@ -80,6 +84,9 @@ Every command takes these flags, before or after the subcommand:
   and `--delete`; it commits what the overlay holds at that moment, so a
   commit while a file of the mount is still being written records the
   bytes written so far, the way `git add` does on a file being saved.
+  Like the writable mount, it exists only in a build with the
+  `unstable-writable-mount` feature; a default or release build refuses
+  it by name.
 - `scn land CHANGESET` — rebase a changeset onto a ref and move the ref
   (`--onto`, default `main`). `--request-id KEY` is the retry key; it
   defaults to the changeset ID and ref, so a retry of the same land is

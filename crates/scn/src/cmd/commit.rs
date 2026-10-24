@@ -32,9 +32,19 @@ pub struct CommitArgs {
     #[arg(long, env = "SCION_AUTHOR", default_value = "scn <scn@localhost>")]
     author: String,
     /// Take the changes from the overlay of a `scn mount` on DIR, instead
-    /// of --put and --delete.
+    /// of --put and --delete. A build without the
+    /// `unstable-writable-mount` feature refuses it before it connects.
     #[arg(long = "from-mount", value_name = "DIR", conflicts_with_all = ["puts", "deletes", "executable"])]
     from_mount: Option<PathBuf>,
+}
+
+impl CommitArgs {
+    /// Whether this commit takes its changes from a mount's overlay,
+    /// which only a build with the `unstable-writable-mount` feature
+    /// serves.
+    pub fn from_mount(&self) -> bool {
+        self.from_mount.is_some()
+    }
 }
 
 fn parse_put(spec: &str) -> Result<(String, PathBuf), String> {
@@ -56,6 +66,9 @@ enum Edit {
 
 /// Uploads the files, creates the changeset, and prints its ID.
 pub async fn commit(ctx: &mut Ctx, args: CommitArgs) -> Result<()> {
+    // A build without the writable-mount feature refused the mount
+    // argument in `main`, before anything connected; the write path it
+    // guards is compiled out of that build.
     let (name, email) = parse_author(&args.author)?;
     let edits = match &args.from_mount {
         None => arg_edits(&args)?,

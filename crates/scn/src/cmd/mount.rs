@@ -33,9 +33,19 @@ pub struct MountArgs {
     no_mount: bool,
     /// Take writes on the mount, for the v0.1 unstable write path: a
     /// symlinked parent directory in the overlay can still redirect a
-    /// write outside it, so the mount is read-only without this.
+    /// write outside it, so the mount is read-only without this. A build
+    /// without the `unstable-writable-mount` feature refuses the flag
+    /// before it connects.
     #[arg(long)]
     unstable_writable: bool,
+}
+
+impl MountArgs {
+    /// Whether the mount was asked to take writes, which only a build
+    /// with the `unstable-writable-mount` feature serves.
+    pub fn writable_requested(&self) -> bool {
+        self.unstable_writable
+    }
 }
 
 /// Arguments of `scn unmount`.
@@ -125,6 +135,9 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
             dir.display()
         );
     }
+    // A build without the writable-mount feature refused the flag in
+    // `main`, before anything connected; the write path it guards is
+    // compiled out of that build.
     let base = ctx.resolve(&args.rev).await?;
     // The server mints the mount's ticket: the read permission of the
     // whole walk below the root tree of the mounted changeset. It goes to
@@ -153,8 +166,9 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
         root,
         &reply.ticket,
         overlay.join(CHANGES),
-    )
-    .writable(args.unstable_writable);
+    );
+    #[cfg(feature = "unstable-writable-mount")]
+    let vfs = vfs.writable(args.unstable_writable);
     let secret = vfs.secret_name();
 
     // The identity of the serving process: an exclusive lock on the
@@ -172,7 +186,10 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
         overlay: overlay.clone(),
         rev: args.rev.clone(),
         pid: std::process::id(),
+        #[cfg(feature = "unstable-writable-mount")]
         writable: args.unstable_writable,
+        #[cfg(not(feature = "unstable-writable-mount"))]
+        writable: false,
     })?;
     // The bind is the one step that can still fail before serving: on
     // its failure, remove the record, so the next mount takes over.
