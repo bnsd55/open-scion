@@ -454,12 +454,17 @@ jobs:
             -o target/coverage/merged.profdata
           objects=$(find target/units-sqlite target/units-postgres -type f | sort | tr '\n' ' ')
           # shellcheck disable=SC2086
-          "$lcv" report $objects \
+          if ! "$lcv" report $objects \
             -instr-profile=target/coverage/merged.profdata \
             --summary-only --fail-under-lines 80 \
             ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
-            2> target/coverage/report-stderr.txt \
-            | tee target/coverage/report-summary.txt
+            > target/coverage/report-summary.txt \
+            2> target/coverage/report-stderr.txt; then
+            echo "the report failed; its stderr:"
+            cat target/coverage/report-stderr.txt
+            exit 2
+          fi
+          cat target/coverage/report-stderr.txt
           # Guard 1: the assert at zero. A mismatch means the report
           # could not map a counter to the units at hand - the report
           # lies by omission (its lines read uncovered), so the run
