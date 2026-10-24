@@ -157,7 +157,7 @@ jobs:
           # container, the only postgres image on the runner.
           SCION_PG_URL: postgres://postgres:scion@localhost:5432/scion
           SCION_FAULT_PG: "1"
-          SCION_FAULT_PG_CMD: docker stop ${{ job.services.postgres.id }} # PROOF-INJECTION
+          SCION_FAULT_PG_CMD: docker restart ${{ job.services.postgres.id }}
           # soak-fault.sh's restart wait runs bare `pg_isready`, whose
           # default host is the local socket; on the runner Postgres is
           # the service container's TCP port, so libpq looks there.
