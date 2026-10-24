@@ -569,6 +569,7 @@ async fn build_changes(
 async fn principal(
     url: String,
     caller: usize,
+    round: usize,
     mut rng: Rng,
     ops: u64,
     signals: Arc<Signals>,
@@ -581,7 +582,11 @@ async fn principal(
     };
     let mut bases = HashMap::new();
     for op in 0..ops {
-        let tag = format!("{name}-o{op}-{}", rng.next() % 1_000_000);
+        // The round is in the key: the store outlives the round, and the
+        // server refuses a used key for a different land - a key drawn
+        // only from the principal, the op index and a 10^6 suffix
+        // collides across rounds (the seed 1626443366 flake).
+        let tag = format!("{name}-r{round}-o{op}-{}", rng.next() % 1_000_000);
         // Retry an earlier land with its key, or poll one by ID, or land.
         if !recs.is_empty() && rng.below(5) == 0 {
             let idx = rng.below(recs.len());
@@ -710,7 +715,14 @@ async fn the_model_holds_across_lands_retries_and_restarts() {
     let mut rng = Rng::new(seed);
     let mut pending_kills = 0usize;
     for round in 0..rounds {
-        let server = Server::start(&data, &log);
+        // Every round's opening start follows the previous round's kill
+        // (the drop SIGKILLs the server even on a quiet round), and the
+        // restart below follows this round's: both go through
+        // start_after_kill, so the killed server's store lock - which
+        // outlives the SIGKILL by a moment on Postgres (the seed
+        // 1273923143 flake) - is waited for, bounded, instead of
+        // failing the round's start.
+        let (server, _) = start_after_kill(&data, &log);
         let signals = Arc::new(Signals::default());
         let principals: Vec<_> = (0..PRINCIPALS)
             .map(|caller| {
@@ -719,7 +731,7 @@ async fn the_model_holds_across_lands_retries_and_restarts() {
                     Rng::new(rng.next()),
                     Arc::clone(&signals),
                 );
-                tokio::spawn(principal(url, caller, rng, OPS, signals))
+                tokio::spawn(principal(url, caller, round, rng, OPS, signals))
             })
             .collect();
         // Let the principals get to work, then kill the server under
@@ -780,7 +792,7 @@ async fn the_model_holds_across_lands_retries_and_restarts() {
             .collect();
 
         // The restart, then the checks.
-        let server = Server::start(&data, &log);
+        let (server, _) = start_after_kill(&data, &log);
         let (scion, objects) = connect(&server.url).await.unwrap();
         let scions: Vec<Scion> = (0..PRINCIPALS).map(|_| scion.clone()).collect();
         finish_lands(&scions, &mut model).await;
