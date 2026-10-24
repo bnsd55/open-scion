@@ -241,9 +241,11 @@ jobs:
     # pages. The test job skips a docs-only pull request, so without
     # this job a broken link or a stale doc would land and fail main's
     # first run instead. The same if as the docs job: for a docs-only
-    # PR the two of them are the only jobs that run. The coverage step
-    # fails when a docs_*.rs file exists that the run step does not
-    # name, so a new docs test file cannot be missed.
+    # PR the two of them are the only jobs that run. The test targets
+    # come from the docs_*.rs files themselves, so a new docs test
+    # file runs without a hand list to forget; the counts refuse a
+    # glob that matched nothing, so a moved directory cannot turn the
+    # job into a no-op.
     if: >-
       ${{ !cancelled() && (needs.tier.result == 'success' || needs.tier.result == 'skipped') && !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04
@@ -257,20 +259,21 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: every docs test file is named
-        run: |
-          named="crates/scion-server/tests/docs_alerts.rs             crates/scion-server/tests/docs_capacity.rs             crates/scion-server/tests/docs_changes.rs             crates/scion-server/tests/docs_flags.rs             crates/scion-server/tests/docs_links.rs             crates/scion-server/tests/docs_ops.rs             crates/scn/tests/docs_cli.rs"
-          actual="$(ls crates/scion-server/tests/docs_*.rs crates/scn/tests/docs_*.rs 2>/dev/null || true)"
-          missed="$(comm -23 <(echo "$actual" | sort) <(echo "$named" | sort))"
-          if [ -n "$missed" ]; then
-            echo "a docs test file exists that the docs-tests job does not run:"
-            echo "$missed"
-            exit 1
-          fi
       - name: the docs tests
         run: |
-          cargo test -p open-scion-server             --test docs_alerts --test docs_capacity --test docs_changes             --test docs_flags --test docs_links --test docs_ops
-          cargo test -p open-scion --test docs_cli
+          shopt -s nullglob
+          server_files=(crates/scion-server/tests/docs_*.rs)
+          cli_files=(crates/scn/tests/docs_*.rs)
+          if [ "${#server_files[@]}" -eq 0 ] || [ "${#cli_files[@]}" -eq 0 ]; then
+            echo "no docs_*.rs files found: the docs tests would run nothing"
+            exit 1
+          fi
+          server_args=()
+          for f in "${server_files[@]}"; do server_args+=(--test "$(basename "$f" .rs)"); done
+          cli_args=()
+          for f in "${cli_files[@]}"; do cli_args+=(--test "$(basename "$f" .rs)"); done
+          cargo test -p open-scion-server "${server_args[@]}"
+          cargo test -p open-scion "${cli_args[@]}"
 
   supply-chain:
     name: cargo-deny
