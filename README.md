@@ -144,8 +144,8 @@ git clone https://github.com/tokio-rs/tokio /tmp/tokio
 git -C /tmp/tokio checkout be689a35f5ade5a39e507f79d3ec85cdab27806f
 ```
 
-(any git repository with a `README.md` and a code folder works). Every
-line below runs as written.
+(another repository works if you change the paths below to its own;
+with tokio, every line runs as written).
 
 ```sh
 cargo build --release
