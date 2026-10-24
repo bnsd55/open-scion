@@ -65,11 +65,15 @@ Proof: crates/scion-server/tests/first_boot.rs::a_first_boot_serves_probes_and_r
 ### One server
 
 ```sh
+install -d -m 0700 /srv/scion
 SCION_TOKEN=<TOKEN> ./scion-server --data /srv/scion serve
 ```
 
 That is the whole deployment: clients talk to `127.0.0.1:7878` (or `--listen`
-HOST:PORT). The data directory holds every blob and every row, so keep it
+HOST:PORT). `install -d -m 0700` makes the directory the mode it says, whatever
+the umask is - under umask 002 (Ubuntu's user private groups) a plain `mkdir`
+makes a group-writable directory, and the server refuses it; the error names
+the chmod that fixes it. The data directory holds every blob and every row, so keep it
 mode 0700 and owned by the user the server runs as: the server refuses one
 that group or others can write, or that sits under a directory another user
 can change. Without `--ticket-key` no object is readable, so a real server
@@ -87,6 +91,29 @@ bounds the clients served at once, `--max-streams` (256) bounds the calls
 one client may hold open at once, and `--max-stalled-bytes` (64 MiB)
 bounds what the stalled replies of one connection may hold before the
 connection is closed. A cache and a daemon take the same three flags.
+
+What one server process can hold for clients that never read, at the
+defaults, in the worst case:
+
+    128 connections x 64 MiB stalled bytes   8192 MiB
+    the read budget (whole-object replies)     256 MiB
+    the reply budget (unary replies)           128 MiB
+    ------------------------------------------ --------
+    about                                      8.4 GiB
+
+The first line is `--max-connections` x `--max-stalled-bytes`
+(`DEFAULT_CONNECTIONS`, `DEFAULT_STALLED_BYTES` in
+crates/scion-proto/src/runtime/listen.rs): a connection whose stalled
+replies hold more than `--max-stalled-bytes` is closed, and what they
+hold goes free, so a slow client costs at most its own connection,
+not a share of the server. The second is the read budget that a
+whole-object reply's built body takes before the body is built
+(`READ_BUDGET_BYTES` in crates/scion-server/src/service.rs); the
+third is the unary-reply budget (`REPLY_MEMORY_BUDGET` in
+crates/scion-server/src/reply.rs). Size the server's memory from that
+sum: fewer connections, a smaller stall cap, or both, take the first
+line down linearly.
+
 
 Choose the tokens with care: `--token T` (or `SCION_TOKEN=T`) makes one
 principal, `default`, with every right on every repo. A token on the command
