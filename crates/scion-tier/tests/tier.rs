@@ -1845,6 +1845,10 @@ async fn a_daemons_stderr_stays_quiet_and_colorless_across_gets() {
         .arg(TOKEN)
         .arg("--upstream-token")
         .arg(TOKEN)
+        // The caller's RUST_LOG must not steer the daemon's log filter:
+        // RUST_LOG=debug would bring the per-call line back, RUST_LOG=off
+        // would silence the check entirely.
+        .env_remove("RUST_LOG")
         .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
         .map(Kill)
