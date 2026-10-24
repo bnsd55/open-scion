@@ -1746,6 +1746,56 @@ mod tests {
         );
     }
 
+    /// The path check passes, but the apply still fails: a delete of a
+    /// path the head never had has nothing to conflict with on the path
+    /// side, and the apply refuses it against the head's tree. The land
+    /// must end as a recorded Conflict with the version the apply ran
+    /// on - not an error, and not landed.
+    #[test]
+    fn a_delete_the_head_never_had_ends_in_a_recorded_conflict() {
+        let f = fixture_shared();
+        let cs_a = f.commit(f.root, &[put("a/x", "A")]);
+        assert_eq!(f.land(cs_a, "ka").state, LandState::Landed);
+        let cs = f.commit(f.main().target, &[del("never/had.txt")]);
+        let out = f.land(cs, "kdel");
+        assert_eq!(out.state, LandState::Conflict, "{}", out.detail);
+        assert!(
+            out.detail.starts_with("does not apply to"),
+            "the detail is the apply refusal: {}",
+            out.detail
+        );
+    }
+
+    /// A land aimed at a ref that does not exist is a Rejected verdict,
+    /// recorded and named - never an error and never a move.
+    #[test]
+    fn a_land_on_a_missing_ref_is_a_recorded_rejection() {
+        let f = fixture_shared();
+        let cs = f.commit(f.root, &[put("a/x", "A")]);
+        let out = f
+            .lands
+            .land(
+                &f.store,
+                &caller(),
+                &LandRequest {
+                    repo: "r".into(),
+                    changeset: cs,
+                    target_ref: "nope".into(),
+                    request_key: "knone".into(),
+                    deadline: Deadline::new(Instant::now() + std::time::Duration::from_secs(600)),
+                },
+            )
+            .unwrap();
+        assert_eq!(out.state, LandState::Rejected, "{}", out.detail);
+        assert!(
+            out.detail.contains("nope"),
+            "the detail names the missing ref: {}",
+            out.detail
+        );
+        // Nothing moved.
+        assert_eq!(f.main().target, f.root);
+    }
+
     /// A panic that dies under a ref's lock poisons it with a
     /// half-written index. The index is a cache and the database is the
     /// truth, so the poisoned slot must be dropped and rebuilt: a land
