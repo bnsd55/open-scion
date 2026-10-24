@@ -452,9 +452,15 @@ jobs:
           lcv="$(find "$(rustc --print sysroot)" -type f -name llvm-cov -print -quit)"
           "$pd" merge -sparse target/coverage/*.profraw \
             -o target/coverage/merged.profdata
-          objects=$(find target/units-sqlite target/units-postgres -type f | sort | tr '\n' ' ')
-          # shellcheck disable=SC2086
-          if ! "$lcv" report $objects \
+          # Every unit is a coverage object, passed as a repeated
+          # -object flag. Bare paths would read as source filters: the
+          # report would map the first binary and silently filter the
+          # rest into nothing.
+          objects=()
+          while IFS= read -r f; do objects+=(-object "$f"); done \
+            < <(find target/units-sqlite target/units-postgres -type f | sort)
+          echo "coverage objects: $(( ${#objects[@]} / 2 ))"
+          if ! "$lcv" report "${objects[@]}" \
             -instr-profile=target/coverage/merged.profdata \
             --summary-only \
             ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
