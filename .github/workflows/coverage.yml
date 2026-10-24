@@ -465,7 +465,7 @@ jobs:
           if ! "$lcv" report "${objects[@]}" \
             -instr-profile=target/coverage/merged.profdata \
             --summary-only \
-            ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
+            --ignore-filename-regex "$ignore_regex" \
             > target/coverage/report-summary.txt \
             2> target/coverage/report-stderr.txt; then
             echo "the report failed; its stderr:"
@@ -490,13 +490,22 @@ jobs:
             echo "the report dropped $mismatches functions; the number is not the truth"
             exit 2
           fi
+          # Third-party sources stay out of the denominator. The
+          # registry's build.rs files map into the report at 0% - the
+          # measure discards build-phase profiles on purpose - and
+          # nothing under .cargo or rustc's sysroot is ours to cover.
+          # About three points of the total sat on 33 dependency
+          # build.rs files; the exclusions file cannot hold these
+          # patterns (its guard reads tracked paths only), so they
+          # live here, beside the exclusions file's regex.
+          ignore_regex="${COVERAGE_IGNORE}|/\\.cargo/registry/|/rustc/"
           # The machine-checked numbers come from the JSON export: its
           # fields are named and stable, unlike the text table's column
           # positions, which move with the branch columns' presence.
           if ! "$lcv" export "${objects[@]}" \
             -instr-profile=target/coverage/merged.profdata \
             --summary-only \
-            ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
+            --ignore-filename-regex "$ignore_regex" \
             > target/coverage/report.json; then
             echo "the export failed"
             exit 2
