@@ -748,7 +748,11 @@ Proof: crates/scion-server/tests/crash.rs::a_newer_schema_refuses_the_open_and_a
 An import reads git revision `--rev` (default `HEAD`) into scion repo
 `--repo` (default `main`), and points scion ref `--ref` (default `main`)
 at the imported tip. Besides every root and merge, it re-checks `--verify`
-(default 100) ordinary commits against git.
+(default 100) ordinary commits against git. A commit whose author or
+committer line carries git's unknown-offset zone `-0000` is refused: the
+offset is unknown, not zero, and importing it would fold the sign into
+the stored history. Every real zone imports with its offset; fix or
+re-date such a commit in the git history and import again.
 
 So an upgrade is: stop the server (and any tiers that share the directory —
 none do by default), copy the directory as a backup (section 3), start the
@@ -993,8 +997,11 @@ reconnects.
 that mean something. Every line of a call carries the `call` span's
 fields, `rpc`, `peer` and `request_id`: one `scn` command sends one
 `x-request-id` through every hop, so a grep for `request_id=<id>` in the
-logs of scn, the daemon, the cache and the server shows the whole path
-of one operation.
+logs of scn and the server shows the whole path of one operation. A
+cache or a daemon logs a call only at DEBUG — its per-call counts are
+the metrics' `scion_cache_hits_total` and `scion_cache_misses_total` —
+so at the default level those hops answer through the metrics, not the
+log.
 
 - `the call is unauthenticated` — a call without a valid token. A few are
   normal (a scanner, a stale client); a stream of them is a client with a
@@ -1024,6 +1031,17 @@ of one operation.
 - `the stale-land sweep failed` / `the stale-land sweep task failed` — the
   hourly sweep could not run. Lands then pile up past
   `--land-stale-secs`; look at the error above it.
+- `a unary reply refused: the reply budget is spent` — a client holds
+  more than the reply budget (128 MiB of unary replies it never read,
+  across every connection); further unary reads are refused
+  `resource_exhausted` until it reads what it opened or its connections
+  close. The warn carries only the size, but the line sits in the
+  call's span, whose fields name the client: every log line of a call
+  carries `rpc`, `peer` and `request_id`.
+- `a committed write's reply is over the reply budget: sent uncounted` —
+  the budget was spent, but the call changed state and its answer went
+  out anyway: the write landed and the client got the truth. Nothing was
+  lost; fix the client that holds the budget.
 
 A ticket refusal, an access refusal, or a corrupt blob each log one line
 per event, never the bytes or the token that caused them.
@@ -1141,6 +1159,14 @@ Tell the causes apart:
   are large and the clients are many — raise
   `--max-stalled-bytes` only if the box has the memory for it, or add a
   cache tier so the large replies do not all reach the server.
+
+- Many clients leave whole unary replies unread: they hold the server's
+  reply budget (128 MiB), and further unary reads are refused
+  `resource_exhausted` until they read or disconnect. This alert does
+  not fire for them — the gauge counts stalled streams, not parked
+  whole replies — the refusal's warn line
+  (`a unary reply refused: the reply budget is spent`) and the RPC's
+  `resource_exhausted` count name it.
 
 Escalate when the close notice repeats for one peer and the client is
 not yours to fix: the client's owner stops the waste, not the server.

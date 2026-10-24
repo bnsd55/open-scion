@@ -119,9 +119,16 @@ jobs:
             esac
             # Workflow or release files. The lint job's actionlint
             # step already runs for every pull request; the release
-            # smoke is the addition.
+            # smoke is the addition. A workflow change also runs the
+            # Postgres and macOS jobs: the workflows are how those
+            # jobs prove themselves, so a change to one runs the jobs
+            # it can break.
             case "$file" in
-              .github/workflows/*|scripts/release*) workflows=true ;;
+              .github/workflows/*|scripts/release*)
+                workflows=true
+                pg=true
+                macos=true
+                ;;
             esac
             # A dependency surface: any manifest, any lockfile (the
             # root's or a fuzz workspace's), the deny configuration a
@@ -401,9 +408,21 @@ jobs:
         # the tier rule above); the 16 and 18 cells are best effort and
         # run nightly and on a release candidate's dispatch.
         version: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && fromJSON('["16.15", "17.11", "18.6"]') || fromJSON('["17.11"]') }}
+        # The digest pins. A tag can move to new bytes; a digest cannot
+        # (production-audit.md section 9). Each include entry pins the
+        # multi-arch image index of its tag, fetched live from the
+        # registry (the runners are x64 and arm64; both are in the
+        # index). Bump a version together with its digest line.
+        include:
+          - version: 16.15
+            digest: 9e2cf6287f25c3151f4c9421ccce2b17f3e60061c111a29165e0d2cdd9ff0a97
+          - version: 17.11
+            digest: b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+          - version: 18.6
+            digest: edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6
     services:
       postgres:
-        image: postgres:${{ matrix.version }}
+        image: postgres:${{ matrix.version }}@sha256:${{ matrix.digest }}
         env:
           POSTGRES_PASSWORD: scion
           POSTGRES_DB: scion
@@ -477,8 +496,23 @@ jobs:
       # takes the database down while it runs.
       - name: the database may go down, and the store recovers
         run: |
-          container=$(docker ps --filter ancestor=postgres:${{ matrix.version }} --format '{{.Names}}' | head -1)
-          test -n "$container"
+          # The service container is found by its published port, never
+          # by the image reference: the image is pinned by digest, and
+          # a tag-shaped filter (ancestor=postgres:17.11) matches a
+          # digest-pinned container not at all. Exactly one container
+          # may publish 5432 on this runner; zero or two are a setup
+          # error the step names before any test runs.
+          names=$(docker ps --filter publish=5432 --format '{{.Names}}')
+          count=$(printf '%s\n' "$names" | grep -c . || true)
+          if [ "$count" -eq 0 ]; then
+            echo "::error::no container publishes 5432: the postgres service container is missing or did not start"
+            exit 1
+          fi
+          if [ "$count" -gt 1 ]; then
+            echo "::error::$count containers publish 5432: the takeover test cannot know which is the job's database ($names)"
+            exit 1
+          fi
+          container=$names
           SCION_TEST_PG_CONTAINER="$container" \
           SCION_TEST_BACKEND=postgres \
           SCION_TEST_POSTGRES_URL=postgres://postgres:scion@localhost:5432/scion \
@@ -630,7 +664,7 @@ jobs:
       # the blob files take the cuts, the metadata sits in the database's
       # own WAL, and the run proves the store reads what the cut left.
       postgres:
-        image: postgres:17.11
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
         env:
           POSTGRES_PASSWORD: scion
           POSTGRES_DB: scion
@@ -721,7 +755,7 @@ jobs:
       # the marker and the blob files sit on the NFS mount, the metadata
       # sits in the database, and the run proves the mount of that half.
       postgres:
-        image: postgres:17.11
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
         env:
           POSTGRES_PASSWORD: scion
           POSTGRES_DB: scion
