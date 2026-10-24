@@ -371,7 +371,7 @@ impl Objects for ObjectsService {
         request.extensions_mut().insert(caller);
         resolve_ref(&self.worker, &self.access, &self.quotas, request)
             .await
-            .map(Response::new)
+            .map(|r| crate::service::count_reply(Response::new(r)))
     }
 
     async fn get_root_tree(
@@ -422,10 +422,12 @@ impl Objects for ObjectsService {
             // ticket fails every read that carries it.
             None => Vec::new(),
         };
-        Ok(Response::new(GetRootTreeResponse {
-            tree_id: tree.as_bytes().to_vec(),
-            ticket,
-        }))
+        Ok(crate::service::count_reply(Response::new(
+            GetRootTreeResponse {
+                tree_id: tree.as_bytes().to_vec(),
+                ticket,
+            },
+        )))
     }
 
     type GetObjectsStream = ObjectStream;
@@ -510,7 +512,7 @@ impl Objects for ObjectsService {
             zstd,
             decoded,
         );
-        Ok(Response::new(stream.await?))
+        Ok(crate::service::mark_stream(Response::new(stream.await?)))
     }
 }
 

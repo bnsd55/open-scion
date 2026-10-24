@@ -7,6 +7,38 @@ updates:
     groups:
       cargo:
         patterns: ["*"]
+  # Each fuzz sub-workspace holds its own Cargo.lock, which the root
+  # entry never reads (it did: the gix advisory rode a fuzz lock after
+  # the root moved). The same schedule and grouping as "/"; a fuzz
+  # crate's dependency bump lands as its own grouped PR.
+  - package-ecosystem: cargo
+    directory: /crates/scion-core/fuzz
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+  - package-ecosystem: cargo
+    directory: /crates/scion-proto/fuzz
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+  - package-ecosystem: cargo
+    directory: /crates/scion-server/fuzz
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+  - package-ecosystem: cargo
+    directory: /crates/scion-tier/fuzz
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
   - package-ecosystem: github-actions
     directory: /
     schedule:

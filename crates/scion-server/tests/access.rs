@@ -194,6 +194,7 @@ async fn serve(store: &Backend, dir: &std::path::Path, access: Access) -> (Stop,
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::new(Metrics::default()),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         Some(Arc::new(scion_server::Keys::generate())),
         async {
@@ -1048,6 +1049,7 @@ async fn serve_keys(
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::new(Metrics::default()),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         Some(Arc::new(keys)),
         async {
