@@ -64,6 +64,7 @@ async fn serve_behind_a_relay(store: &Backend) -> (String, Arc<AtomicBool>, temp
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::default(),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         Some(tickets),
         std::future::pending(),

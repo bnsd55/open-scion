@@ -116,6 +116,7 @@ async fn serve(store: &Backend, dir: &std::path::Path) -> (Stop, Scion) {
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::new(scion_server::Metrics::default()),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         Some(Arc::new(scion_server::Keys::generate())),
         async {
