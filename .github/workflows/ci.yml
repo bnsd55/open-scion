@@ -214,8 +214,10 @@ jobs:
   docs:
     name: rustdoc
     needs: tier
-    # The docs tests run on every event and for every ready pull
-    # request; for a docs-only PR they are the only tier that runs.
+    # rustdoc runs on every event and for every ready pull request; for
+    # a docs-only PR it and the docs-tests job below are the only jobs
+    # that run. The docs tests are integration tests, not rustdoc, so
+    # they live in the separate docs-tests job below.
     if: >-
       ${{ !cancelled() && (needs.tier.result == 'success' || needs.tier.result == 'skipped') && !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04
@@ -230,6 +232,45 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
+  docs-tests:
+    name: docs tests
+    needs: tier
+    # The docs tests (links, the changes fragments, flags, operations,
+    # alerts, capacity, the CLI help) are integration tests of the docs
+    # pages. The test job skips a docs-only pull request, so without
+    # this job a broken link or a stale doc would land and fail main's
+    # first run instead. The same if as the docs job: for a docs-only
+    # PR the two of them are the only jobs that run. The coverage step
+    # fails when a docs_*.rs file exists that the run step does not
+    # name, so a new docs test file cannot be missed.
+    if: >-
+      ${{ !cancelled() && (needs.tier.result == 'success' || needs.tier.result == 'skipped') && !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: every docs test file is named
+        run: |
+          named="crates/scion-server/tests/docs_alerts.rs             crates/scion-server/tests/docs_capacity.rs             crates/scion-server/tests/docs_changes.rs             crates/scion-server/tests/docs_flags.rs             crates/scion-server/tests/docs_links.rs             crates/scion-server/tests/docs_ops.rs             crates/scn/tests/docs_cli.rs"
+          actual="$(ls crates/scion-server/tests/docs_*.rs crates/scn/tests/docs_*.rs 2>/dev/null || true)"
+          missed="$(comm -23 <(echo "$actual" | sort) <(echo "$named" | sort))"
+          if [ -n "$missed" ]; then
+            echo "a docs test file exists that the docs-tests job does not run:"
+            echo "$missed"
+            exit 1
+          fi
+      - name: the docs tests
+        run: |
+          cargo test -p open-scion-server             --test docs_alerts --test docs_capacity --test docs_changes             --test docs_flags --test docs_links --test docs_ops
+          cargo test -p open-scion --test docs_cli
 
   supply-chain:
     name: cargo-deny
