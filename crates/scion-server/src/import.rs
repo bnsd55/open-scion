@@ -1215,10 +1215,16 @@ fn zone(raw: &str) -> Option<(i64, i32)> {
     {
         return None;
     }
-    Some((
-        seconds,
-        sign * (hours.parse::<i32>().ok()? * 3600 + minutes.parse::<i32>().ok()? * 60),
-    ))
+    // A negative zero (`-0000`, and `-000000` of the same shape) is
+    // the one zone that cannot read back: git writes an unknown offset
+    // this way, and zero parses to `+0000`. The arithmetic folds the
+    // sign into the value (-1 * 0 = 0), so the pair comparison below
+    // would accept it; the sign is checked here instead.
+    let total = hours.parse::<i32>().ok()? * 3600 + minutes.parse::<i32>().ok()? * 60;
+    if sign == -1 && total == 0 {
+        return None;
+    }
+    Some((seconds, sign * total))
 }
 
 fn per_sec(count: usize, since: Instant) -> u128 {
