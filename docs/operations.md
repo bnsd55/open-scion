@@ -1198,6 +1198,7 @@ checking out through a cache and a daemon beside it.
 |---|---|
 | Commit | the `git rev-parse HEAD` of the run that produced the table |
 | Runner | the hosted runner class, by its public label and spec |
+| Filesystem | the filesystem the run measured, from the run's `machine.txt` artifact (`df -T` on the work directory); the `ubuntu-24.04` class's root disk is ext4 ([support.md](support.md)) |
 | Repetitions | 2 per cell; the table reports the cell's whole run, and the run's raw samples are the workflow run's `capacity.csv` artifact |
 
 | backend | writers | readers | land p99 ms | checkout p50 ms | checkout p99 ms | timeouts | errors | server RSS MiB | landed | blob store KiB per 1k lands | database KiB per 1k lands |
