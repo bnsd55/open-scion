@@ -481,7 +481,10 @@ jobs:
           fi
           # The 80-line gate, checked here: raw llvm-cov has no
           # --fail-under-lines flag.
-          total_lines=$(awk '$1 == "TOTAL" {print $10}' \
+          # $7 = the lines-cover column in raw llvm-cov's table
+          # ($10 was cargo-llvm-cov's layout, the wrapper had one more
+          # column).
+          total_lines=$(awk '$1 == "TOTAL" {print $7}' \
             target/coverage/report-summary.txt | tr -d '%')
           echo "total lines covered: ${total_lines:-none}% (floor 80%)"
           if [ -z "$total_lines" ] || [ "${total_lines%%.*}" -lt 80 ]; then
@@ -494,7 +497,7 @@ jobs:
           # floor is half of the corrected reading, well under it, so a
           # half-lost merge still fails.
           pg_floor=45
-          pg_cover=$(awk '$1 == "scion-server/src/pg.rs" {print $10}' \
+          pg_cover=$(awk '$1 == "scion-server/src/pg.rs" {print $7}' \
             target/coverage/report-summary.txt | tr -d '%')
           echo "pg.rs lines covered: ${pg_cover:-none}% (floor $pg_floor%)"
           if [ -z "$pg_cover" ] || [ "${pg_cover%%.*}" -lt "$pg_floor" ]; then
