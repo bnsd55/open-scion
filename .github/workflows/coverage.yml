@@ -190,6 +190,10 @@ jobs:
           kill "$watcher"
           df -h / | tail -1; free -m | awk 'NR==2'
           du -sh target/coverage; find target/coverage -name '*.profraw' | wc -l
+          echo "the measure's instrumented units, for the C65 design note:"
+          du -sh target/coverage/debug
+          find target/coverage/debug -type f -perm -u+x ! -name '*.d' ! -name '*.rlib' ! -name '*.so' -exec du -ch {} + | tail -1
+          find target/coverage/debug -type f -perm -u+x ! -name '*.d' ! -name '*.rlib' ! -name '*.so' | wc -l
 
       - name: upload the measure's profiles
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
