@@ -163,10 +163,13 @@ that breaks one is caught.
   `scion-tier/tests/tier.rs::a_tier_serves_no_root_trees_or_refs`,
   `scion-tier/tests/tier.rs::a_tier_refuses_an_object_whose_bytes_do_not_match_its_id`
 - **A daemon serves one OS user.** Its socket is 0600 in a directory
-  only its user can reach, and it refuses any other; the daemon checks
-  no ticket, so the rule is what keeps one user's objects from
-  another's. The single-user rule itself rests on the operating system,
-  not on the code: no test yet.
+  only its user can reach, and it refuses any other; the daemon relays
+  a ticket as it came, without verifying it, by design - its socket
+  user can already read everything the daemon stores, and the upstream
+  verifies the ticket's signature, expiry and walk before any byte
+  moves - so the rule is what keeps one user's objects from another's.
+  The single-user rule itself rests on the operating system, not on
+  the code: no test yet.
 - **The keys on disk are what the checks say.** A secret is a regular
   file, owned by the account that runs the process or root, mode 0600;
   a whole-keeping file refuses group and others write; a symlink dies
@@ -270,6 +273,12 @@ that breaks one is caught.
   `scion-server/tests/archive_attacks.rs::two_pending_lands_sharing_a_request_key_are_named_or_tolerated`,
   `scion-server/tests/archive_attacks.rs::a_mid_replay_failure_leaves_the_target_empty`,
   `scion-server/tests/archive_attacks.rs::a_pg_replay_that_dies_halfway_leaves_the_database_empty`
+- **A call that fails its auth carries no principal, so no
+  per-principal quota applies to it.** The connection cap, the stream
+  cap and the audit meter's per-address folding bound such calls; the
+  per-principal request and upload caps begin once the token names a
+  principal.
+  `scion-server/tests/every_rpc_unauthenticated.rs::every_rpc_answers_unauthenticated_without_a_valid_token`
 - **A refused-auth flood is counted by the machine, not the socket.**
   The audit meter folds one peer's refusals into counted lines keyed
   by the address — an IPv6 by its /64, the smallest block one site

@@ -407,7 +407,10 @@ principal, so the caps are off unless a flag sets one.
 Rewriting the access file takes effect at the next start (or restart): the
 server reads it once. A ticket keeps working for its whole life after a
 reload that narrows its principal, up to 15 minutes from signing, on this
-server and on any cache that holds the repo's objects. To revoke reads:
+server and on any cache that holds the repo's objects. Tickets live by the
+server's clock: a clock stepped back extends every live ticket by up to the
+60 seconds of skew the check allows, so run NTP in slew mode, not step, on
+a machine that serves tickets. To revoke reads:
 rewrite the file and restart, and either wait out the tickets (15 minutes)
 or rotate the ticket key (`--ticket-key`) to cut them off at once. Objects
 already on a user's daemon are out of reach of both; give a daemon only

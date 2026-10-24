@@ -275,6 +275,11 @@ impl Access {
                     let digest = blake3::Hash::from_hex(digest)
                         .map_err(|_| at("a token digest is 64 hex digits".into()))?;
                     let digest = *digest.as_bytes();
+                    if digest == token_digest("") {
+                        return Err(at("this is the digest of an empty token, and an empty \
+                             token is no secret; hash the real token with `hash-token`"
+                            .into()));
+                    }
                     if access.tokens.iter().any(|(d, _)| *d == digest) {
                         return Err(at("another principal has this token".into()));
                     }
