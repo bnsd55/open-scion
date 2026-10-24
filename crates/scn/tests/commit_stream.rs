@@ -221,15 +221,10 @@ fn an_empty_file_still_commits() {
 #[test]
 fn a_commit_of_a_big_file_stays_under_its_rss_ceiling() {
     const FILE_BYTES: usize = 24 * 1024 * 1024;
-    #[allow(dead_code)]
     const CEILING_KB: u64 = 32 * 1024;
     let fx = Fixture::start();
     let file = fx.put_file("huge.bin", FILE_BYTES);
-    // PROOF-INJECTION 2: the ceiling at 1 MiB, so the STREAM peak
-    // prints in the CI log and the test fails on it. The next commit
-    // reverts the ceiling and the flag.
     let out = commit_measured(&fx, "huge.bin", &file, false);
-    let ceiling_kb: u64 = 1024;
     assert!(
         out.status.success(),
         "commit failed: {}{}",
@@ -237,14 +232,12 @@ fn a_commit_of_a_big_file_stays_under_its_rss_ceiling() {
         String::from_utf8_lossy(&out.stderr)
     );
     let peak_kb = out.peak_kb;
-    println!(
-        "the scn commit's peak RSS was {peak_kb} kB; the ceiling is {ceiling_kb} kB (PROOF-INJECTION 2)"
-    );
+    println!("the scn commit's peak RSS was {peak_kb} kB; the ceiling is {CEILING_KB} kB");
     assert!(peak_kb > 0, "the sampler never saw the commit");
     assert!(
-        peak_kb <= ceiling_kb,
-        "the commit's peak RSS ({peak_kb} kB) passed the ceiling ({ceiling_kb} kB); \
-         the stream peak is higher than the guard's ceiling allows"
+        peak_kb <= CEILING_KB,
+        "the commit's peak RSS ({peak_kb} kB) passed the ceiling ({CEILING_KB} kB); \
+         a whole-file read is back"
     );
 }
 
