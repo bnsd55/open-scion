@@ -239,15 +239,14 @@ fn a_commit_of_a_big_file_stays_under_its_rss_ceiling() {
     assert!(peak_kb > 0, "the sampler never saw the commit");
     // Both peaks (lever off and on) land in the run's summary when CI
     // runs, so the guard's numbers are CI's own, not a local machine's.
-    if let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY") {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
+    if let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY")
+        && let Ok(mut f) = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
             .open(path)
-        {
-            use std::io::Write as _;
-            let _ = writeln!(f, "commit-stream peak (lever=true): {peak_kb} kB");
-        }
+    {
+        use std::io::Write as _;
+        let _ = writeln!(f, "commit-stream peak (lever=true): {peak_kb} kB");
     }
     assert!(
         peak_kb <= CEILING_KB,
