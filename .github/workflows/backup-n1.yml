@@ -21,7 +21,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # The schedule runs in its own group: a concurrency group keeps one
+  # pending run at most, and a newer queued run replaces the pending
+  # one whatever cancel-in-progress says - a dispatch would replace a
+  # waiting weekly drill.
+  group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && 'weekly' || github.ref }}
   cancel-in-progress: true
 
 jobs:
