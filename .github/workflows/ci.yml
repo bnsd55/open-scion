@@ -119,9 +119,16 @@ jobs:
             esac
             # Workflow or release files. The lint job's actionlint
             # step already runs for every pull request; the release
-            # smoke is the addition.
+            # smoke is the addition. A workflow change also runs the
+            # Postgres and macOS jobs: the workflows are how those
+            # jobs prove themselves, so a change to one runs the jobs
+            # it can break.
             case "$file" in
-              .github/workflows/*|scripts/release*) workflows=true ;;
+              .github/workflows/*|scripts/release*)
+                workflows=true
+                pg=true
+                macos=true
+                ;;
             esac
             # A dependency surface: any manifest, any lockfile (the
             # root's or a fuzz workspace's), the deny configuration a
@@ -489,8 +496,23 @@ jobs:
       # takes the database down while it runs.
       - name: the database may go down, and the store recovers
         run: |
-          container=$(docker ps --filter ancestor=postgres:${{ matrix.version }} --format '{{.Names}}' | head -1)
-          test -n "$container"
+          # The service container is found by its published port, never
+          # by the image reference: the image is pinned by digest, and
+          # a tag-shaped filter (ancestor=postgres:17.11) matches a
+          # digest-pinned container not at all. Exactly one container
+          # may publish 5432 on this runner; zero or two are a setup
+          # error the step names before any test runs.
+          names=$(docker ps --filter publish=5432 --format '{{.Names}}')
+          count=$(printf '%s\n' "$names" | grep -c . || true)
+          if [ "$count" -eq 0 ]; then
+            echo "::error::no container publishes 5432: the postgres service container is missing or did not start"
+            exit 1
+          fi
+          if [ "$count" -gt 1 ]; then
+            echo "::error::$count containers publish 5432: the takeover test cannot know which is the job's database ($names)"
+            exit 1
+          fi
+          container=$names
           SCION_TEST_PG_CONTAINER="$container" \
           SCION_TEST_BACKEND=postgres \
           SCION_TEST_POSTGRES_URL=postgres://postgres:scion@localhost:5432/scion \
