@@ -1035,8 +1035,9 @@ log.
   more than the reply budget (128 MiB of unary replies it never read,
   across every connection); further unary reads are refused
   `resource_exhausted` until it reads what it opened or its connections
-  close. Find the client from the refused RPC's `resource_exhausted`
-  count and its `peer`.
+  close. The warn carries only the size, but the line sits in the
+  call's span, whose fields name the client: every log line of a call
+  carries `rpc`, `peer` and `request_id`.
 - `a committed write's reply is over the reply budget: sent uncounted` —
   the budget was spent, but the call changed state and its answer went
   out anyway: the write landed and the client got the truth. Nothing was
