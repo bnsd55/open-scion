@@ -177,6 +177,11 @@ jobs:
         run: scripts/test-merge-changelog.sh
       - name: the release tag verdicts hold (release-verify-tag)
         run: scripts/test-release-verify-tag.sh
+      # The store-upgrade ladder's cap: 9 tags -> 8 kept + a warning
+      # naming the dropped ones. No store-upgrade run holds 9 tags
+      # today, so the decision is tested here on a fixture repo.
+      - name: the store ladder keeps the newest 8 and names the rest
+        run: scripts/test-store-upgrade-cap.sh
       # A workflow that cannot parse fails here, on the PR that carries
       # it, not main's next push-triggered run (#416, #419). The
       # actionlint release is pinned by version and sha256.

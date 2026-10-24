@@ -1,0 +1,94 @@
+name: store-upgrade
+
+on:
+  # The migration surface: a change here must prove the tagged ladder, and
+  # nothing else needs the builds.
+  pull_request:
+    paths:
+      - "crates/scion-server/src/store.rs"
+      - "crates/scion-server/migrations/**"
+      - "scripts/store-upgrade.sh"
+      - ".github/workflows/store-upgrade.yml"
+  # Weekly, so the growing tag ladder is exercised even when the
+  # migrations are quiet.
+  schedule:
+    - cron: "30 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: "tags or refs to use, oldest first (empty: resolve them)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The resolve step runs first, so a run with no release tag says so
+  # before it builds anything: the job starts at v0.1.0.
+  resolve:
+    name: resolve the tag ladder
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      count: ${{ steps.resolve.outputs.count }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The tags, so the ladder resolves against the whole history.
+          fetch-depth: 0
+          fetch-tags: true
+      - name: resolve the tags
+        id: resolve
+        env:
+          STORE_UPGRADE_TAGS: ${{ inputs.tags }}
+        run: |
+          if [ -n "${STORE_UPGRADE_TAGS:-}" ]; then
+            tags="${STORE_UPGRADE_TAGS}"
+          else
+            tags=$(scripts/store-upgrade.sh --resolve-tags) || exit 1
+          fi
+          if [ -z "$tags" ]; then
+            echo "::error::the tag ladder resolved to nothing: the stand-ins must cover it"
+            exit 1
+          fi
+          printf '%s\n' "$tags"
+          echo "count=$(printf '%s\n' "$tags" | wc -l | tr -d ' ')" >> "$GITHUB_OUTPUT"
+
+  # One job: the ladder is short (a cap of 8 lives in the script), and the
+  # tagged builds share nothing, so a matrix would only duplicate the
+  # checkout work. Per-tag caches come with the dynamic-matrix split, when
+  # the ladder outgrows one job.
+  prove:
+    name: open and upgrade every tagged store
+    needs: resolve
+    if: needs.resolve.outputs.count != '0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: the ancestors of the stores carry no ACL
+        run: |
+          # The private-dir check refuses a data directory whose ancestors
+          # carry an ACL beyond their mode bits, and the ubuntu-24.04
+          # runner gives /home a default ACL. The check names this fix.
+          if command -v setfacl > /dev/null && getfacl /home 2> /dev/null | grep -q '^default:'; then
+            sudo setfacl -b /home
+          fi
+      - name: prove the tagged ladder
+        env:
+          STORE_UPGRADE_TAGS: ${{ inputs.tags }}
+          WORK: ${{ runner.temp }}/store-upgrade
+        run: scripts/store-upgrade.sh
