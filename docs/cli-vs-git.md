@@ -9,8 +9,8 @@ behind the mappings are in
 
 | scn | git | gh | what it does |
 |---|---|---|---|
-| `scn cat REV:PATH` | `git show REV:PATH` | `gh api repos/O/R/contents/PATH?ref=REV` (a branch or a tag) | read one file, no clone |
-| `scn ls REV[:DIR]` | `git ls-tree REV[:DIR]` | `gh api repos/O/R/contents/DIR?ref=B` | mode, kind, size, name per entry |
+| `scn cat REV:PATH` | `git show REV:PATH` | `gh api repos/O/R/contents/PATH?ref=REV` (a branch, a tag or a commit) | read one file, no clone |
+| `scn ls REV[:DIR]` | `git ls-tree REV[:DIR]` | `gh api repos/O/R/contents/DIR?ref=REV` | mode, kind, size, name per entry |
 | `scn log [REV]` | `git log --first-parent` | `gh api repos/O/R/commits?sha=B` | history, newest first; `scn log` is first-parent only, `gh` lists all parents |
 | `scn blame REV:PATH` | `git blame --first-parent REV:PATH` | none (GitHub has no blame API) | per-line authorship, renames followed |
 | `scn show REV` | `git show --stat REV` | `gh api repos/O/R/commits/SHA` | one changeset: message, author, changed paths |
