@@ -274,8 +274,17 @@ line is readable by every local account (`ps`), an environment value
 by the same user and root, and a file with the checks of the access
 file by whoever can read it.
 
+The database must hold the schema before the first serve: an open whose
+`search_path` names a schema that does not exist is refused (`the URL's
+search_path names no existing schema; create it first`). Make it once,
+before the first start:
+
 ```sh
-printf 'postgres://user@dbhost/scion?sslmode=require\n' > /srv/scion/db-url
+psql 'postgres://user@dbhost/scion?sslmode=require' -c 'CREATE SCHEMA scion'
+```
+
+```sh
+printf 'postgres://user@dbhost/scion?sslmode=require&options=--search_path%3Dscion\n' > /srv/scion/db-url
 chmod 600 /srv/scion/db-url
 scion-server --data /srv/scion \
   --postgres-url-file /srv/scion/db-url \
@@ -378,7 +387,10 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
   above that name the one-server lock and the fence are Postgres only.
 
 Backup and restore of a Postgres-backed server: `pg_dump` the database
-first, then copy the data directory. A changeset in the dump names only
+first, then copy the data directory. One database can hold several stores,
+each in its own schema; a dump of the database backs up every store in it,
+and one store alone is `pg_dump --schema <name>` (its restore reads back
+into the schema of the same name). A changeset in the dump names only
 blob files that existed when the dump was taken, and a blob file is written
 before its database row commits, so the later copy holds every file the
 dump names. Restore into a fresh database, copy the data directory back,
@@ -388,11 +400,16 @@ start the server with the same `--postgres-url`.
 
 `--token` and `--access` are exclusive. An access file names tokens by their
 BLAKE3 digest (never the token itself) and maps each to a principal with
-per-repo read and write rules:
+per-repo read and write rules. Every line is tab-separated, and the columns
+are: the line's kind (`token`, `read`, `write`), the principal, then what
+the line grants - a digest on a `token` line, a repo name on a `read` or
+`write` line. A `read` or `write` line may carry one more column, a path
+prefix that limits the rule to that folder (`read\tops\tmain\tsrc/a`
+covers `src/a/...`, not `srcx`); without it the line covers the whole repo:
 
 ```sh
 TOK=$(printf %s <SECRET> | ./scion-server hash-token)
-printf 'token\tops\t%s\nread\tops\tr\nwrite\tops\tr\n' "$TOK" > /srv/scion/access.txt
+printf 'token\tops\t%s\nread\tops\tmain\nwrite\tops\tmain\n' "$TOK" > /srv/scion/access.txt
 chmod 600 /srv/scion/access.txt
 ./scion-server --data /srv/scion serve --access /srv/scion/access.txt \
   --ticket-key /srv/scion-keys/ticket.key
