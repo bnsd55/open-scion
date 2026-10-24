@@ -272,7 +272,9 @@ fn an_unknown_timezone_date_is_refused() {
     let bad = git.run(&["rev-parse", "main"]);
     // git really wrote the unknown offset.
     assert!(
-        git.raw(&["cat-file", "commit", &bad], b"").windows(5).any(|w| w == b"-0000"),
+        git.raw(&["cat-file", "commit", &bad], b"")
+            .windows(5)
+            .any(|w| w == b"-0000"),
         "the fixture's commit carries -0000"
     );
 
