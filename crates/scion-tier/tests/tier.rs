@@ -1813,3 +1813,76 @@ fn agrees(store: &DiskStore, file: &(String, Vec<u8>, std::path::PathBuf, u64)) 
         Err(_) => false,
     }
 }
+
+/// The daemon's stderr stays quiet and colorless across reads: no escape
+/// byte (color only when stderr is a terminal), and nothing per call (the
+/// `GetObjects` line is DEBUG; the hit and miss counts are the metrics'
+/// `cache_counts`). The 20 reads return their objects, so the quiet is
+/// not a broken daemon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemons_stderr_stays_quiet_and_colorless_across_gets() {
+    use std::process::Command;
+    use std::time::Instant;
+
+    let object = blob(b"once per request is not a log level\n");
+    let fake = Fake::new(&[&object], Duration::ZERO);
+    let upstream = serve_fake(fake.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let log = dir.path().join("daemon.log");
+    let data = dir.path().join("data");
+    let child = Command::new(env!("CARGO_BIN_EXE_scion-daemon"))
+        .arg("--data")
+        .arg(&data)
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--upstream")
+        .arg(&upstream)
+        .arg("--max-bytes")
+        .arg((8 << 20).to_string())
+        .arg("--token")
+        .arg(TOKEN)
+        .arg("--upstream-token")
+        .arg(TOKEN)
+        // The caller's RUST_LOG must not steer the daemon's log filter:
+        // RUST_LOG=debug would bring the per-call line back, RUST_LOG=off
+        // would silence the check entirely.
+        .env_remove("RUST_LOG")
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .map(Kill)
+        .unwrap();
+    // The child is up when its socket file is there (10 s ceiling).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !socket.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never opened its socket"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let mut client = connect(&format!("unix://{}", socket.display()), Some(TOKEN)).await;
+
+    // One read, then measure what the daemon has logged.
+    get(&mut client, &fake, &[&object]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let after_one = std::fs::read(&log).unwrap().len();
+
+    // Nineteen more reads: a line per call would add about 19 lines.
+    for _ in 0..19 {
+        get(&mut client, &fake, &[&object]).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let bytes = std::fs::read(&log).unwrap();
+    assert!(
+        !bytes.contains(&0x1b),
+        "the daemon's stderr carries escape bytes: color is not a terminal's business"
+    );
+    let grew = bytes.len() - after_one;
+    assert!(
+        grew < 200,
+        "the daemon logged {grew} bytes across 19 reads: a line per call"
+    );
+    drop(child);
+}

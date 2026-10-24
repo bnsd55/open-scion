@@ -99,8 +99,10 @@ pub async fn commit(ctx: &mut Ctx, args: CommitArgs) -> Result<()> {
         let state = match edit {
             Edit::Delete => None,
             Edit::Link(target) => {
-                // SHORTCUT: reads each target whole, so memory caps the
-                // length. Upgrade: stream chunks.
+                // SHORTCUT: reads each target whole, but a target is one
+                // path, so its length is PATH_MAX (4096 bytes on Linux,
+                // 1024 on macOS). Upgrade: none short of the protocol
+                // renaming symlink targets to blob ids.
                 let content = ctx
                     .put_blob(target)
                     .await
@@ -108,12 +110,9 @@ pub async fn commit(ctx: &mut Ctx, args: CommitArgs) -> Result<()> {
                 Some(FileState::Symlink { target: content })
             }
             Edit::Put { file, exec } => {
-                // SHORTCUT: reads each file whole, so memory caps the file
-                // size (the server caps it at 100 MiB). Upgrade: stream
-                // chunks from the file.
-                let data = read_put(&file)?;
+                check_put(&file)?;
                 let content = ctx
-                    .put_blob(data)
+                    .put_blob_file(&file)
                     .await
                     .with_context(|| format!("cannot upload {}", file.display()))?;
                 Some(FileState::Regular {
@@ -167,10 +166,10 @@ fn arg_edits(args: &CommitArgs) -> Result<BTreeMap<RepoPath, Edit>> {
     Ok(edits)
 }
 
-/// Reads the local file of a put, and refuses anything that is not a
-/// regular file: a device or FIFO never sees an end, so the read would
+/// Refuses anything that is not a regular file, before any byte is
+/// read: a device or FIFO never sees an end, so a stream of one would
 /// grow until the OOM killer.
-fn read_put(file: &Path) -> Result<Vec<u8>> {
+fn check_put(file: &Path) -> Result<()> {
     let meta =
         std::fs::metadata(file).with_context(|| format!("cannot read {}", file.display()))?;
     if !meta.is_file() {
@@ -179,7 +178,7 @@ fn read_put(file: &Path) -> Result<Vec<u8>> {
             file.display()
         );
     }
-    std::fs::read(file).with_context(|| format!("cannot read {}", file.display()))
+    Ok(())
 }
 
 /// Splits `Name <email>` into name and email bytes.
@@ -235,7 +234,7 @@ mod tests {
         let _serial = crate::fork_gate::serial();
         let refused = |file: std::path::PathBuf| {
             let (sent, done) = std::sync::mpsc::channel();
-            std::thread::spawn(move || sent.send(read_put(&file).is_err()).unwrap());
+            std::thread::spawn(move || sent.send(check_put(&file).is_err()).unwrap());
             // The refusal needs no read: one that hangs fails the test.
             done.recv_timeout(Duration::from_secs(2))
                 .unwrap_or_else(|_| panic!("the read was not refused at once"))

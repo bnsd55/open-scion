@@ -711,12 +711,15 @@ impl ScionService {
 /// protocol: a message over them fails the call on whichever side finds it
 /// first (section 2 of protocol-v1).
 ///
-/// SHORTCUT: a unary reply's bytes stay in HTTP/2 uncounted until the
-/// client reads them or the connection closes; the largest one left is
-/// `Diff` (about 120 KB), so a client that never reads holds at most its
-/// connections x streams of those. Every reply that can grow with its
-/// input streams; a new unary RPC must stream, or bound its reply, before
-/// it ships.
+/// SHORTCUT: the reply-memory budget (#586) bounds the unary replies
+/// parked in HTTP/2, so a client that never reads holds the budget -
+/// `REPLY_MEMORY_BUDGET`, 128 MiB across every connection - not the
+/// server's memory. The residual: the count is the reply's encoded
+/// length set by its handler, not the wire bytes (the 5-byte gRPC
+/// frame prefix of each parked reply stays uncounted), and a
+/// committed write's reply goes out uncounted by design. A new unary
+/// RPC must still mark its reply, or stream, before it ships: the
+/// layer's test seam fails the handler that forgets.
 pub fn into_server<S: Scion + Send + 'static>(service: S) -> ScionServer<S> {
     ScionServer::new(service)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
