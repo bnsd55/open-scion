@@ -678,7 +678,12 @@ impl<S: Store> Tier<S> {
             produce,
         )
         .await;
-        tracing::info!(
+        // Per call, so it is DEBUG: the daemon and cache serve a tier's
+        // whole traffic through here, and a line per call at INFO was
+        // 7.7 GB in 66 h of the soak (#399 Run A). The hit and miss
+        // counts are already the metrics' cache_counts, so the log
+        // carries nothing the metrics do not.
+        tracing::debug!(
             repo = %ask.repo,
             objects = ask.keys.len(),
             hits = progress.hits.load(Ordering::Relaxed),
