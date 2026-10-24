@@ -69,6 +69,9 @@ git -C "$WORK/git" -c user.name=Ada -c user.email=ada@example.com \
 git -C "$WORK/git" -c user.name=Ada -c user.email=ada@example.com \
   commit -q -m conformance
 
+# D25: the server refuses a missing data directory; create it here, 0700.
+mkdir -p "$WORK/data"
+chmod 700 "$WORK/data"
 NO_COLOR=1 "$BIN" --data "$WORK/data" import "$WORK/git" --repo r --ref main \
   --verify 0 > /dev/null
 

@@ -291,12 +291,29 @@ impl Server {
         Self::spawn_with_url(heading, data, postgres_url.as_deref(), log)
     }
 
+    /// The harness's data-directory make: private, whatever the umask.
+    #[cfg(unix)]
+    fn make_private_dir(data: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::create_dir_all(data).unwrap();
+        fs::set_permissions(data, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     fn spawn_with_url(
         heading: &'static str,
         data: &Path,
         postgres_url: Option<&str>,
         log: &Path,
     ) -> Self {
+        // D25: the binary refuses a missing data directory; the harness
+        // is for servers that serve, so it makes the directory the way
+        // the runbook's operator does: private.
+        if !data.exists() {
+            #[cfg(unix)]
+            Self::make_private_dir(data);
+            #[cfg(not(unix))]
+            fs::create_dir_all(data).unwrap();
+        }
         let argv = Self::guide_argv(heading, data);
         let log_file = fs::OpenOptions::new()
             .create(true)

@@ -8,7 +8,7 @@ use scion_proto::v1::{
 use serde_json::{Value, json};
 use tonic::{Status, Streaming};
 
-use crate::client::{Ctx, MAX_JOINED_REPLY_BYTES, id_from, lossy, split_spec};
+use crate::client::{Ctx, MAX_JOINED_REPLY_BYTES, id_from, lossy, put_json_bytes, split_spec};
 use crate::out::{flush, write_all};
 use crate::outln;
 
@@ -94,7 +94,7 @@ pub async fn ls(ctx: &mut Ctx, spec: &str) -> Result<()> {
             .iter()
             .map(|(name, entry)| {
                 let mut value = entry_json(entry);
-                value["name"] = lossy(name.as_bytes()).into();
+                put_json_bytes(&mut value, "name", name.as_bytes());
                 value
             })
             .collect();
@@ -216,7 +216,7 @@ pub async fn show(ctx: &mut Ctx, rev: &str) -> Result<()> {
                     }
                     None => json!({ "op": "delete" }),
                 };
-                change["path"] = lossy(path.as_bytes()).into();
+                put_json_bytes(&mut change, "path", path.as_bytes());
                 change
             })
             .collect();
@@ -294,22 +294,27 @@ fn identity(who: &IdentityTime) -> String {
 }
 
 pub(crate) fn identity_json(who: &IdentityTime) -> Value {
-    json!({
+    let mut value = json!({
         "name": lossy(who.name()),
         "email": lossy(who.email()),
         "unix_secs": who.unix_secs(),
         "tz_offset_minutes": who.tz_offset_minutes(),
-    })
+    });
+    put_json_bytes(&mut value, "name", who.name());
+    put_json_bytes(&mut value, "email", who.email());
+    value
 }
 
 fn changeset_json(id: ChangesetId, cs: &Changeset) -> Value {
-    json!({
+    let mut value = json!({
         "id": id.to_string(),
         "parents": cs.parents().iter().map(ToString::to_string).collect::<Vec<_>>(),
         "author": identity_json(cs.author()),
         "committer": cs.committer().map(identity_json),
         "message": lossy(cs.message()),
-    })
+    });
+    put_json_bytes(&mut value, "message", cs.message());
+    value
 }
 
 /// An entry as JSON: kind, ID, and the executable flag of a regular file.

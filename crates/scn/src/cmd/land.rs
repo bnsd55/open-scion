@@ -75,14 +75,31 @@ fn print_outcome(json: bool, reply: &LandResponse) -> Result<()> {
         .map(|p| lossy(p).into_owned())
         .collect();
     if json {
-        let out = json!({
+        use base64::Engine as _;
+        let mut value = json!({
             "land_id": reply.land_id,
             "state": reply.state().as_str_name(),
             "result": result.map(|id| id.to_string()),
             "detail": reply.detail,
             "conflict_paths": paths,
         });
-        outln!("{out}");
+        // An array element carries no sibling field, so the exact bytes
+        // travel as a whole sibling array, in the same order, only when a
+        // path is not valid UTF-8.
+        if reply
+            .conflict_paths
+            .iter()
+            .any(|p| std::str::from_utf8(p).is_err())
+        {
+            value["conflict_paths_b64"] = serde_json::Value::from(
+                reply
+                    .conflict_paths
+                    .iter()
+                    .map(|p| base64::engine::general_purpose::STANDARD.encode(p))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        outln!("{value}");
         return Ok(());
     }
     match (reply.state(), result) {
