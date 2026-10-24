@@ -396,7 +396,7 @@ resume_and_check() {
     sleep 5
   done
   if [ "${SCION_FAULT_PG:-0}" = "1" ]; then
-    false # PROOF-INJECTION: the pg_restart call is skipped
+    : # PROOF-INJECTION: the pg_restart call is skipped
     t0=$(date +%s)
     until [ "$(latency)" -gt 0 ]; do
       [ "$(($(date +%s) - t0))" -lt 60 ] || {
