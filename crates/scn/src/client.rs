@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::fs;
+use std::io::Read as _;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,6 +16,7 @@ use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest, ResolveRefRequest};
 use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES, MAX_PART_MESSAGE_BYTES};
+use tokio_stream::{StreamExt as _, wrappers::ReceiverStream};
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
@@ -89,6 +91,61 @@ impl Interceptor for Call {
             .insert(request_id::REQUEST_ID, self.request_id.clone());
         Ok(request)
     }
+}
+
+/// Maps a read failure of a streaming put to the refusal that names the
+/// file: it changed while it was read, so the read saw a torn mix. Other
+/// errors pass as themselves.
+fn changed(file: &Path, e: std::io::Error) -> std::io::Error {
+    if e.kind() == std::io::ErrorKind::UnexpectedEof || e.kind() == std::io::ErrorKind::InvalidData
+    {
+        std::io::Error::other(format!(
+            "{} changed while it was read; commit again",
+            file.display()
+        ))
+    } else {
+        e
+    }
+}
+
+/// The pause between the file's metadata read and its first chunk, for
+/// the test that truncates the file there. One-shot: the first put
+/// takes it, the rest pass. Test-hooks only.
+#[cfg(any(test, feature = "test-hooks"))]
+static PUT_PAUSE: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
+/// Installs the pause the next streaming put takes between its metadata
+/// read and its first chunk read, or takes the installed one back with
+/// `None`.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn set_put_pause(pause: Option<Box<dyn Fn() + Send + Sync>>) {
+    *PUT_PAUSE.lock().unwrap() = pause;
+}
+
+/// Runs the installed pause, if any.
+#[cfg(any(test, feature = "test-hooks"))]
+fn take_put_pause() {
+    if let Some(pause) = PUT_PAUSE.lock().unwrap().take() {
+        pause();
+    }
+}
+
+/// The pause never exists outside the tests.
+#[cfg(not(any(test, feature = "test-hooks")))]
+fn take_put_pause() {}
+
+/// Whether the streaming put's whole-file mutation lever is flipped
+/// (`SCION_TEST_COMMIT_MUTATION` = `whole_file`). Test-hooks only: the
+/// ceiling guard sets it to prove the guard is not vacuous.
+#[cfg(any(test, feature = "test-hooks"))]
+fn mutation_whole_file() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    *ENV.get_or_init(|| {
+        std::env::var_os("SCION_TEST_COMMIT_MUTATION").as_deref()
+            == Some(std::ffi::OsStr::new("whole_file"))
+    }) || ON.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// The `Objects` client of `url`, for the tests, with a 10s timeout.
@@ -238,6 +295,103 @@ impl Ctx {
             .with_context(|| format!("cannot resolve {rev:?}"))?
             .into_inner();
         id_from(&reply.changeset_id)
+    }
+
+    /// Uploads one file's content in chunks streamed from the file
+    /// itself. The first message names the repo; an empty file still
+    /// sends one (empty) message. The caller has checked the file is
+    /// regular: a stream of a device or FIFO never ends. The file must
+    /// keep the size and mtime it had when this was called: if it
+    /// shrank, grew or was rewritten while it was read, the upload
+    /// fails and names the file.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the file changed while it was read, or the upload
+    /// fails.
+    pub async fn put_blob_file(&mut self, file: &Path) -> Result<BlobId> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if mutation_whole_file() {
+            // The ceiling guard's lever: the old whole-file read, so
+            // the guard can prove it is not vacuous.
+            return self.put_blob(fs::read(file)?).await;
+        }
+        let path = file.to_path_buf();
+        // Two chunks in flight, so the reader never runs far past the
+        // network drain.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+        // The read's verdict, after its last chunk or its refusal.
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<std::io::Result<()>>();
+        std::thread::spawn(move || {
+            let read = (|| -> std::io::Result<()> {
+                // The size and mtime come from the handle, so the
+                // numbers belong to the file that was read.
+                let mut f = fs::File::open(&path)?;
+                let before = f.metadata()?;
+                let len = before.len();
+                let modified = before.modified()?;
+                // The torn-read tests truncate the file here, between
+                // the metadata read and the first chunk.
+                take_put_pause();
+                let mut left = len;
+                loop {
+                    // The last chunk is the short one; CHUNK_BYTES fits
+                    // any pointer width.
+                    let want = usize::try_from(left.min(CHUNK_BYTES as u64))
+                        .expect("the chunk size fits usize");
+                    let mut chunk = vec![0_u8; want];
+                    f.read_exact(&mut chunk).map_err(|e| changed(&path, e))?;
+                    left -= want as u64;
+                    if tx.blocking_send(chunk).is_err() {
+                        return Ok(()); // the call died; no one reads on
+                    }
+                    if left == 0 {
+                        break;
+                    }
+                }
+                // A byte past the length: the file grew.
+                let mut one = [0_u8; 1];
+                if f.read(&mut one)? > 0 {
+                    return Err(changed(
+                        &path,
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, "grew"),
+                    ));
+                }
+                let after = f.metadata()?;
+                // SHORTCUT: the rewrite check compares mtime, so a
+                // same-size rewrite inside the filesystem's timestamp
+                // granularity (FAT/exFAT 2 s, some NFS/FUSE mounts
+                // 1 s) passes and a torn mix commits with no error;
+                // ext4 and APFS are nanosecond, so a production cell
+                // cannot hit it. Upgrade path: compare ctime too, or
+                // re-read and hash the file.
+                if after.len() != len || after.modified()? != modified {
+                    return Err(changed(
+                        &path,
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, "rewritten"),
+                    ));
+                }
+                Ok(())
+            })();
+            // The chunks the call never took die with the channel.
+            drop(tx);
+            let _ = done_tx.send(read);
+        });
+        let mut first = Some(self.repo.clone());
+        let requests = ReceiverStream::new(rx).map(move |chunk| PutBlobRequest {
+            repo: first.take().unwrap_or_default(),
+            data: chunk,
+        });
+        // The reply decides with the read: a refusal of the read names
+        // the file, whatever the server answered about the parts.
+        let reply = self.client.put_blob(requests).await;
+        // The reader always answers, even when the call died first; if
+        // it died itself, the call's own error tells the story.
+        if let Ok(Err(e)) = done_rx.await {
+            return Err(e.into());
+        }
+        let reply = reply?.into_inner();
+        id_from(&reply.blob_id)
     }
 
     /// Uploads one file's content in chunks. The first message names the repo;
