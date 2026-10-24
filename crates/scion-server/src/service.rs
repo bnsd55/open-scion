@@ -714,9 +714,12 @@ impl ScionService {
 /// SHORTCUT: a unary reply's bytes stay in HTTP/2 uncounted until the
 /// client reads them or the connection closes; the largest one left is
 /// `Diff` (about 120 KB), so a client that never reads holds at most its
-/// connections x streams of those. Every reply that can grow with its
-/// input streams; a new unary RPC must stream, or bound its reply, before
-/// it ships.
+/// connections x streams of those. A whole-object reply (`ListDir`,
+/// `GetChangeset`, `ReadFile`) is bounded twice: its built body takes
+/// the read budget (`READ_BUDGET_BYTES`) before the body is built, and
+/// the parts it has sent ride the per-connection stalled-bytes cap,
+/// whose connection is closed over the cap. A new unary RPC must
+/// stream, or bound its reply, before it ships.
 pub fn into_server<S: Scion + Send + 'static>(service: S) -> ScionServer<S> {
     ScionServer::new(service)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)

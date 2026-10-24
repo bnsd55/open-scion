@@ -88,6 +88,29 @@ one client may hold open at once, and `--max-stalled-bytes` (64 MiB)
 bounds what the stalled replies of one connection may hold before the
 connection is closed. A cache and a daemon take the same three flags.
 
+What one server process can hold for clients that never read, at the
+defaults, in the worst case:
+
+    128 connections x 64 MiB stalled bytes   8192 MiB
+    the read budget (whole-object replies)     256 MiB
+    the reply budget (unary replies)           128 MiB
+    ------------------------------------------ --------
+    about                                      8.4 GiB
+
+The first line is `--max-connections` x `--max-stalled-bytes`
+(`DEFAULT_CONNECTIONS`, `DEFAULT_STALLED_BYTES` in
+crates/scion-proto/src/runtime/listen.rs): a connection whose stalled
+replies hold more than `--max-stalled-bytes` is closed, and what they
+hold goes free, so a slow client costs at most its own connection,
+not a share of the server. The second is the read budget that a
+whole-object reply's built body takes before the body is built
+(`READ_BUDGET_BYTES` in crates/scion-server/src/service.rs); the
+third is the unary-reply budget (`REPLY_MEMORY_BUDGET` in
+crates/scion-server/src/reply.rs). Size the server's memory from that
+sum: fewer connections, a smaller stall cap, or both, take the first
+line down linearly.
+
+
 Choose the tokens with care: `--token T` (or `SCION_TOKEN=T`) makes one
 principal, `default`, with every right on every repo. A token on the command
 line is readable by every local account, so the argv form warns and goes
