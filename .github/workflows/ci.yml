@@ -263,6 +263,16 @@ jobs:
             echo "== cargo deny check in $dir"
             (cd "$dir" && cargo deny --config deny.toml check)
           done
+          # A lock that no longer matches its manifest means the lock was
+          # left behind by a manifest bump: a fuzz build would re-resolve
+          # it in place, so a stale pin (it happened: the gix advisory
+          # rode a fuzz lock after the root moved) never fails a job.
+          # --locked fails on the first drift, named per sub-workspace.
+          for toml in crates/*/fuzz/Cargo.toml; do
+            echo "== the lock matches the manifest in $(dirname "$toml")"
+            cargo metadata --locked --format-version 1 \
+              --manifest-path "$toml" > /dev/null
+          done
       # A new sub-workspace whose lockfile sits outside the loop above
       # would carry advisories unseen again; this names it.
       - run: scripts/check-deny-coverage.sh
