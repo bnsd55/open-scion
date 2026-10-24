@@ -445,8 +445,11 @@ jobs:
           # them as mismatched data (pg.rs read 6% while its job ran
           # 635 tests green). With the units in hand the count is zero
           # by construction, and the assert below holds the line.
-          pd="$(find "$(rustc --print sysroot)" -name llvm-profdata -type f | head -1)"
-          lcv="$(find "$(rustc --print sysroot)" -name llvm-cov -type f | head -1)"
+          # -quit, not head: a head-truncated find dies of SIGPIPE, and
+          # pipefail turns that into a failed assignment (exit 141,
+          # reported as 1) before the report ever starts.
+          pd="$(find "$(rustc --print sysroot)" -type f -name llvm-profdata -quit)"
+          lcv="$(find "$(rustc --print sysroot)" -type f -name llvm-cov -quit)"
           "$pd" merge -sparse target/coverage/*.profraw \
             -o target/coverage/merged.profdata
           objects=$(find target/units-sqlite target/units-postgres -type f | sort | tr '\n' ' ')
