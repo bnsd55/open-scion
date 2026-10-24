@@ -23,7 +23,9 @@ Make the project safe to install anywhere it claims to work.
   matrix over ubuntu-24.04 and macos-15, since [#326](https://github.com/bnsd55/openscion/pull/326).
 - Known flaky tests, named until they are fixed, the gate closes when
   the nightly confirms their fixes: the land-cut audit test's call
-  counting (a fix waits on every call before it counts, #554); the
+  counting (fixed: the test runs rounds of 8 until one cuts a call, 10
+  at most, and every round's calls are held to the promise,
+  [#577](https://github.com/bnsd55/openscion/pull/577)); the
   graph-query cap test's two 10 s liveness bounds, too tight for the
   arm64 job's debug build (the bounds move to 120 s, #556); the
   land-model cost the arm64 run exposes; and the admin-audit seed's
@@ -169,8 +171,9 @@ Freeze the surfaces users need, not the implementation.
 - Tickets and snapshots follow the N and N-1 mixed-version window.
 - The version matrix runs the supported client, server, cache, daemon
   and store pairs.
-- A store written by every tagged release opens and upgrades. Rollback
-  restores the pre-upgrade backup.
+- A store written by the newest 8 tagged releases opens and upgrades
+  (an older tag is named in a warning, not built). Rollback restores the
+  pre-upgrade backup.
 - A full repository exports to a versioned logical archive. CI verifies
   and restores the archive.
 - Postgres 17 is promoted to production (D23) when all of it holds:
@@ -178,7 +181,8 @@ Freeze the surfaces users need, not the implementation.
   passes on Postgres 17, the real Postgres fault rows pass, backup and
   restore pass on Postgres 17, and the release-candidate trial runs on
   Postgres 17 as well as on SQLite. The durability evidence of v0.5 is
-  the floor this stands on.
+  the floor this stands on. The per-requirement gap list with the
+  evidence behind each verdict is `docs/pg17-qualification.md`.
 - No crate publishes to crates.io at v1.0 (D12). A narrow client crate
   may publish when a real outside consumer exists. The server, tier and
   CLI internals stay private, and a machine check watches the facade

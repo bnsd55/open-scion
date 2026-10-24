@@ -53,6 +53,7 @@ jobs:
       pg: ${{ steps.files.outputs.pg }}
       macos: ${{ steps.files.outputs.macos }}
       workflows: ${{ steps.files.outputs.workflows }}
+      deps: ${{ steps.files.outputs.deps }}
     steps:
       - id: files
         env:
@@ -67,6 +68,7 @@ jobs:
           pg=false
           macos=false
           workflows=false
+          deps=false
           while IFS= read -r line; do
             [ -z "$line" ] && continue
             status=${line%% *}
@@ -121,12 +123,25 @@ jobs:
             case "$file" in
               .github/workflows/*|scripts/release*) workflows=true ;;
             esac
+            # A dependency surface: any manifest, any lockfile (the
+            # root's or a fuzz workspace's), the deny configuration a
+            # lockfile is checked against, and the coverage script
+            # that keeps every lockfile checked. cargo-deny runs for
+            # the pull request that touches one, so an advisory or a
+            # bad license fails before the merge, not on main after it.
+            case "$file" in
+              Cargo.toml|*/Cargo.toml|\
+              Cargo.lock|*/Cargo.lock|\
+              deny.toml|*/deny.toml|\
+              scripts/check-deny-coverage.sh) deps=true ;;
+            esac
           done <<< "$files"
           {
             echo "docs_only=$docs_only"
             echo "pg=$pg"
             echo "macos=$macos"
             echo "workflows=$workflows"
+            echo "deps=$deps"
           } >> "$GITHUB_OUTPUT"
 
   lint:
@@ -152,18 +167,28 @@ jobs:
       - name: the changelog takes fragments, not edits
         if: github.event_name == 'pull_request'
         run: scripts/check-changelog.sh
+      # Depth 2 feeds this too: the pull request's own change is
+      # HEAD^1..HEAD, so a golden re-pin must carry its format doc's
+      # version line in the same pull request.
+      - name: a golden change moves its format doc's version
+        if: github.event_name == 'pull_request'
+        run: scripts/check-golden-pairing.sh
       - name: the changelog merge script does what it says
         run: scripts/test-merge-changelog.sh
-      # The release pipeline's tag verdicts, fed canned tag objects: no
-      # CI run holds a signed release tag, so the decision is tested
-      # here instead of being trusted.
       - name: the release tag verdicts hold (release-verify-tag)
         run: scripts/test-release-verify-tag.sh
+      # The store-upgrade ladder's cap: 9 tags -> 8 kept + a warning
+      # naming the dropped ones. No store-upgrade run holds 9 tags
+      # today, so the decision is tested here on a fixture repo.
+      - name: the store ladder keeps the newest 8 and names the rest
+        run: scripts/test-store-upgrade-cap.sh
       # A workflow that cannot parse fails here, on the PR that carries
       # it, not main's next push-triggered run (#416, #419). The
       # actionlint release is pinned by version and sha256.
       - name: the workflows parse (actionlint)
         run: scripts/lint-workflows.sh
+      - name: the capacity reader counters count the log's own shapes
+        run: scripts/test-capacity-counters.sh
       - name: a script that dies leaves no owned process
         run: scripts/test-owned-run.sh
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -208,8 +233,14 @@ jobs:
 
   supply-chain:
     name: cargo-deny
-    # The slow tier: main, the nightly and a dispatch only.
-    if: github.event_name != 'pull_request'
+    needs: tier
+    # The slow tier: main, the nightly and a dispatch only -- plus a
+    # pull request that touches a dependency surface (a manifest, a
+    # lockfile, a deny.toml or the coverage script), so an advisory or
+    # a bad license fails on the pull request instead of on main after
+    # the merge. A draft skips every job, this one included.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.deps == 'true')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -225,6 +256,16 @@ jobs:
       # root holds hold here too.
       - name: cargo deny check, in every fuzz sub-workspace
         run: |
+          # The lock check runs BEFORE cargo deny: cargo deny resolves a
+          # stale lock in place (its own resolution may write the
+          # lockfile), so a check after it would see the lock cargo deny
+          # already fixed, not the stale one the commit carried - the
+          # exact silent re-resolve this check exists to catch.
+          for toml in crates/*/fuzz/Cargo.toml; do
+            echo "== the lock matches the manifest in $(dirname "$toml")"
+            cargo metadata --locked --format-version 1 \
+              --manifest-path "$toml" > /dev/null
+          done
           for lock in crates/*/fuzz/Cargo.lock; do
             dir="$(dirname "$lock")"
             # Fail closed: cargo-deny only warns when its config is

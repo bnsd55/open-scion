@@ -321,10 +321,27 @@ pub fn parse_repo_path(path: &str) -> Result<RepoPath> {
 }
 
 /// Raw bytes as text for display.
-// SHORTCUT: lossy, also in JSON output, so non-UTF-8 names and messages print
-// with replacement characters. Upgrade: escape or base64 raw bytes in JSON.
+///
+/// The JSON output keeps the exact bytes beside the lossy text:
+/// [`put_json_bytes`] writes a sibling `<field>_b64`, standard base64
+/// with padding, only when the bytes are not valid UTF-8.
 pub(crate) fn lossy(bytes: &[u8]) -> Cow<'_, str> {
     String::from_utf8_lossy(bytes)
+}
+
+/// Sets `field` on `value` to the lossy text of `bytes` and, only when
+/// the bytes are not valid UTF-8, adds the sibling `<field>_b64` with the
+/// exact bytes, standard base64 with padding. A script that reads scn's
+/// JSON gets the real bytes back from the sibling; a value that is valid
+/// UTF-8 prints as before, with no extra field.
+pub(crate) fn put_json_bytes(value: &mut serde_json::Value, field: &str, bytes: &[u8]) {
+    value[field] = lossy(bytes).into();
+    if std::str::from_utf8(bytes).is_err() {
+        use base64::Engine as _;
+        value[format!("{field}_b64")] = base64::engine::general_purpose::STANDARD
+            .encode(bytes)
+            .into();
+    }
 }
 
 /// Seconds since the Unix epoch.

@@ -190,6 +190,9 @@ fn a_gc_audit_names_no_blob() {
 /// Runs `scion-server` with `args` after the global `--data`, and returns
 /// its output.
 fn run(data: &std::path::Path, args: &[&str]) -> Output {
+    // D25: the binary refuses a missing data directory; a test that
+    // wants the create-behavior makes the directory itself.
+    fs::create_dir_all(data).unwrap();
     Command::new(env!("CARGO_BIN_EXE_scion-server"))
         .arg("--data")
         .arg(data)

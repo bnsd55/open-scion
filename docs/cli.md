@@ -5,6 +5,17 @@ over gRPC, prints human-readable text by default, and takes `--json` for
 machine-readable output. An error exits 2; `0` is success and `1` is the
 "no" of `scn is-ancestor`.
 
+## Names and messages in JSON
+
+A path, a file name, an author name or email, and a changeset message
+hold raw bytes, which need not be valid UTF-8. In `--json` output every
+such field keeps its lossy text (an invalid byte prints as U+FFFD), and
+a field whose bytes are not valid UTF-8 carries the exact bytes beside
+it in a sibling field named `<field>_b64`: standard base64, with
+padding. A value that is valid UTF-8 prints as before, with no sibling
+field. The human output stays the lossy text; the JSON is the channel
+that round-trips the bytes.
+
 ## Global flags and environment variables
 
 Every command takes these flags, before or after the subcommand:

@@ -143,6 +143,33 @@ impl Backend {
         crate::pg::test_reset_statement_count();
     }
 
+    /// The body fetches the gc's prune made since the last reset: one
+    /// call to `stored_changeset_bodies` is one fetch. A test with a
+    /// small byte budget asserts this is more than one, so the prune
+    /// really goes through the byte-budget chunker. Backend-neutral:
+    /// the counter sits at the gc's call site.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn test_gc_body_fetch_count() -> u64 {
+        crate::gc::test_body_fetch_count()
+    }
+
+    /// Sets the gc's body-fetch count back to zero.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_reset_gc_body_fetch_count() {
+        crate::gc::test_reset_body_fetch_count();
+    }
+
+    /// Shrinks the byte budget of the gc's body fetches, for a test that
+    /// exercises the chunker on small bodies. Pass zero to reset.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_set_gc_body_budget(bytes: usize) {
+        crate::gc::test_set_body_budget(bytes);
+    }
+
     /// Whether the server's first stale-land sweep has finished: a test
     /// that counts a call's statements waits for it, so the sweep's own
     /// statements cannot fall inside its window.

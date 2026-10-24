@@ -375,6 +375,22 @@ fn fsck_command(store: &Backend) -> anyhow::Result<()> {
 /// the same file, checks, and writer the server uses, so the CLI and a
 /// running server append whole lines to one file. A run that cannot
 /// record refuses before it changes anything.
+/// D25: a missing data directory is refused, not created. One rule for
+/// every subcommand that touches a store; `restore` creates its own
+/// target and never sees this.
+fn refuse_missing_data_dir(data: &Path) -> anyhow::Result<()> {
+    if data.is_dir() {
+        return Ok(());
+    }
+    if data.exists() {
+        return Err(anyhow::anyhow!("{} is not a directory", data.display()));
+    }
+    Err(anyhow::anyhow!(
+        "{} does not exist; create it or pass --data",
+        data.display()
+    ))
+}
+
 fn cli_audit(data: &Path, audit_file: Option<&Path>) -> anyhow::Result<scion_server::Audit> {
     let path = audit_file.map_or_else(|| data.join("audit.log"), Path::to_path_buf);
     scion_server::Audit::open(&path)
@@ -753,6 +769,30 @@ async fn main() -> anyhow::Result<()> {
             .await;
         }
         _ => {}
+    }
+    // D25: a missing data directory is refused, not created. Every
+    // subcommand that touches a store or writes into the directory must
+    // find it there; `restore` is the one command whose job is to
+    // create one, `verify` reads only the archive, and `hash-token`
+    // touches no store. A silent `./scion-data` in whatever directory a
+    // run happened to start in has bitten once already: ticket-key
+    // wrote an audit log into the cwd's default, where CI's ACL
+    // refused it.
+    if let Err(refusal) = if matches!(
+        cli.command,
+        Command::Verify { .. } | Command::Restore { .. } | Command::HashToken { .. }
+    ) {
+        Ok(())
+    } else {
+        refuse_missing_data_dir(&cli.data)
+    } {
+        if matches!(cli.command, Command::Fsck) {
+            // fsck's exit table promises 2 for "could not run"
+            // (docs/stability.md, 1.x): the refusal is that case.
+            eprintln!("scion-server fsck: {refusal}");
+            std::process::exit(2);
+        }
+        return Err(refusal);
     }
     let store = match cli.command {
         Command::Import { .. } | Command::Gc { .. } | Command::Export { .. } => {

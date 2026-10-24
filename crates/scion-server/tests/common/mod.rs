@@ -291,12 +291,29 @@ impl Server {
         Self::spawn_with_url(heading, data, postgres_url.as_deref(), log)
     }
 
+    /// The harness's data-directory make: private, whatever the umask.
+    #[cfg(unix)]
+    fn make_private_dir(data: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::create_dir_all(data).unwrap();
+        fs::set_permissions(data, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     fn spawn_with_url(
         heading: &'static str,
         data: &Path,
         postgres_url: Option<&str>,
         log: &Path,
     ) -> Self {
+        // D25: the binary refuses a missing data directory; the harness
+        // is for servers that serve, so it makes the directory the way
+        // the runbook's operator does: private.
+        if !data.exists() {
+            #[cfg(unix)]
+            Self::make_private_dir(data);
+            #[cfg(not(unix))]
+            fs::create_dir_all(data).unwrap();
+        }
         let argv = Self::guide_argv(heading, data);
         let log_file = fs::OpenOptions::new()
             .create(true)
@@ -450,6 +467,69 @@ impl Drop for Server {
         // status, so no zombie outlives the test that started it.
         self.child.kill().ok();
         self.child.wait().ok();
+    }
+}
+
+/// Starts a server on `data` right after a kill. The killed server's
+/// store lock outlives the SIGKILL by a moment: on Postgres the
+/// advisory lock dies with the killed server's session, when the
+/// database gets around to ending that backend, and on SQLite the
+/// flock tears down when the kernel reaps the process. The wait takes
+/// the real condition, bounded at 10 s, and retries ONLY the holder
+/// refusal, one line per try with the elapsed time; any other exit
+/// fails at once. Returns the server and the number of holder refusals
+/// it retried: a test that must prove the wait happened asserts on the
+/// count.
+pub(crate) fn start_after_kill(data: &Path, log: &Path) -> (Server, u64) {
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(10);
+    let mut retried = 0_u64;
+    loop {
+        let mark = usize::try_from(fs::metadata(log).map_or(0, |m| m.len()))
+            .expect("the log's length fits usize");
+        let mut server = Server::spawn(data, log);
+        let mut listening = false;
+        loop {
+            if server.listens(log) {
+                listening = true;
+                break;
+            }
+            if let Some(status) = server.try_wait() {
+                let text = fs::read_to_string(log).unwrap_or_default();
+                let fresh = &text[mark..];
+                // Postgres refuses with the holder message of the
+                // advisory lock; SQLite with the one of the flock.
+                let holder = fresh.contains("another server holds this store")
+                    || fresh.contains("is in use by another server");
+                assert!(
+                    holder,
+                    "the server exited with {status}:
+{fresh}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the server never listened within 10 s:
+{}",
+                fs::read_to_string(log).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if listening {
+            return (server, retried);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the store lock of {} was never released within 10 s",
+            data.display()
+        );
+        retried += 1;
+        eprintln!(
+            "start_after_kill: the killed server's store lock is still held, retrying at {} ms",
+            start.elapsed().as_millis()
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 

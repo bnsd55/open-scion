@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::BufWriter;
 
-use crate::client::{Ctx, id_from, lossy};
+use crate::client::{Ctx, id_from, lossy, put_json_bytes};
 use crate::cmd::read::entry_json;
 use crate::out::{flush, write};
 use crate::outln;
@@ -121,8 +121,10 @@ pub async fn diff(ctx: &mut Ctx, old: &str, new: &str, path: Option<&RepoPath>) 
                     "old": side(old),
                     "new": side(new),
                 });
+                put_json_bytes(&mut value, "path", &entry.path);
                 if renamed {
                     value["old_path"] = lossy(&entry.rename_from).into();
+                    put_json_bytes(&mut value, "old_path", &entry.rename_from);
                     value["similarity"] = entry.similarity.into();
                 }
                 json_entries.push((entry.rename_from, value));

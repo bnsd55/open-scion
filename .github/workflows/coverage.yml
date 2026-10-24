@@ -151,12 +151,13 @@ jobs:
           # log — so the measure fails itself, loudly, while there is
           # still room to log the numbers.
           ( while sleep 30; do date -u +%T; df -h / | tail -1; free -m | awk 'NR==2'; du -sh target/coverage 2>/dev/null; \
+              ps -eo pid,rss,pcpu,etime,comm --sort=-rss | head -4 | tee -a watcher.log; \
               avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9'); \
               mem=$(free -m | awk 'NR==2 {print $7}'); \
               { [ "$avail" -gt 3 ] && [ "$mem" -gt 600 ]; } || { echo 'the runner is out of disk or memory'; df -h /; free -m; ps aux --sort=-rss | head -12; exit 2; }; done ) &
           watcher=$!
           mkdir -p .config
-          printf '[profile.default]\ntimeout = "600s"\nretries = 1\nslow-timeout = { period = "60s", terminate-after = 8 }\n' > .config/nextest.toml
+          printf '[profile.default]\ntimeout = "600s"\nretries = 1\nslow-timeout = { period = "60s", terminate-after = 5 }\n' > .config/nextest.toml
           # The README's recipe: show-env exports the instrumentation
           # RUSTFLAGS and the profile environment, plain cargo nextest
           # runs the tests against the binaries the build makes. The
@@ -171,6 +172,14 @@ jobs:
           ulimit -v 6291456
           # shellcheck disable=SC1090
           source <(cargo llvm-cov show-env --sh)
+          # The build phase writes profiles too: instrumented
+          # proc-macro and build-script processes run while cargo
+          # compiles, and their counters map to no binary the report
+          # reads - they were the 794 "functions have mismatched data"
+          # the corrected split still printed. So the build runs with
+          # profiles discarded, and only the run phase writes them.
+          LLVM_PROFILE_FILE=/dev/null nice -n 19 cargo nextest run \
+            --workspace --no-run
           # One .profraw per test process made thousands per job, and
           # the runner was lost four runs in a row with no log (#565).
           # The %4m pool folds them into four files per test binary.
@@ -194,6 +203,13 @@ jobs:
         with:
           name: measure-log-sqlite
           path: measure.log
+          if-no-files-found: ignore
+      - name: the watcher's process samples, always
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: watcher-sqlite
+          path: watcher.log
           if-no-files-found: ignore
   measure-postgres:
     name: coverage, the postgres backend
@@ -302,6 +318,7 @@ jobs:
         run: |
           set -o pipefail
           ( while sleep 30; do date -u +%T; df -h / | tail -1; free -m | awk 'NR==2'; du -sh target/coverage 2>/dev/null; \
+              ps -eo pid,rss,pcpu,etime,comm --sort=-rss | head -4 | tee -a watcher.log; \
               avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9'); \
               mem=$(free -m | awk 'NR==2 {print $7}'); \
               { [ "$avail" -gt 3 ] && [ "$mem" -gt 600 ]; } || { echo 'the runner is out of disk or memory'; df -h /; free -m; ps aux --sort=-rss | head -12; exit 2; }; done ) &
@@ -311,14 +328,22 @@ jobs:
           source <(cargo llvm-cov show-env --sh)
           # The server crate is what ci.yml's postgres job proves, and
           # the profiles of the default measure already carry its
-          # sqlite-side lines. The one excluded walk runs longer than
-          # its timeout under postgres plus instrumentation.
+          # sqlite-side lines. The build set is the whole workspace so
+          # the crate compiles under the same feature unification as
+          # the default measure and the gate: a -p build gives the
+          # crate a different coverage mapping, and the gate's report
+          # drops the -p side's counters as mismatched data (pg.rs read
+          # 6% while the postgres job ran 635 tests green - the split's
+          # artifact, not missing tests). The run set is the server
+          # crate's tests.
           # SHORTCUT: one graph walk runs longer than eight minutes
           # under postgres plus instrumentation, because the ancestry
           # walk issues one query per node link. Remove this exclusion
           # when the batched ancestry walk lands.
-          nice -n 19 cargo nextest run -p open-scion-server --no-fail-fast \
-            -E 'not test(graph_queries_across_many_merges_answer)' \
+          LLVM_PROFILE_FILE=/dev/null nice -n 19 cargo nextest run \
+            --workspace --no-run
+          nice -n 19 cargo nextest run --workspace --no-fail-fast \
+            -E 'package(open-scion-server) and not test(graph_queries_across_many_merges_answer)' \
             | tee measure-postgres.log
           kill "$watcher"
         env:
@@ -340,6 +365,13 @@ jobs:
         with:
           name: measure-log-postgres
           path: measure.log
+          if-no-files-found: ignore
+      - name: the watcher's process samples, always
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: watcher-postgres
+          path: watcher.log
           if-no-files-found: ignore
   gate:
     name: coverage, the gate
@@ -397,10 +429,58 @@ jobs:
           source <(cargo llvm-cov show-env --sh)
           export CARGO_LLVM_COV_TARGET_DIR="$PWD/target/coverage"
           export CARGO_TARGET_DIR="$PWD/target/coverage"
-          nice -n 19 cargo build --workspace --tests
+          # The gate rebuilds the exact compilation units the measures
+          # built: `cargo test --no-run` compiles the lib in test mode
+          # and every integration test (what nextest builds too), which
+          # plain `cargo build --tests` does not - the unit-test
+          # functions it leaves out were the 1221 "functions have
+          # mismatched data" that no amount of profile hygiene removed.
+          LLVM_PROFILE_FILE=/dev/null nice -n 19 cargo test \
+            --workspace --no-run
           cargo llvm-cov report --summary-only --fail-under-lines 80 \
             ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
+            2> target/coverage/report-stderr.txt \
             | tee target/coverage/report-summary.txt
+          # Guard 1: counters the report could not map are dropped
+          # silently into a warning. That is how the split lost the
+          # whole Postgres side while the total read 84.86% (run
+          # 39932392151: "794 functions have mismatched data", pg.rs
+          # 6%). One mapping flavor and discarded build-phase profiles
+          # fix the side the split lost, but the count is not zero:
+          # a constant 1221 functions in the profiles map to no unit
+          # the gate rebuilds, identical across three dispatches
+          # (39956356938, 39959927635, 39965099329). Naming that set
+          # is follow-up. The gate fails when the count rises above
+          # the constant: new unmappable functions are a regression.
+          # A lost side shows in guard 2's floors, not here.
+          # SHORTCUT: the 1,22x are unnamed profile data the report
+          # drops; the constant moves with main's own unit set (1221
+          # across three dispatches, 1226 after main grew by #574 and
+          # the capacity tests), so the ceiling is the constant plus
+          # headroom, not a fixed truth. Upgrade path = name the set
+          # (C65), then lower the ceiling to what is left, ideally 0.
+          mismatch_ceiling=1300
+          mismatches=$(grep -oE '[0-9]+ functions have mismatched data' \
+            target/coverage/report-stderr.txt | grep -oE '[0-9]+' | head -1)
+          mismatches=${mismatches:-0}
+          echo "functions with mismatched data: $mismatches (ceiling $mismatch_ceiling)"
+          if [ "$mismatches" -gt "$mismatch_ceiling" ]; then
+            echo "the report dropped $mismatches functions it could not map, above the known constant"
+            exit 2
+          fi
+          # Guard 2: the Postgres side's lines must be above a floor.
+          # pg.rs carries the Postgres backend's code; a correct merge
+          # of both measures' profiles reads it far above half. The
+          # floor is half of the corrected reading (run 39947175543's
+          # gate), well under it, so a half-lost merge still fails.
+          pg_floor=45
+          pg_cover=$(awk '$1 == "scion-server/src/pg.rs" {print $10}' \
+            target/coverage/report-summary.txt | tr -d '%')
+          echo "pg.rs lines covered: ${pg_cover:-none}% (floor $pg_floor%)"
+          if [ -z "$pg_cover" ] || [ "${pg_cover%%.*}" -lt "$pg_floor" ]; then
+            echo "pg.rs is below the floor; the Postgres side of the merge is missing"
+            exit 2
+          fi
           # The proof the filter applies: no excluded file may appear
           # in the printed per-file list.
           while IFS= read -r pattern; do
