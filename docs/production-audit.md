@@ -242,8 +242,8 @@ section; its fixes landed as #561. Highlights, with the C50 verdicts:
    open, closed by C54 (§1).
 2. The archive restore's repository-sized RAM hold (§2), and the C60
    Postgres lock-restart runbook + whether `serve` should wait (§2).
-3. `scn commit` whole-file reads (§3), open until #582; the unary
-   reply caps and `lossy` JSON closed (#586, #576).
+3. The unary reply caps and `lossy` JSON closed (#586, #576); the
+   `scn commit` whole-file read closed by #582 (§3).
 4. The database-loop sweep: SQL in loops, `ORDER BY`, isolation (§4).
 6. The data-dir default create-vs-refuse question (§6).
 7. The additive contract goldens that enforce the format policies (§7).
