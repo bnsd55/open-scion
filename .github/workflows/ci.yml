@@ -256,6 +256,16 @@ jobs:
       # root holds hold here too.
       - name: cargo deny check, in every fuzz sub-workspace
         run: |
+          # The lock check runs BEFORE cargo deny: cargo deny resolves a
+          # stale lock in place (its own resolution may write the
+          # lockfile), so a check after it would see the lock cargo deny
+          # already fixed, not the stale one the commit carried - the
+          # exact silent re-resolve this check exists to catch.
+          for toml in crates/*/fuzz/Cargo.toml; do
+            echo "== the lock matches the manifest in $(dirname "$toml")"
+            cargo metadata --locked --format-version 1 \
+              --manifest-path "$toml" > /dev/null
+          done
           for lock in crates/*/fuzz/Cargo.lock; do
             dir="$(dirname "$lock")"
             # Fail closed: cargo-deny only warns when its config is

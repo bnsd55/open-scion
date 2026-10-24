@@ -1,0 +1,7 @@
+# The labels of the self-hosted runner the soak's 72-hour run asks for.
+# actionlint refuses a workflow that names a label no runner declares;
+# the soak's runner is rented for the day a soak runs, so its label is
+# declared here, not by a runner that is rarely up.
+self-hosted-runner:
+  labels:
+    - scion-soak
