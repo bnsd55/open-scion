@@ -278,6 +278,14 @@ that breaks one is caught.
   stranger in the shared bucket. (#414)
   `meter_key`, and the test
   `scion-server/src/audit.rs::one_address_rotating_ports_does_not_bury_a_stranger`
+- **A client that never reads its unary replies holds the budget, not
+  the server's memory.** The reply-memory layer counts every parked
+  unary reply's bytes against one budget (128 MiB across every
+  connection) and refuses further unary reads with `resource_exhausted`
+  while it is spent; a committed write's reply goes out regardless, and
+  every way a reply ends — the reply finishes, the client resets the
+  stream, or the connection closes — frees its share. (#586)
+  `crates/scion-server/tests/reply_budget_h2.rs`
 - **A restore verifies first, and goes only into an empty store.** It
   runs the same `verify` a reader runs and refuses on any damage, and it
   refuses a data directory that already holds a store
