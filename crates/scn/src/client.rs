@@ -140,11 +140,20 @@ fn take_put_pause() {}
 /// ceiling guard sets it to prove the guard is not vacuous.
 #[cfg(any(test, feature = "test-hooks"))]
 fn mutation_whole_file() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    *ENV.get_or_init(|| {
         std::env::var_os("SCION_TEST_COMMIT_MUTATION").as_deref()
             == Some(std::ffi::OsStr::new("whole_file"))
-    })
+    }) || ON.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Flips the whole-file mutation lever, the way the env var does, for a
+/// test that cannot set the process's env safely.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn set_whole_file_mutation(on: bool) {
+    static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    ON.store(on, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// The `Objects` client of `url`, for the tests, with a 10s timeout.

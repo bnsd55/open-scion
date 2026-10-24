@@ -221,9 +221,12 @@ fn an_empty_file_still_commits() {
 #[test]
 fn a_commit_of_a_big_file_stays_under_its_rss_ceiling() {
     const FILE_BYTES: usize = 24 * 1024 * 1024;
-    const CEILING_KB: u64 = 32 * 1024;
+    const CEILING_KB: u32 = 32 * 1024;
     let fx = Fixture::start();
     let file = fx.put_file("huge.bin", FILE_BYTES);
+    // PROOF-INJECTION: the lever flipped, the whole-file read must fail
+    // the ceiling and print its peak. The next commit reverts this.
+    open_scion::client::set_whole_file_mutation(true);
     let out = commit_measured(&fx, "huge.bin", &file);
     assert!(
         out.status.success(),
