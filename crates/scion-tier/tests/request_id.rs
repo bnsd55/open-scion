@@ -161,7 +161,9 @@ fn spawn(bin: &str, args: &[&str], log: &PathBuf) -> Bin {
     let child = Command::new(bin)
         .args(args)
         .env("NO_COLOR", "1")
-        .env("RUST_LOG", "info")
+        // GetObjects logs at DEBUG (its per-call line at INFO was
+        // 7.7 GB in the soak's 66 h), and the id rides that line.
+        .env("RUST_LOG", "debug")
         .stdout(file.try_clone().unwrap())
         .stderr(file)
         .spawn()

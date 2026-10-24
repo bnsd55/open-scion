@@ -88,6 +88,7 @@ pub(crate) mod objects;
 mod pg;
 pub(crate) mod quotas;
 pub(crate) mod read;
+pub(crate) mod reply;
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) mod seed;
 pub(crate) mod service;
@@ -314,6 +315,7 @@ pub use history::{PathHistory, backfill_path_history};
 pub use import::set_import_per_commit_txs;
 pub use import::{ImportOptions, ImportReport, import_git};
 pub use quotas::Quotas;
+pub use reply::REPLY_MEMORY_BUDGET;
 pub use scion_proto::runtime::metrics::Metrics;
 pub use service::{ServeOptions, serve};
 // `ServeOptions` is public and holds the audit handle, so the handle is

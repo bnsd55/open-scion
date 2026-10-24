@@ -106,3 +106,71 @@ jobs:
           name: soak-fault-artifacts
           path: ${{ runner.temp }}/soak-fault-artifacts/
           if-no-files-found: ignore
+
+  # The Postgres arm of the fault soak: the same mixed load, kills and
+  # checks, on a Postgres-backed store, with the database itself
+  # restarted beside every server kill (SCION_FAULT_PG, soak-fault.sh's
+  # pg_restart). Dispatch only: where a long-run Postgres lives is
+  # still open (D10), so the nightly never runs this arm; a dispatch
+  # proves it on demand. The image is pinned tag@sha256 the way the
+  # digest-pin wave (C64) pins the service containers.
+  soak-fault-postgres:
+    name: soak-fault-postgres
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    # The same shape as the SQLite fault soak: 150 min covers 120 min
+    # of load, and the build, the checks and the teardown share the
+    # rest. A dispatch defaults to 10 minutes of load.
+    timeout-minutes: 165
+    services:
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: run the fault soak on Postgres
+        env:
+          RUN_MINUTES: ${{ github.event.inputs.minutes || '120' }}
+          SOAK_RSS_PCT: "150"
+          SOAK_FD_GROWTH: "100"
+          SOAK_P99_FACTOR: "2"
+          # The same baseline window as the SQLite fault soak (#365),
+          # applied per restart segment.
+          SOAK_WARM_SECONDS: "1800"
+          # The backend and its fault: the URL decides the store's
+          # backend (soak-fault.sh exports it as SCION_POSTGRES_URL),
+          # and the restart command restarts this job's own service
+          # container, the only postgres image on the runner.
+          SCION_PG_URL: postgres://postgres:scion@localhost:5432/scion
+          SCION_FAULT_PG: "1"
+          SCION_FAULT_PG_CMD: docker restart ${{ job.services.postgres.id }}
+          # soak-fault.sh's restart wait runs bare `pg_isready`, whose
+          # default host is the local socket; on the runner Postgres is
+          # the service container's TCP port, so libpq looks there.
+          PGHOST: "127.0.0.1"
+          PGPORT: "5432"
+        run: |
+          # The same cap as the SQLite fault soak: 150 min covers 120
+          # min of load.
+          timeout 9000 scripts/soak-fault.sh
+      - name: upload the samples and the logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: soak-fault-postgres-artifacts
+          path: ${{ runner.temp }}/soak-fault-artifacts/
+          if-no-files-found: ignore

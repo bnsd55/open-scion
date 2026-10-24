@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! The `scion-server` binary: `import`, `serve` and `derive`.
 
+use std::io::IsTerminal;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
@@ -722,8 +723,11 @@ fn write_gc_metrics_file(path: &Path, report: &gc::Report, took: Duration, dry_r
 async fn main() -> anyhow::Result<()> {
     // Logs go to stderr: stdout carries the output of `ticket-key` and
     // `hash-token`, which callers capture with $(...).
+    // Color only when stderr is a terminal: a file or a pipe is a log
+    // to keep, and escape bytes in it are noise on every line.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
@@ -1227,6 +1231,7 @@ async fn serve(
             tls: config.server_tls,
             metrics,
             audit: config.audit,
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         tickets,
         async move {

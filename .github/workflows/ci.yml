@@ -177,6 +177,11 @@ jobs:
         run: scripts/test-merge-changelog.sh
       - name: the release tag verdicts hold (release-verify-tag)
         run: scripts/test-release-verify-tag.sh
+      # The store-upgrade ladder's cap: 9 tags -> 8 kept + a warning
+      # naming the dropped ones. No store-upgrade run holds 9 tags
+      # today, so the decision is tested here on a fixture repo.
+      - name: the store ladder keeps the newest 8 and names the rest
+        run: scripts/test-store-upgrade-cap.sh
       # A workflow that cannot parse fails here, on the PR that carries
       # it, not main's next push-triggered run (#416, #419). The
       # actionlint release is pinned by version and sha256.
@@ -209,8 +214,10 @@ jobs:
   docs:
     name: rustdoc
     needs: tier
-    # The docs tests run on every event and for every ready pull
-    # request; for a docs-only PR they are the only tier that runs.
+    # rustdoc runs on every event and for every ready pull request; for
+    # a docs-only PR it and the docs-tests job below are the only jobs
+    # that run. The docs tests are integration tests, not rustdoc, so
+    # they live in the separate docs-tests job below.
     if: >-
       ${{ !cancelled() && (needs.tier.result == 'success' || needs.tier.result == 'skipped') && !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04
@@ -225,6 +232,48 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
+  docs-tests:
+    name: docs tests
+    needs: tier
+    # The docs tests (links, the changes fragments, flags, operations,
+    # alerts, capacity, the CLI help) are integration tests of the docs
+    # pages. The test job skips a docs-only pull request, so without
+    # this job a broken link or a stale doc would land and fail main's
+    # first run instead. The same if as the docs job: for a docs-only
+    # PR the two of them are the only jobs that run. The test targets
+    # come from the docs_*.rs files themselves, so a new docs test
+    # file runs without a hand list to forget; the counts refuse a
+    # glob that matched nothing, so a moved directory cannot turn the
+    # job into a no-op.
+    if: >-
+      ${{ !cancelled() && (needs.tier.result == 'success' || needs.tier.result == 'skipped') && !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: the docs tests
+        run: |
+          shopt -s nullglob
+          server_files=(crates/scion-server/tests/docs_*.rs)
+          cli_files=(crates/scn/tests/docs_*.rs)
+          if [ "${#server_files[@]}" -eq 0 ] || [ "${#cli_files[@]}" -eq 0 ]; then
+            echo "no docs_*.rs files found: the docs tests would run nothing"
+            exit 1
+          fi
+          server_args=()
+          for f in "${server_files[@]}"; do server_args+=(--test "$(basename "$f" .rs)"); done
+          cli_args=()
+          for f in "${cli_files[@]}"; do cli_args+=(--test "$(basename "$f" .rs)"); done
+          cargo test -p open-scion-server "${server_args[@]}"
+          cargo test -p open-scion "${cli_args[@]}"
 
   supply-chain:
     name: cargo-deny
@@ -251,6 +300,16 @@ jobs:
       # root holds hold here too.
       - name: cargo deny check, in every fuzz sub-workspace
         run: |
+          # The lock check runs BEFORE cargo deny: cargo deny resolves a
+          # stale lock in place (its own resolution may write the
+          # lockfile), so a check after it would see the lock cargo deny
+          # already fixed, not the stale one the commit carried - the
+          # exact silent re-resolve this check exists to catch.
+          for toml in crates/*/fuzz/Cargo.toml; do
+            echo "== the lock matches the manifest in $(dirname "$toml")"
+            cargo metadata --locked --format-version 1 \
+              --manifest-path "$toml" > /dev/null
+          done
           for lock in crates/*/fuzz/Cargo.lock; do
             dir="$(dirname "$lock")"
             # Fail closed: cargo-deny only warns when its config is
