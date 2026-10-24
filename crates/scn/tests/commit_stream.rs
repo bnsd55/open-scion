@@ -240,7 +240,11 @@ fn a_commit_of_a_big_file_stays_under_its_rss_ceiling() {
     // Both peaks (lever off and on) land in the run's summary when CI
     // runs, so the guard's numbers are CI's own, not a local machine's.
     if let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY") {
-        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+        {
             use std::io::Write as _;
             let _ = writeln!(f, "commit-stream peak (lever=true): {peak_kb} kB");
         }
@@ -267,15 +271,12 @@ struct Measured {
 
 /// The child's env when the lever is flipped: the whole-file read.
 fn lever_env(lever: bool) -> impl Iterator<Item = (&'static str, &'static str)> {
-    lever.then_some(("SCION_TEST_COMMIT_MUTATION", "whole_file")).into_iter()
+    lever
+        .then_some(("SCION_TEST_COMMIT_MUTATION", "whole_file"))
+        .into_iter()
 }
 
-fn commit_measured(
-    fx: &Fixture,
-    name: &str,
-    file: &std::path::Path,
-    lever: bool,
-) -> Measured {
+fn commit_measured(fx: &Fixture, name: &str, file: &std::path::Path, lever: bool) -> Measured {
     let args = [
         "--server",
         &fx.url,
