@@ -448,8 +448,8 @@ jobs:
           # -quit, not head: a head-truncated find dies of SIGPIPE, and
           # pipefail turns that into a failed assignment (exit 141,
           # reported as 1) before the report ever starts.
-          pd="$(find "$(rustc --print sysroot)" -type f -name llvm-profdata -quit)"
-          lcv="$(find "$(rustc --print sysroot)" -type f -name llvm-cov -quit)"
+          pd="$(find "$(rustc --print sysroot)" -type f -name llvm-profdata -print -quit)"
+          lcv="$(find "$(rustc --print sysroot)" -type f -name llvm-cov -print -quit)"
           "$pd" merge -sparse target/coverage/*.profraw \
             -o target/coverage/merged.profdata
           objects=$(find target/units-sqlite target/units-postgres -type f | sort | tr '\n' ' ')
