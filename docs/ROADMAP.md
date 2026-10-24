@@ -39,8 +39,10 @@ Make the project safe to install anywhere it claims to work.
   landed the fix, and none of the 57 CI runs on `main` from its merge
   to 2026-10-21 shows a `Broken pipe` in the release smoke.
 - [Ubuntu's umask 002 and user private groups trip the group-writable
-  checks](https://github.com/bnsd55/openscion/issues/302): open, the
-  last item of this gate.
+  checks](https://github.com/bnsd55/openscion/issues/302): closed by
+  choice - the rule stays fail-closed, the refusal names the chmod
+  that fixes the directory, and the runbook shows how to make the
+  directory so the rule never fires.
 
 ## v0.2.0 - compatibility and recovery
 

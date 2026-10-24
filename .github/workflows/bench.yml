@@ -93,7 +93,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: run the capacity grid
         env:
-          SCION_PG_URL: postgres://postgres@127.0.0.1:5432/scion
+          # The harness drops and creates its databases, so it runs
+          # only on a scion_capacity_* database.
+          SCION_PG_URL: postgres://postgres@127.0.0.1:5432/scion_capacity_grid
           CAPACITY_MACHINE: "GitHub ubuntu-24.04 hosted runner: 4 vCPU, 16 GiB RAM, 14 GiB SSD"
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: scripts/capacity.sh

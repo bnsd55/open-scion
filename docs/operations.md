@@ -57,36 +57,77 @@ git -C /srv/git/my-repo log --oneline -1
 ```
 
 The first import makes the repo (named `main` unless `--repo` says
-otherwise), and a client's `scn log main` reads it back; the import can
-run while the server serves.
+otherwise), and a client reads it back:
+
+```sh
+SCION_SERVER=http://127.0.0.1:7878 scn --token-file /srv/scion-token log main
+```
+
+The client's global flags (`--server`, `--token-file`) go before the
+subcommand; the environment forms are `SCION_SERVER` and `SCION_TOKEN`.
+The import can run while the server serves.
 
 Proof: crates/scion-server/tests/first_boot.rs::a_first_boot_serves_probes_and_reads_back
 
 ### One server
 
 ```sh
+install -d -m 0700 /srv/scion
 SCION_TOKEN=<TOKEN> ./scion-server --data /srv/scion serve
 ```
 
 That is the whole deployment: clients talk to `127.0.0.1:7878` (or `--listen`
-HOST:PORT). The data directory holds every blob and every row, so keep it
+HOST:PORT). `install -d -m 0700` makes the directory the mode it says, whatever
+the umask is - under umask 002 (Ubuntu's user private groups) a plain `mkdir`
+makes a group-writable directory, and the server refuses it; the error names
+the chmod that fixes it. The data directory holds every blob and every row, so keep it
 mode 0700 and owned by the user the server runs as: the server refuses one
 that group or others can write, or that sits under a directory another user
 can change. Without `--ticket-key` no object is readable, so a real server
 adds a ticket key (section 2):
 
 ```sh
-./scion-server ticket-key --out /srv/scion-keys/ticket.key   # prints the public key
+./scion-server --data /srv/scion ticket-key --out /srv/scion-keys/ticket.key \
+  | tee /srv/scion-keys/ticket.pub   # prints the public key
 chmod 600 /srv/scion-keys/ticket.key
 ./scion-server --data /srv/scion serve --token <TOKEN> \
   --ticket-key /srv/scion-keys/ticket.key
 ```
+
+The public key lands in `ticket.pub`, kept for the next rotation's
+`--ticket-key-old` (section 2).
+
+`ticket-key` records its run in the data directory's audit log, so it
+takes the same `--data` as the serve line.
 
 Size the process with the three connection caps: `--max-connections` (128)
 bounds the clients served at once, `--max-streams` (256) bounds the calls
 one client may hold open at once, and `--max-stalled-bytes` (64 MiB)
 bounds what the stalled replies of one connection may hold before the
 connection is closed. A cache and a daemon take the same three flags.
+
+What one server process can hold for clients that never read, at the
+defaults, in the worst case:
+
+    128 connections x 64 MiB stalled bytes   8192 MiB
+    the read budget (whole-object replies)     256 MiB
+    the reply budget (unary replies)           128 MiB
+    ------------------------------------------ --------
+    about                                      8.4 GiB
+
+The first line is `--max-connections` x `--max-stalled-bytes`
+(`DEFAULT_CONNECTIONS`, `DEFAULT_STALLED_BYTES` in
+crates/scion-proto/src/runtime/listen.rs): a connection whose stalled
+replies hold more than `--max-stalled-bytes` is closed, and what they
+hold goes free, so a slow client costs at most its own connection,
+not a share of the server. The second is the read budget that a
+whole-object reply's built body takes before the body is built
+(`READ_BUDGET_BYTES` in crates/scion-server/src/service.rs); the
+third is the unary-reply budget (`REPLY_MEMORY_BUDGET` in
+crates/scion-server/src/reply.rs). Size the server's memory from that
+sum: fewer connections, a smaller stall cap, or both, take the first
+line down linearly.
+
 
 Choose the tokens with care: `--token T` (or `SCION_TOKEN=T`) makes one
 principal, `default`, with every right on every repo. A token on the command
@@ -519,6 +560,7 @@ its value is readable by every local account through `ps`.
 | --- | --- | --- | --- |
 | `SCION_DATA` | `--data` | `scion-server` | Data directory, default `scion-data`. |
 | `SCION_POSTGRES_URL` | `--postgres-url` | `scion-server` | The URL holds the database credentials; the environment keeps them out of the process list (`ps`). `--postgres-url-file` reads it from a file the owner alone may read, and the argv form is deprecated: it warns now and goes away in a later release. |
+| `SCION_POSTGRES_URL_FILE` | `--postgres-url-file` | `scion-server` | A file that holds the database URL. Only its owner may read it, and a symlink is refused. |
 | `SCION_TOKEN` | `--token` | `scion-server` (`serve`, `hash-token`), `scion-cache`, `scion-daemon`, `scn` | A secret; the environment keeps it out of the process list. The `--token-file` flag reads the token from a file the owner alone may read, and `hash-token` reads it from stdin. The argv form prints a deprecation warning and goes away in a later release. |
 | `SCION_UPSTREAM_TOKEN` | `--upstream-token` | `scion-cache`, `scion-daemon` | A secret, as `SCION_TOKEN`; `--upstream-token-file` reads it from a file, and the argv form is deprecated: it warns now and goes away in a later release. |
 | `SCION_DAEMON_DATA` | `--data` | `scion-daemon` | Data directory, default `scion-daemon-data`. |
@@ -542,8 +584,10 @@ symlink, or that sits under directories another user can change.
 
 Rotation, step by step:
 
-1. Make the new key: `scion-server ticket-key --out NEW.key` — it prints the
-   new public key as 64 hex characters.
+1. Make the new key, and capture its public key into its own file, kept
+   for the next rotation:
+   `scion-server --data /srv/scion ticket-key --out NEW.key | tee NEW.pub`
+   — it prints the new public key as 64 hex characters.
 2. Give the tiers both public keys, new first, **before** the server moves
    to the new key — a cache that verifies only the old key refuses every
    ticket the new server mints:
@@ -551,10 +595,12 @@ Rotation, step by step:
    flag; two are the most). Restart the caches; a cache that verifies
    against both serves tickets of either key.
 3. Restart the server with both keys: `--ticket-key NEW.key
-   --ticket-key-old OLD-PUBLIC`. The old argument is a file holding the
-   **public** key of the previous key (the hex that the old run printed),
-   not its seed — and the file holds the bare hex and nothing else: 64
-   hex characters, no `name=` prefix, no trailing line. A public key is
+   --ticket-key-old OLD-PUBLIC`. The old argument is the previous key's
+   `.pub` file - the public key that the run which made the **previous**
+   key captured (step 1 the last time), not its seed, and not this
+   rotation's new key. The file's text is trimmed when read, so a
+   trailing newline is fine; what it holds is the bare 64-hex public
+   key and nothing else. A public key is
    not a secret: anyone may read the file, but group and others must not
    be able to WRITE it (a changed key breaks every tier that verifies
    against the old one), it must not be a symlink, and the directories
@@ -756,7 +802,24 @@ re-date such a commit in the git history and import again.
 
 So an upgrade is: stop the server (and any tiers that share the directory —
 none do by default), copy the directory as a backup (section 3), start the
-new binary, watch the log for the migration, run `fsck`. Schema 7 (tree
+new binary, watch the log for the migration, run `fsck`. A store that
+has data logs its migration steps when a build migrates it.
+
+Where the binaries come from. v0.1.0 is a source release: build the
+version you need from its signed tag (`docs/RELEASING.md`):
+
+```sh
+git checkout <tag>
+cargo build --release --locked
+```
+
+A release that ships binaries says so in its release notes, and
+`docs/verify.md` verifies them. Whichever way the binaries came, keep
+the previous build's binaries beside the new ones **before** an
+upgrade: the rollback below needs them, because rebuilding the old tag
+mid-incident needs the toolchain and the time you do not have.
+
+Schema 7 (tree
 entry sizes, `#172`) drops every stored tree and its derived rows, so the
 first queries after it re-derive trees from the stored changesets; the
 blobs and changesets stay. A tier's store may keep tree bytes of the old
@@ -1222,33 +1285,33 @@ checking out through a cache and a daemon beside it.
 
 | | |
 |---|---|
-| Commit | the `git rev-parse HEAD` of the run that produced the table |
+| Commit | ab6bfdc92314fc41d2a8c5dca0f0a13bd39b5612 the main commit the run measured (the run's own HEAD, fcb947e6, adds the grid's database name only), at [run 40119721010](https://github.com/bnsd55/openscion/actions/runs/40119721010) |
 | Runner | the hosted runner class, by its public label and spec |
+| Filesystem | the filesystem the run measured, from the run's `machine.txt` artifact (`df -T` on the work directory); the `ubuntu-24.04` class's root disk is ext4 ([support.md](support.md)) |
 | Repetitions | 2 per cell; the table reports the cell's whole run, and the run's raw samples are the workflow run's `capacity.csv` artifact |
 
 | backend | writers | readers | land p99 ms | checkout p50 ms | checkout p99 ms | timeouts | errors | server RSS MiB | landed | blob store KiB per 1k lands | database KiB per 1k lands |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| sqlite | 2 | 0 | - | - | - | - | - | - | - | - | - |
-| sqlite | 2 | 5 | - | - | - | - | - | - | - | - | - |
-| sqlite | 2 | 20 | - | - | - | - | - | - | - | - | - |
-| sqlite | 50 | 0 | - | - | - | - | - | - | - | - | - |
-| sqlite | 50 | 5 | - | - | - | - | - | - | - | - | - |
-| sqlite | 50 | 20 | - | - | - | - | - | - | - | - | - |
-| sqlite | 200 | 0 | - | - | - | - | - | - | - | - | - |
-| sqlite | 200 | 5 | - | - | - | - | - | - | - | - | - |
-| sqlite | 200 | 20 | - | - | - | - | - | - | - | - | - |
-| postgres | 2 | 0 | - | - | - | - | - | - | - | - | - |
-| postgres | 2 | 5 | - | - | - | - | - | - | - | - | - |
-| postgres | 2 | 20 | - | - | - | - | - | - | - | - | - |
-| postgres | 50 | 0 | - | - | - | - | - | - | - | - | - |
-| postgres | 50 | 5 | - | - | - | - | - | - | - | - | - |
-| postgres | 50 | 20 | - | - | - | - | - | - | - | - | - |
-| postgres | 200 | 0 | - | - | - | - | - | - | - | - | - |
-| postgres | 200 | 5 | - | - | - | - | - | - | - | - | - |
-| postgres | 200 | 20 | - | - | - | - | - | - | - | - | - |
+| sqlite | 2 | 0 | 15 | - | - | 0 | 0 | 24 | 2000 | 112318 | - |
+| sqlite | 2 | 5 | 31 | 172 | 238 | 0 | 0 | 31 | 2000 | 112324 | - |
+| sqlite | 2 | 20 | 103 | 683 | 827 | 0 | 0 | 32 | 2000 | 112366 | - |
+| sqlite | 50 | 0 | 228 | - | - | 0 | 0 | 43 | 2000 | 58798 | - |
+| sqlite | 50 | 5 | 490 | 173 | 243 | 0 | 0 | 50 | 2000 | 58848 | - |
+| sqlite | 50 | 20 | 2057 | 685 | 839 | 0 | 0 | 50 | 2000 | 58882 | - |
+| sqlite | 200 | 0 | 958 | - | - | 0 | 0 | 57 | 2000 | 78358 | - |
+| sqlite | 200 | 5 | 2170 | 175 | 248 | 0 | 0 | 74 | 2000 | 78384 | - |
+| sqlite | 200 | 20 | 9924 | 684 | 830 | 0 | 0 | 77 | 2000 | 78364 | - |
+| postgres | 2 | 0 | 64 | - | - | 0 | 0 | 20 | 2000 | 5668 | 87210 |
+| postgres | 2 | 5 | 124 | 253 | 298 | 0 | 0 | 24 | 2000 | 5668 | 87530 |
+| postgres | 2 | 20 | 243 | 879 | 1071 | 0 | 0 | 27 | 2000 | 5668 | 86618 |
+| postgres | 50 | 0 | 2309 | - | - | 0 | 0 | 33 | 2000 | 5668 | 34674 |
+| postgres | 50 | 5 | 4454 | 254 | 301 | 0 | 0 | 38 | 2000 | 5668 | 34558 |
+| postgres | 50 | 20 | 7042 | 877 | 1079 | 0 | 0 | 38 | 2000 | 5664 | 34482 |
+| postgres | 200 | 0 | 9326 | - | - | 0 | 0 | 45 | 2000 | 5668 | 62428 |
+| postgres | 200 | 5 | 18244 | 254 | 296 | 0 | 0 | 63 | 2000 | 5666 | 62366 |
+| postgres | 200 | 20 | 31584 | 869 | 1054 | 0 | 0 | 66 | 2000 | 5668 | 62406 |
 
-The cells with `-` are the ones no run has filled yet. Every cell
-runs on a store the cell's own import made: on SQLite a data directory
+Every cell runs on a store the cell's own import made: on SQLite a data directory
 the cell created, on Postgres a database the cell dropped and
 recreated, so a cell's numbers are the store's at its own size, and
 the growth column is the cell's own lands' bytes. The timeouts column
