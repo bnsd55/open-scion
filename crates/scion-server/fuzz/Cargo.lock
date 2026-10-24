@@ -794,7 +794,7 @@ dependencies = [
 
 [[package]]
 name = "gix"
-version = "0.89.0" # PROOF-INJECTION
+version = "0.90.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b92b20c1560511a9014b16e29db2f3c6f0580d4fe289b70f41131277b065a3b0"
 dependencies = [
