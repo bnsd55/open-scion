@@ -151,12 +151,13 @@ jobs:
           # log — so the measure fails itself, loudly, while there is
           # still room to log the numbers.
           ( while sleep 30; do date -u +%T; df -h / | tail -1; free -m | awk 'NR==2'; du -sh target/coverage 2>/dev/null; \
+              ps -eo pid,rss,pcpu,etime,comm --sort=-rss | head -4 | tee -a watcher.log; \
               avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9'); \
               mem=$(free -m | awk 'NR==2 {print $7}'); \
               { [ "$avail" -gt 3 ] && [ "$mem" -gt 600 ]; } || { echo 'the runner is out of disk or memory'; df -h /; free -m; ps aux --sort=-rss | head -12; exit 2; }; done ) &
           watcher=$!
           mkdir -p .config
-          printf '[profile.default]\ntimeout = "600s"\nretries = 1\nslow-timeout = { period = "60s", terminate-after = 8 }\n' > .config/nextest.toml
+          printf '[profile.default]\ntimeout = "600s"\nretries = 1\nslow-timeout = { period = "60s", terminate-after = 5 }\n' > .config/nextest.toml
           # The README's recipe: show-env exports the instrumentation
           # RUSTFLAGS and the profile environment, plain cargo nextest
           # runs the tests against the binaries the build makes. The
@@ -202,6 +203,13 @@ jobs:
         with:
           name: measure-log-sqlite
           path: measure.log
+          if-no-files-found: ignore
+      - name: the watcher's process samples, always
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: watcher-sqlite
+          path: watcher.log
           if-no-files-found: ignore
   measure-postgres:
     name: coverage, the postgres backend
@@ -310,6 +318,7 @@ jobs:
         run: |
           set -o pipefail
           ( while sleep 30; do date -u +%T; df -h / | tail -1; free -m | awk 'NR==2'; du -sh target/coverage 2>/dev/null; \
+              ps -eo pid,rss,pcpu,etime,comm --sort=-rss | head -4 | tee -a watcher.log; \
               avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9'); \
               mem=$(free -m | awk 'NR==2 {print $7}'); \
               { [ "$avail" -gt 3 ] && [ "$mem" -gt 600 ]; } || { echo 'the runner is out of disk or memory'; df -h /; free -m; ps aux --sort=-rss | head -12; exit 2; }; done ) &
@@ -356,6 +365,13 @@ jobs:
         with:
           name: measure-log-postgres
           path: measure.log
+          if-no-files-found: ignore
+      - name: the watcher's process samples, always
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: watcher-postgres
+          path: watcher.log
           if-no-files-found: ignore
   gate:
     name: coverage, the gate
