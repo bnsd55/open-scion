@@ -313,9 +313,9 @@ lives there. Each directory above it must be owned by root or by you, and
 must not be writable by group or others unless it has the sticky bit (as
 `/tmp` has). `scn` checks the same for the socket. The error names the
 directory; `chmod go-w DIR` fixes it. With umask 002 (a private group per
-user), new directories are group-writable, so they are refused until you run
-that - by choice: the rule stays fail-closed, and `install -d -m 0700 DIR`
-makes the directory so the check never fires. Stop the daemon with Ctrl-C or SIGTERM: it then writes its index, and
+user), a plain mkdir makes a group-writable directory, and it is refused by
+choice (the rule stays fail-closed). Make the directory with
+`install -d -m 0700 DIR`, or run `chmod g-w DIR`. Stop the daemon with Ctrl-C or SIGTERM: it then writes its index, and
 its next start reads that one file instead of every stored object.
 
 A regional cache can also write snapshots, so that a new node's daemon does
