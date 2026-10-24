@@ -480,10 +480,10 @@ tmpfs disk-full and dm-log-writes steps), `test (postgres)` (Postgres
 Requires Rust 1.88 or newer and `protoc` (the Protocol Buffers compiler; for
 example `brew install protobuf` or `apt install protobuf-compiler`).
 
-No release of this project has been cut yet, so the binaries of a version
-build from its signed tag (`git checkout <tag>; cargo build --release
---locked`); a cut release carries attested binaries on its GitHub release
-(`docs/verify.md` verifies them). An operator upgrading keeps the previous
+v0.1.0 is a source release: the binaries of a version build from its
+signed tag (`git checkout <tag>; cargo build --release --locked`). A
+release that ships binaries says so in its release notes, and
+`docs/verify.md` verifies them. An operator upgrading keeps the previous
 release's binaries beside the new ones: a rollback needs them
 (`docs/operations.md`, "Upgrades").
 

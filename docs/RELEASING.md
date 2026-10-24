@@ -64,11 +64,11 @@ A release is cut through one PR from a branch named
    clone of the tagged commit, build the workspace and run the
    README's `Try it` flow end to end. The tagged commit is also the
    operator's source for the binaries (see `docs/operations.md`,
-   "Upgrades"): say in the release notes that the binaries of this
-   version build from this tag (`git checkout <tag>; cargo build
-   --release --locked`), and that an operator upgrading keeps the
-   previous release's binaries beside the new ones, because a
-   rollback needs them.
+   "Upgrades"): a source release says so in its notes (the binaries
+   build from this tag: `git checkout <tag>; cargo build --release
+   --locked`); a release that ships binaries says that instead. Either
+   way the notes point the operator at keeping the previous release's
+   binaries beside the new ones, because a rollback needs them.
 6. **The umask-002 run.** #302 is closed by choice: the group-writable
    rule stays fail-closed and the refusal names the chmod, so the
    release's umask-002 run proves the refusal, not an exception.
